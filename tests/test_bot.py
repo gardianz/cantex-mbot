@@ -488,6 +488,43 @@ async def test_strategy_resets_daily_count_on_utc_rollover(tmp_path, monkeypatch
     store.close()
 
 
+def test_parse_dump_label_styles_and_name_norm():
+    from cantex_bot.wallet_import import parse_dump
+    m = "word " * 24
+    dump = "\n".join([
+        "grass_1", m, "Cantex::1220aa", "e0" * 32, "98" * 32,        # bare hex
+        "", "ani_1", m, "Cantex::1220bb", "op: " + "37" * 32, "tk: " + "6f" * 32,
+        "", "cantex danu_one", m, "Cantex::1220cc",
+        "operator key: " + "d7" * 32, "trading key: " + "6b" * 32,
+    ])
+    ws = parse_dump(dump)
+    assert [w.name for w in ws] == ["grass_1", "ani_1", "danu_one"]   # "cantex " stripped
+    assert ws[0].operator == "e0" * 32 and ws[0].trading == "98" * 32
+    assert ws[1].operator == "37" * 32 and ws[2].operator == "d7" * 32
+
+
+def test_parse_dump_rejects_misaligned():
+    from cantex_bot.wallet_import import parse_dump, WalletImportError
+    with pytest.raises(WalletImportError):
+        parse_dump("name\nword word word\nCantex::x\ndeadbeef")   # 4 lines
+
+
+def test_append_wallets_idempotent(tmp_path, monkeypatch):
+    from cantex_bot import wallet_import as wi
+    monkeypatch.setattr(wi, "assert_gitignored", lambda p: None)   # tmp files, skip git check
+    env = tmp_path / ".env"
+    cfg = tmp_path / "config.toml"
+    env.write_text("CANTEX_W1_OPERATOR_KEY=aa\n")
+    cfg.write_text('[[wallets]]\nname = "w1"\n')
+    ws = wi.parse_dump("\n".join(["grass_1", "word " * 24, "Cantex::z", "e0" * 32, "98" * 32]))
+    env_add, cfg_add = wi.append_wallets(ws, env_path=str(env), config_path=str(cfg))
+    assert len(env_add) == 1 and len(cfg_add) == 1
+    assert "CANTEX_GRASS_1_OPERATOR_KEY=" + "e0" * 32 in env.read_text()
+    assert 'name = "grass_1"' in cfg.read_text()
+    # second run adds nothing (idempotent)
+    assert wi.append_wallets(ws, env_path=str(env), config_path=str(cfg)) == ([], [])
+
+
 def test_store_snapshot(tmp_path):
     store = Store(tmp_path / "s.db")
     store.save_snapshot("w1", "activity", {"cc_rebate_candidates": {"yesterday.cc": 5}})

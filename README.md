@@ -143,6 +143,10 @@ It normalises names, validates the 64-char hex keys, is idempotent (skips names
 already present), refuses to write to a file that isn't gitignored, and never
 prints key values. Delete `wallets.txt` afterwards.
 
+The same importer is on the interactive menu as **Add wallets (bulk import)** —
+it asks for the dump file path, previews the parsed names, and appends on
+confirm. Restart the bot afterwards so the new wallets load.
+
 ### 6. Verify before trading
 
 ```bash

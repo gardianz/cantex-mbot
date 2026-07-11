@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import logging
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 import questionary
 from rich.console import Console
@@ -323,6 +324,49 @@ class App:
             dash = Dashboard(self.service, self.config, self.run_state)
             await dash.print_once()
 
+    async def action_add_wallets(self) -> None:
+        """Bulk-import wallets from a pasted key dump file into .env + config.toml."""
+        from .wallet_import import WalletImportError, append_wallets, parse_dump
+
+        path = (await questionary.path(
+            "Path to the wallet dump file "
+            "(name / mnemonic / Cantex:: / operator key / trading key per wallet):"
+        ).ask_async() or "").strip()
+        if not path:
+            return
+        try:
+            wallets = parse_dump(Path(path).read_text())
+        except OSError as exc:
+            console.print(f"[red]Cannot read {path}: {exc}[/red]")
+            return
+        except WalletImportError as exc:
+            console.print(f"[red]Parse error: {exc}[/red]")
+            return
+
+        console.print(
+            f"Parsed [bold]{len(wallets)}[/bold] wallet(s): "
+            f"{', '.join(w.name for w in wallets)}"
+        )
+        armed = await questionary.confirm(
+            "Append new wallets to .env and config.toml?", default=False
+        ).ask_async()
+        if not armed:
+            console.print("[yellow]Cancelled.[/yellow]")
+            return
+        try:
+            env_add, cfg_add = append_wallets(wallets)
+        except WalletImportError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+        console.print(
+            f"[green]Added[/green] {len(env_add)} to .env, {len(cfg_add)} to "
+            f"config.toml ({len(wallets) - len(env_add)} already present)."
+        )
+        console.print(
+            "[dim]Restart the bot to load the new wallets. "
+            "Delete the dump file — it holds private keys.[/dim]"
+        )
+
     # -- main loop -----------------------------------------------------------
 
     async def menu(self) -> None:
@@ -333,6 +377,7 @@ class App:
             "Manual swap": self.action_manual_swap,
             "Web check (history + rebates)": self.action_web_check,
             "Wallet status": self.action_wallet_status,
+            "Add wallets (bulk import)": self.action_add_wallets,
             "Quit": None,
         }
         while True:

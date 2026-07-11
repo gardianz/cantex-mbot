@@ -19,7 +19,11 @@ built on the official `cantex_sdk`.
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the
   SDK as a hard cap on the live swap.
-- **Telegram logging** — swap results, guard rejects, errors, summaries.
+- **Telegram logging + `/stats` bot** — swap results, guard rejects, errors,
+  summaries. When `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set the bot also
+  answers commands (owner chat only): **`/stats`** replies with a per-wallet
+  table — target progress (`done/target`), daily & weekly loss (USDCX), and
+  today's fee (CC) — plus a TOTAL row; **`/help`** lists commands.
 - **Scales to hundreds of wallets** — a background service refreshes a per-wallet
   cache with bounded concurrency (`max_concurrency`), and the dashboard paints
   from that cache instantly. Rows show `loading` until their first refresh lands.

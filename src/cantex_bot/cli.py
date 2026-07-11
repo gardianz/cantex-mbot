@@ -23,11 +23,16 @@ from .store import Store
 from .strategies.strategy1 import Strategy1
 from .swap_all import AmountError, AmountSpec, swap_selected
 from .swapper import SwapEngine
-from .telegram import TelegramNotifier
+from .telegram import TelegramCommandBot, TelegramNotifier
 from .wallets import WalletManager
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+
+def _sig(v: Decimal) -> str:
+    """Loss value to 2 decimals, keeping its sign (negative = net gain)."""
+    return f"{v:.2f}"
 
 
 class App:
@@ -49,6 +54,14 @@ class App:
             interval=config.performance.refresh_interval,
             run_state=self.run_state,
         )
+        self.tgbot = TelegramCommandBot(
+            config.telegram, self.notifier,
+            handlers={
+                "stats": self._cmd_stats,
+                "help": self._cmd_help,
+                "start": self._cmd_help,
+            },
+        )
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -65,8 +78,15 @@ class App:
         )
         if not net.dry_run:
             console.print("[bold red]LIVE mode configured — real funds at risk.[/bold red]")
+        # If Telegram is configured, run the /stats command bot and keep the
+        # background portfolio cache warm so replies have live numbers.
+        if self.tgbot.enabled:
+            self.service.start()
+            self.tgbot.start()
+            console.print("[dim]Telegram bot online — send /stats for a per-wallet report.[/dim]")
 
     async def shutdown(self) -> None:
+        await self.tgbot.stop()
         await self.service.stop()
         await self.manager.close()
         await self.notifier.close()
@@ -366,6 +386,66 @@ class App:
             "[dim]Restart the bot to load the new wallets. "
             "Delete the dump file — it holds private keys.[/dim]"
         )
+
+    # -- telegram commands ---------------------------------------------------
+
+    async def _cmd_help(self, _arg: str) -> str:
+        return (
+            "Cantex bot commands:\n"
+            "/stats  — per-wallet target progress, loss (day/week), fee today\n"
+            "/help   — this message"
+        )
+
+    async def _cmd_stats(self, _arg: str) -> str:
+        """Per-wallet table: TARGET (done/target), LOSS d/w (USDCX), FEE today (CC)."""
+        from datetime import datetime, timezone
+
+        # Fresh numbers: if the background cache is cold, sweep once inline.
+        if all(s.updated == 0 for s in self.service.snaps.values()):
+            await self.service.refresh_once()
+
+        default_target = getattr(self.config.strategy1, "daily_swap_target", 0)
+        rows: list[tuple[str, str, str, str]] = []
+        d_done = d_target = 0
+        loss_d = loss_w = Decimal(0)
+        fee_sum = Decimal(0)
+        for name in self.manager.names:
+            s = self.service.snaps.get(name)
+            if s is None:
+                continue
+            v = self.run_state.views.get(name)
+            if v is not None and (v.active or v.finished):
+                done, target = v.done, v.target or default_target
+            else:
+                done, target = s.swaps_today, default_target
+            d_done += done
+            d_target += target
+            loss_d += s.loss_today
+            loss_w += s.loss_week
+            fee_sum += s.fee_today
+            flag = "" if s.status == "ok" else f" ({s.status})"
+            rows.append((
+                name[:12],
+                f"{done}/{target}",
+                f"{_sig(s.loss_today)}/{_sig(s.loss_week)}",
+                f"{s.fee_today:.3f}{flag}",
+            ))
+
+        w0 = max([12] + [len(r[0]) for r in rows])
+        w1 = max([6] + [len(r[1]) for r in rows])
+        w2 = max([9] + [len(r[2]) for r in rows])
+        header = f"{'WALLET':<{w0}}  {'TARGET':>{w1}}  {'LOSS d/w':>{w2}}  FEE(CC)"
+        lines = [header, "-" * len(header)]
+        for name, tgt, loss, fee in rows:
+            lines.append(f"{name:<{w0}}  {tgt:>{w1}}  {loss:>{w2}}  {fee}")
+        total = (
+            f"{'TOTAL':<{w0}}  {f'{d_done}/{d_target}':>{w1}}  "
+            f"{f'{_sig(loss_d)}/{_sig(loss_w)}':>{w2}}  {fee_sum:.3f}"
+        )
+        lines += ["-" * len(header), total]
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        title = f"📊 Cantex stats — {stamp}  ({len(rows)} wallets)"
+        return title + "\n\n" + "\n".join(lines)
 
     # -- main loop -----------------------------------------------------------
 

@@ -1042,3 +1042,67 @@ async def test_dashboard_render_smoke():
     assert "CANTEX DASHBOARD" in out
     assert "PORTFOLIO" in out and "WALLETS" in out
     assert "Paid" in out and "812" in out
+
+
+# -- Telegram command bot (/stats) -----------------------------------------
+
+def test_chunk_lines_splits_on_line_boundaries():
+    from cantex_bot.telegram import _chunk_lines
+    text = "\n".join(f"line{i}" for i in range(10))  # 10 * 6 chars + newlines
+    chunks = _chunk_lines(text, 20)
+    assert all(len(c) <= 20 for c in chunks)
+    # No line is lost or split across chunks (each line stays whole).
+    assert "\n".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_chunk_lines_hard_splits_overlong_line():
+    from cantex_bot.telegram import _chunk_lines
+    chunks = _chunk_lines("x" * 45, 20)
+    assert [len(c) for c in chunks] == [20, 20, 5]
+
+
+def _command_bot(monkeypatch):
+    from cantex_bot.telegram import TelegramCommandBot, TelegramNotifier
+    cfg = TelegramConfig(enabled=True, bot_token="tok", chat_id="123")
+    notifier = TelegramNotifier(cfg)
+    sent: list[str] = []
+    monkeypatch.setattr(notifier, "send",
+                        AsyncMock(side_effect=lambda t: sent.append(t)))
+    seen: list[str] = []
+
+    async def stats(arg):
+        seen.append(arg)
+        return "REPORT BODY"
+
+    bot = TelegramCommandBot(cfg, notifier, handlers={"stats": stats})
+    return bot, sent, seen
+
+
+@pytest.mark.asyncio
+async def test_command_bot_dispatches_stats(monkeypatch):
+    bot, sent, seen = _command_bot(monkeypatch)
+    await bot._dispatch({"message": {"chat": {"id": 123}, "text": "/stats"}})
+    assert seen == [""]
+    assert sent and sent[0].startswith("<pre>") and "REPORT BODY" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_command_bot_ignores_foreign_chat(monkeypatch):
+    bot, sent, seen = _command_bot(monkeypatch)
+    await bot._dispatch({"message": {"chat": {"id": 999}, "text": "/stats"}})
+    assert seen == [] and sent == []
+
+
+@pytest.mark.asyncio
+async def test_command_bot_strips_botname_and_args(monkeypatch):
+    bot, sent, seen = _command_bot(monkeypatch)
+    await bot._dispatch({"message": {"chat": {"id": 123}, "text": "/stats@MyBot foo"}})
+    assert seen == ["foo"]
+
+
+@pytest.mark.asyncio
+async def test_command_bot_unknown_command(monkeypatch):
+    bot, sent, seen = _command_bot(monkeypatch)
+    await bot._dispatch({"message": {"chat": {"id": 123}, "text": "/nope"}})
+    assert seen == []
+    assert sent and "Unknown command" in sent[0] and "/stats" in sent[0]

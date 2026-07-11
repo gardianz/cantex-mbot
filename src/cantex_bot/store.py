@@ -1,0 +1,229 @@
+"""Local SQLite state: swap log, daily counters, and scrape snapshots."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS swaps (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL NOT NULL,
+    wallet        TEXT NOT NULL,
+    direction     TEXT NOT NULL,          -- 'buy' | 'sell'
+    sell_symbol   TEXT NOT NULL,
+    buy_symbol    TEXT NOT NULL,
+    sell_amount   TEXT NOT NULL,
+    buy_amount    TEXT NOT NULL,
+    admin_fee     TEXT NOT NULL DEFAULT '0',
+    liquidity_fee TEXT NOT NULL DEFAULT '0',
+    network_fee   TEXT NOT NULL DEFAULT '0',
+    price         TEXT NOT NULL DEFAULT '0',
+    dry_run       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_swaps_wallet_ts ON swaps (wallet, ts);
+
+CREATE TABLE IF NOT EXISTS daily_counters (
+    wallet  TEXT NOT NULL,
+    day     TEXT NOT NULL,               -- YYYY-MM-DD (UTC)
+    count   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (wallet, day)
+);
+
+CREATE TABLE IF NOT EXISTS scrape_snapshots (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    wallet  TEXT NOT NULL,
+    kind    TEXT NOT NULL,               -- 'history' | 'activity'
+    data    TEXT NOT NULL                -- JSON blob
+);
+CREATE INDEX IF NOT EXISTS idx_snap_wallet_kind_ts ON scrape_snapshots (wallet, kind, ts);
+
+CREATE TABLE IF NOT EXISTS fee_obs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    day         TEXT NOT NULL,           -- YYYY-MM-DD (UTC)
+    wallet      TEXT NOT NULL,
+    pair        TEXT NOT NULL,
+    network_fee REAL NOT NULL            -- CC, absolute
+);
+CREATE INDEX IF NOT EXISTS idx_fee_wallet_day ON fee_obs (wallet, day);
+"""
+
+
+@dataclass(frozen=True)
+class SwapRecord:
+    wallet: str
+    direction: str
+    sell_symbol: str
+    buy_symbol: str
+    sell_amount: Decimal
+    buy_amount: Decimal
+    admin_fee: Decimal = Decimal(0)
+    liquidity_fee: Decimal = Decimal(0)
+    network_fee: Decimal = Decimal(0)
+    price: Decimal = Decimal(0)
+    dry_run: bool = False
+
+
+def _today() -> str:
+    # UTC, so the daily counter resets at 00:00 UTC — the same boundary the web
+    # swap count, fee stats and loss windows use (Cantex is UTC). A local date
+    # here would reset at local midnight (e.g. WIB = UTC+7, 7h off).
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+class Store:
+    """Thread-safe (coarse-lock) SQLite wrapper."""
+
+    def __init__(self, path: str | Path = "state.db") -> None:
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # -- swaps ---------------------------------------------------------------
+
+    def record_swap(self, rec: SwapRecord) -> None:
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO swaps
+                   (ts, wallet, direction, sell_symbol, buy_symbol, sell_amount,
+                    buy_amount, admin_fee, liquidity_fee, network_fee, price, dry_run)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    time.time(), rec.wallet, rec.direction, rec.sell_symbol,
+                    rec.buy_symbol, str(rec.sell_amount), str(rec.buy_amount),
+                    str(rec.admin_fee), str(rec.liquidity_fee), str(rec.network_fee),
+                    str(rec.price), int(rec.dry_run),
+                ),
+            )
+            self._conn.commit()
+
+    def fees_since(self, wallet: str, seconds: float, *, include_dry: bool = False) -> Decimal:
+        """Total fees (admin + liquidity + network) for a wallet in the window."""
+        cutoff = time.time() - seconds
+        dry_clause = "" if include_dry else "AND dry_run = 0"
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT admin_fee, liquidity_fee, network_fee FROM swaps
+                    WHERE wallet = ? AND ts >= ? {dry_clause}""",
+                (wallet, cutoff),
+            ).fetchall()
+        total = Decimal(0)
+        for r in rows:
+            total += Decimal(r["admin_fee"]) + Decimal(r["liquidity_fee"]) + Decimal(r["network_fee"])
+        return total
+
+    # -- daily counters ------------------------------------------------------
+
+    def incr_daily(self, wallet: str, day: str | None = None) -> int:
+        day = day or _today()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO daily_counters (wallet, day, count) VALUES (?,?,1)
+                   ON CONFLICT(wallet, day) DO UPDATE SET count = count + 1""",
+                (wallet, day),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT count FROM daily_counters WHERE wallet = ? AND day = ?",
+                (wallet, day),
+            ).fetchone()
+        return int(row["count"])
+
+    def daily_count(self, wallet: str, day: str | None = None) -> int:
+        """Swaps counted today. With an explicit ``day`` this reads the legacy
+        day-string counter table; the DEFAULT counts today's (UTC) rows in the
+        ``swaps`` table by their real ``ts``. The ts path is timezone-proof and
+        self-correcting: a row can't be miscounted just because it was written
+        with the wrong local date (the pre-UTC-fix bug that left yesterday's
+        swaps stuck under today's WIB date)."""
+        if day is not None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT count FROM daily_counters WHERE wallet = ? AND day = ?",
+                    (wallet, day),
+                ).fetchone()
+            return int(row["count"]) if row else 0
+        start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM swaps WHERE wallet = ? AND ts >= ?",
+                (wallet, start),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    # -- scrape snapshots ----------------------------------------------------
+
+    def save_snapshot(self, wallet: str, kind: str, data: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO scrape_snapshots (ts, wallet, kind, data) VALUES (?,?,?,?)",
+                (time.time(), wallet, kind, json.dumps(data)),
+            )
+            self._conn.commit()
+
+    def latest_snapshot(self, wallet: str, kind: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT data, ts FROM scrape_snapshots
+                   WHERE wallet = ? AND kind = ? ORDER BY ts DESC LIMIT 1""",
+                (wallet, kind),
+            ).fetchone()
+        if not row:
+            return None
+        out = json.loads(row["data"])
+        out["_scraped_at"] = datetime.fromtimestamp(row["ts"], tz=timezone.utc).isoformat()
+        return out
+
+    # -- network-fee observations --------------------------------------------
+
+    def record_fee(self, wallet: str, pair: str, network_fee: Decimal) -> None:
+        """Log an observed network fee (from any quote) for today's stats."""
+        day = datetime.now(timezone.utc).date().isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee) VALUES (?,?,?,?,?)",
+                (time.time(), day, wallet, pair, float(network_fee)),
+            )
+            self._conn.commit()
+
+    def latest_fee(self, wallet: str) -> Decimal | None:
+        """The most recently observed network fee for a wallet (live quote fee)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT network_fee FROM fee_obs WHERE wallet = ? ORDER BY ts DESC LIMIT 1",
+                (wallet,),
+            ).fetchone()
+        return Decimal(str(row["network_fee"])) if row else None
+
+    def fee_stats_today(
+        self, wallet: str, day: str | None = None
+    ) -> tuple[Decimal | None, Decimal | None, int]:
+        """(min, avg, count) of observed network fees for the wallet today (UTC)."""
+        day = day or datetime.now(timezone.utc).date().isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT MIN(network_fee) AS mn, AVG(network_fee) AS av,
+                          COUNT(*) AS n FROM fee_obs
+                   WHERE wallet = ? AND day = ?""",
+                (wallet, day),
+            ).fetchone()
+        if not row or not row["n"]:
+            return None, None, 0
+        mn = Decimal(str(row["mn"]))
+        av = Decimal(str(row["av"]))
+        return mn, av, int(row["n"])

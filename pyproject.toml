@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cantex-bot"
+version = "0.1.0"
+description = "Multi-wallet interactive trading bot for the Cantex DEX"
+readme = "README.md"
+requires-python = ">=3.11"
+# NOTE: cantex-sdk is not on PyPI. Install it separately first:
+#   pip install -e ../cantex_sdk
+dependencies = [
+    "aiohttp>=3.9.0",
+    "rich>=13.0.0",
+    "questionary>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "aioresponses",
+]
+
+[project.scripts]
+cantex-bot = "cantex_bot.cli:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cantex_bot"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets & local state — never commit
+.env
+config.toml
+secrets/
+profiles/
+state.db
+*.db
+*.log

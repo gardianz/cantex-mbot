@@ -1,0 +1,71 @@
+# Cantex Bot configuration. Copy to config.toml and edit.
+# Private keys and Telegram credentials go in .env, NOT here.
+
+[network]
+# Mainnet: https://api.cantex.io   Testnet: https://api.testnet.cantex.io
+base_url = "https://api.cantex.io"
+# dry_run = true means NO real swaps are submitted (quote + guard only).
+# Set to false only after you have verified everything.
+dry_run = false
+
+[guards]
+# Every swap is rejected if any of these limits is exceeded.
+# Cantex fees: slippage + pool fee (%) + network fee (in CC). No admin fee.
+# Percentages are written as a human reads them: 0.1 = 0.10%, 1 = 1%.
+max_slippage = 0.1          # slippage, percent (0.1 = 0.10%)
+max_pool_fee_pct = 0.1      # pool fee, percent (max across pools in the route)
+max_network_fee = 0.8       # absolute network fee, in CC
+
+[strategy1]
+cc_units = 110               # N: each buy is sized to the market value of N CC tokens
+daily_swap_target = 25     # stop a wallet once it reaches this many swaps in a day
+# Symbols as the exchange lists them. USDCX is the quote token; CC is "Amulet",
+# used only to price the buy leg (its own pair is never traded).
+usdcx_symbol = "USDCX"
+cc_symbol = "CC"
+cooldown_seconds = 1.0     # pause after an actual swap
+insufficient_retries = 4   # stop a wallet after N "saldo kurang" tries
+min_ticket_cc = 10         # exchange min ticket; a token holding worth less is dust (won't sell)
+# Anti-collision: if a live swap is submitted but its confirmation errors, the
+# swap may still have settled. Before firing the opposite leg, poll the trading
+# history confirm_retries times (confirm_interval apart) — a higher count = done.
+confirm_retries = 5
+confirm_interval = 2.0
+# Adaptive fee polling: while waiting for the network fee to fall to
+# max_network_fee, re-quote fast when close, slow when far above.
+poll_min_seconds = 0.5     # interval when fee is at/near the threshold
+poll_max_seconds = 5.0     # interval when fee is far above the threshold
+poll_far_ratio = 0.3       # fee >= 30% above threshold -> use poll_max
+
+[swap_all]
+# Amount (in the sell instrument) used by the one-shot "swap 1x all pairs" command.
+sell_amount = 1
+
+[telegram]
+enabled = true
+
+[dashboard]
+refresh_seconds = 5
+# Data hosts (all read with the operator-key Bearer / anon session — no cookie):
+#   api_base_url    -> /v1/history/trading + /v1/account/reward_activity
+#   ccview_base_url -> Canton explorer for on-chain trading fees
+api_base_url = "https://api.cantex.io"
+ccview_base_url = "https://ccview.io"
+
+[performance]
+# The most important knobs at scale (hundreds of wallets).
+# max_concurrency caps simultaneous outbound requests across ALL wallets so the
+# host is never stormed. Auth is lazy: a wallet authenticates on first use.
+# refresh_interval = seconds between background portfolio refresh sweeps.
+max_concurrency = 10
+lazy_auth = true
+refresh_interval = 30
+
+# One block per wallet. Secrets are read from .env by name (uppercased):
+#   CANTEX_<NAME>_OPERATOR_KEY   (required) — Ed25519 operator key
+#   CANTEX_<NAME>_TRADING_KEY    (optional) — secp256k1 intent key
+[[wallets]]
+name = "w1"
+
+[[wallets]]
+name = "w2"

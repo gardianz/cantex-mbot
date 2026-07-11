@@ -53,36 +53,77 @@ Findings:
 
 All reads use `aiohttp`.
 
-## Install
+## Install (step by step)
 
-Requires **Python 3.11+** (SDK requirement).
+Requires **Python 3.11+** (SDK requirement) and `git`.
+
+### 1. Get the code
+
+```bash
+git clone https://github.com/gardianz/cantex-mbot.git
+cd cantex-mbot
+```
+
+### 2. Get the official SDK (as a sibling folder)
+
+This bot builds on `cantex_sdk`, which is **not on PyPI**. Place it next to the
+bot so the relative path `../cantex_sdk` resolves:
+
+```
+parent/
+├── cantex-mbot/      # this repo
+└── cantex_sdk/       # the official Cantex SDK
+```
+
+If your SDK lives elsewhere, just adjust the path in step 4.
+
+### 3. Create a virtualenv
 
 ```bash
 python3.11 -m venv .venv
-source .venv/bin/activate
-
-pip install -e ../cantex_sdk          # the official SDK (not on PyPI)
-pip install -e ".[dev]"               # this bot + test deps
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python --version                   # confirm 3.11+
 ```
 
-## Configure
+### 4. Install the SDK + this bot
 
 ```bash
-cp config.example.toml config.toml    # edit network, guards, strategy, wallets
-cp .env.example .env                  # per-wallet keys + Telegram (never commit)
+pip install -e ../cantex_sdk       # official SDK (adjust path if needed)
+pip install -e ".[dev]"            # this bot + test deps
 ```
 
-Each `[[wallets]]` block in `config.toml` needs matching entries in `.env`
-(uppercased name):
+### 5. Configure
 
-- `CANTEX_<NAME>_OPERATOR_KEY` — required (Ed25519 operator key)
-- `CANTEX_<NAME>_TRADING_KEY` — optional (secp256k1 intent key)
+```bash
+cp config.example.toml config.toml
+cp .env.example .env
+```
 
-No cookies: history, rebates, and fees are all read with the operator key.
+- **`config.toml`** — network (mainnet/testnet `base_url`), `[guards]`,
+  `[strategy1]`, and one `[[wallets]]` block per wallet.
+- **`.env`** — the keys. For each `[[wallets]] name = "w1"` add entries with the
+  name **uppercased**:
+  - `CANTEX_W1_OPERATOR_KEY` — **required** (Ed25519 operator key). Reads
+    history, rebates, and fees — no cookie/browser needed.
+  - `CANTEX_W1_TRADING_KEY` — optional (secp256k1 intent key; needed to submit
+    **live** swaps).
+  - Optional Telegram: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 
-**`dry_run = true` is the default.** No real swaps are submitted — only quotes
-and guard checks. Set `dry_run = false` (and arm `LIVE` in the CLI) only after
-you have verified behaviour. This bot trades **real funds on mainnet**.
+`.env`, `config.toml`, `secrets/`, and `state.db` are gitignored — **never
+commit them**.
+
+### 6. Verify before trading
+
+```bash
+python -m pytest -q                # all green; no network, keys, or cookies needed
+python -m cantex_bot               # menu → "Web check" confirms keys + endpoints
+```
+
+### 7. Stay in dry-run first
+
+**`dry_run = true` is the default** — only quotes and guard checks, no real swaps.
+This bot trades **real funds on mainnet**. Set `dry_run = false` and arm by typing
+`LIVE` in the CLI **only after** you have verified behaviour.
 
 ## Run
 

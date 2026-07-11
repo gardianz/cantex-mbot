@@ -64,10 +64,18 @@ git clone https://github.com/gardianz/cantex-mbot.git
 cd cantex-mbot
 ```
 
-### 2. Get the official SDK (as a sibling folder)
+### 2. Get the official SDK
 
-This bot builds on `cantex_sdk`, which is **not on PyPI**. Place it next to the
-bot so the relative path `../cantex_sdk` resolves:
+This bot builds on `cantex_sdk`, which is **not on PyPI**. Clone it as a sibling
+folder so the relative path `../cantex_sdk` resolves:
+
+```bash
+cd ..
+git clone https://github.com/caviarnine/cantex_sdk.git
+cd cantex-mbot
+```
+
+Resulting layout:
 
 ```
 parent/
@@ -75,7 +83,8 @@ parent/
 └── cantex_sdk/       # the official Cantex SDK
 ```
 
-If your SDK lives elsewhere, just adjust the path in step 4.
+(Prefer not to keep a sibling checkout? Skip this step and install the SDK
+straight from GitHub in step 4.)
 
 ### 3. Create a virtualenv
 
@@ -90,6 +99,14 @@ python --version                   # confirm 3.11+
 ```bash
 pip install -e ../cantex_sdk       # official SDK (adjust path if needed)
 pip install -e ".[dev]"            # this bot + test deps
+```
+
+No sibling checkout? Install the SDK directly from GitHub instead of the first
+line:
+
+```bash
+pip install git+https://github.com/caviarnine/cantex_sdk.git
+pip install -e ".[dev]"
 ```
 
 ### 5. Configure

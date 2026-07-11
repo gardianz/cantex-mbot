@@ -129,6 +129,20 @@ cp .env.example .env
 `.env`, `config.toml`, `secrets/`, and `state.db` are gitignored — **never
 commit them**.
 
+**Bulk-add wallets.** To add many wallets at once, paste your key dump into a
+text file (one wallet = five lines: name, mnemonic, `Cantex::` address, operator
+key, trading key — the key lines accept `op:`/`operator key:` and `tk:`/`trading
+key:` labels) and run:
+
+```bash
+python scripts/add_wallets.py wallets.txt          # appends to .env + config.toml
+python scripts/add_wallets.py wallets.txt --dry-run  # validate first, write nothing
+```
+
+It normalises names, validates the 64-char hex keys, is idempotent (skips names
+already present), refuses to write to a file that isn't gitignored, and never
+prints key values. Delete `wallets.txt` afterwards.
+
 ### 6. Verify before trading
 
 ```bash

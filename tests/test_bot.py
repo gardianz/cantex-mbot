@@ -825,7 +825,8 @@ async def test_fetch_history_via_bearer():
     wc._get_json = AsyncMock(return_value=payload)  # type: ignore[method-assign]
     trades = await wc.fetch_trading_history()
     assert len(trades) == 1 and trades[0].amount_input == Decimal("3")
-    wc._get_json.assert_awaited_once_with("/v1/history/trading")
+    # A short first page ends the paging after one request.
+    wc._get_json.assert_awaited_once_with("/v1/history/trading?limit=200&offset=0")
 
 
 @pytest.mark.asyncio
@@ -1037,11 +1038,12 @@ async def test_dashboard_render_smoke():
         network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
     dash = Dashboard(svc, config)
     buf = io.StringIO()
-    RichConsole(file=buf, width=120).print(dash.render())
+    RichConsole(file=buf, width=200).print(dash.render())
     out = buf.getvalue()
     assert "CANTEX DASHBOARD" in out
     assert "PORTFOLIO" in out and "WALLETS" in out
     assert "Paid" in out and "812" in out
+    assert "PROFIT" in out and "LOSS" in out
 
 
 # -- Telegram command bot (/stats) -----------------------------------------
@@ -1106,3 +1108,82 @@ async def test_command_bot_unknown_command(monkeypatch):
     await bot._dispatch({"message": {"chat": {"id": 123}, "text": "/nope"}})
     assert seen == []
     assert sent and "Unknown command" in sent[0] and "/stats" in sent[0]
+
+
+# -- history pagination + loss-in-CC + profit --------------------------------
+
+def _hrow(i: int) -> dict:
+    """A distinct trading-history row (unique pool_cid + amount for dedup)."""
+    return {
+        "timestamp_utc": "2026-07-10 10:00:00.0+00",
+        "token_input_instrument_id": "USDCX", "token_output_instrument_id": "cBTC",
+        "amount_input": str(i), "amount_output": "1", "pool_cid": f"p{i}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_pages_until_short():
+    from cantex_bot.webclient import WebClient
+    wc = WebClient(token_provider=AsyncMock(return_value="t"))
+    page1 = {"history_trading": [_hrow(i) for i in range(200)]}
+    page2 = {"history_trading": [_hrow(i) for i in range(200, 205)]}
+    wc._get_json = AsyncMock(side_effect=[page1, page2])  # type: ignore[method-assign]
+    trades = await wc.fetch_trading_history()
+    assert len(trades) == 205
+    assert wc._get_json.await_count == 2  # full page -> page 2; short page -> stop
+    wc._get_json.assert_any_await("/v1/history/trading?limit=200&offset=200")
+
+
+@pytest.mark.asyncio
+async def test_fetch_history_stops_when_paging_ignored():
+    from cantex_bot.webclient import WebClient
+    wc = WebClient(token_provider=AsyncMock(return_value="t"))
+    page = {"history_trading": [_hrow(i) for i in range(200)]}
+    wc._get_json = AsyncMock(return_value=page)  # same page every call
+    trades = await wc.fetch_trading_history()
+    assert len(trades) == 200            # dupes dropped
+    assert wc._get_json.await_count == 2  # page 2 adds nothing -> stop
+
+
+def test_to_cc_converts_and_guards_zero():
+    from cantex_bot.portfolio import PortfolioService
+    assert PortfolioService._to_cc(Decimal("10"), Decimal("2")) == Decimal("5")
+    assert PortfolioService._to_cc(Decimal("10"), Decimal("0")) == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_profit_totals_sum_per_wallet():
+    svc = _fake_portfolio()
+    await svc.refresh_all()
+    s = svc.snaps["w1"]
+    s.profit_yesterday = Decimal("3")
+    s.profit_week = Decimal("4")
+    s.loss_yesterday = Decimal("1")
+    t = svc.totals()
+    assert t.profit_yesterday == Decimal("3")
+    assert t.profit_week == Decimal("4")
+    assert t.loss_yesterday == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_profit_cell_colors_gain_green_loss_red():
+    from cantex_bot.dashboard import Dashboard
+    svc = _fake_portfolio()
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"),
+        strategy1=SimpleNamespace(daily_swap_target=50, cc_symbol="CC"))
+    dash = Dashboard(svc, config)
+    assert dash._profit_part(Decimal("2"))[1] == "green3"
+    assert dash._profit_part(Decimal("-2"))[1] == "red"
+    assert dash._profit_part(Decimal("0"))[0] == "0.00"
+
+
+@pytest.mark.asyncio
+async def test_fee_ttl_throttles_ccview(monkeypatch):
+    """Fees are fetched once, then reused until fee_ttl — no ccview call the
+    second sweep (the fix for the HTTP 429 spam)."""
+    svc = _fake_portfolio()
+    await svc.refresh_all()
+    calls_after_first = svc.ccview.party_fee.await_count
+    await svc.refresh_all()  # immediate second sweep, within fee_ttl
+    assert svc.ccview.party_fee.await_count == calls_after_first  # no new ccview calls

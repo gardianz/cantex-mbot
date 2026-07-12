@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .ccview import CCViewClient, fee_windows
@@ -38,14 +39,21 @@ class WalletSnap:
     swaps_today: int = 0
     swaps_24h: int = 0
     swaps_7d: int = 0
-    loss_today: Decimal = Decimal(0)  # USDCX lost over today's complete cycles
-    loss_week: Decimal = Decimal(0)   # USDCX lost over this week's complete cycles
+    # Loss = USDCX-in minus USDCX-back over complete cycles, converted to CC (so
+    # it shares the reward/fee unit and feeds the profit formula).
+    loss_today: Decimal = Decimal(0)      # CC lost over today's complete cycles
+    loss_yesterday: Decimal = Decimal(0)  # CC lost over yesterday's cycles
+    loss_week: Decimal = Decimal(0)       # CC lost over this week's cycles
+    # Profit = rebates - (fee + loss), all in CC.
+    profit_yesterday: Decimal = Decimal(0)
+    profit_week: Decimal = Decimal(0)
     fee_now: Decimal | None = None    # latest live quote network fee (CC)
     fee_min_today: Decimal | None = None
     fee_avg_today: Decimal | None = None
     fee_today: Decimal = Decimal(0)   # CC paid out today (ccview)
     fee_yesterday: Decimal = Decimal(0)
     fee_this_week: Decimal = Decimal(0)
+    fee_updated: float = 0.0          # monotonic time of last ccview fee refresh
     reb_yesterday: Decimal = Decimal(0)
     reb_this_week: Decimal = Decimal(0)
     reb_last_week: Decimal = Decimal(0)
@@ -65,7 +73,10 @@ class Totals:
     swaps_24h: int = 0
     swaps_7d: int = 0
     loss_today: Decimal = Decimal(0)
+    loss_yesterday: Decimal = Decimal(0)
     loss_week: Decimal = Decimal(0)
+    profit_yesterday: Decimal = Decimal(0)
+    profit_week: Decimal = Decimal(0)
     fee_today: Decimal = Decimal(0)
     fee_yesterday: Decimal = Decimal(0)
     fee_this_week: Decimal = Decimal(0)
@@ -87,6 +98,7 @@ class PortfolioService:
         cc_symbol: str = "CC",
         interval: float = 30.0,
         run_state: RunState | None = None,
+        fee_ttl: float = 300.0,
     ) -> None:
         self.manager = manager
         self.store = store
@@ -95,12 +107,21 @@ class PortfolioService:
         self.cc_symbol = cc_symbol.upper()
         self.interval = interval
         self.run_state = run_state
+        # ccview fees change slowly; refetch at most once per fee_ttl seconds so a
+        # 30s sweep over hundreds of wallets does not storm ccview (HTTP 429).
+        self.fee_ttl = fee_ttl
         self.snaps: dict[str, WalletSnap] = {
             n: WalletSnap(name=n) for n in manager.names
         }
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._sweeps = 0
+        # CC price (USDCX per 1 CC) for converting USDCX loss to CC — market-wide,
+        # cached briefly and shared across wallets.
+        self._market = None
+        self._cc_price = Decimal(0)
+        self._cc_price_ts = 0.0
+        self._cc_price_ttl = 60.0
 
     # -- one wallet ----------------------------------------------------------
 
@@ -127,21 +148,33 @@ class PortfolioService:
                     snap.swaps_today = WebClient.count_today(trades)
                     snap.swaps_24h = WebClient.count_since(trades, _DAY)
                     snap.swaps_7d = WebClient.count_since(trades, _WEEK)
-                    snap.loss_today = WebClient.daily_loss(
-                        trades, usdcx_symbol=self.usdcx_symbol)
-                    snap.loss_week = WebClient.weekly_loss(
-                        trades, usdcx_symbol=self.usdcx_symbol)
+                    # USDCX loss over each window, then converted to CC.
+                    cc_price = await self._ensure_cc_price(wallet)
+                    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+                    snap.loss_today = self._to_cc(WebClient.daily_loss(
+                        trades, usdcx_symbol=self.usdcx_symbol), cc_price)
+                    snap.loss_yesterday = self._to_cc(WebClient.daily_loss(
+                        trades, usdcx_symbol=self.usdcx_symbol, day=yesterday), cc_price)
+                    snap.loss_week = self._to_cc(WebClient.weekly_loss(
+                        trades, usdcx_symbol=self.usdcx_symbol), cc_price)
                     reb = await wallet.web.fetch_rebates()
                     snap.reb_yesterday = reb.yesterday
                     snap.reb_this_week = reb.this_week
                     snap.reb_last_week = reb.last_week
                     snap.reb_status = reb.last_week_status
-                fw = fee_windows()
-                snap.fee_today = (await self.ccview.party_fee(info.address, *fw["today"])).fee
-                snap.fee_yesterday = (await self.ccview.party_fee(info.address, *fw["yesterday"])).fee
-                snap.fee_this_week = (await self.ccview.party_fee(info.address, *fw["this_week"])).fee
+                # ccview fees: throttled — reuse the last values until fee_ttl.
+                now_m = time.monotonic()
+                if now_m - snap.fee_updated >= self.fee_ttl:
+                    fw = fee_windows()
+                    snap.fee_today = (await self.ccview.party_fee(info.address, *fw["today"])).fee
+                    snap.fee_yesterday = (await self.ccview.party_fee(info.address, *fw["yesterday"])).fee
+                    snap.fee_this_week = (await self.ccview.party_fee(info.address, *fw["this_week"])).fee
+                    snap.fee_updated = now_m
                 snap.fee_now = self.store.latest_fee(name)
                 snap.fee_min_today, snap.fee_avg_today, _ = self.store.fee_stats_today(name)
+                # Profit = rebates - (fee + loss), in CC, per window.
+                snap.profit_yesterday = snap.reb_yesterday - (snap.fee_yesterday + snap.loss_yesterday)
+                snap.profit_week = snap.reb_this_week - (snap.fee_this_week + snap.loss_week)
                 snap.status = "ok"
                 snap.error = None
                 snap.updated = time.monotonic()
@@ -156,6 +189,33 @@ class PortfolioService:
             if (tok.instrument_symbol or tok.instrument.id).upper() == symbol:
                 return tok.unlocked_amount
         return Decimal(0)
+
+    async def _ensure_cc_price(self, wallet) -> Decimal:
+        """USDCX per 1 CC via a pricing quote, cached market-wide. 0 if it can't
+        be priced (loss then shows 0 CC until the next successful quote)."""
+        now = time.monotonic()
+        if self._cc_price > 0 and now - self._cc_price_ts < self._cc_price_ttl:
+            return self._cc_price
+        try:
+            if self._market is None:
+                from .markets import MarketMap
+                self._market = await MarketMap.build(wallet.sdk)
+            cc = self._market.instrument(self.cc_symbol)
+            usdcx = self._market.instrument(self.usdcx_symbol)
+            probe = Decimal(10)  # a small-but-non-dust ticket
+            q = await wallet.sdk.get_swap_quote(probe, cc, usdcx)
+            price = q.returned_amount / probe
+            if price > 0:
+                self._cc_price = price
+                self._cc_price_ts = now
+        except Exception as exc:  # noqa: BLE001 - pricing is best-effort
+            logger.debug("cc price quote failed: %s", exc)
+        return self._cc_price
+
+    @staticmethod
+    def _to_cc(usdcx_amount: Decimal, cc_price: Decimal) -> Decimal:
+        """Convert a USDCX amount to CC given the USDCX-per-CC price."""
+        return usdcx_amount / cc_price if cc_price > 0 else Decimal(0)
 
     # -- sweep + loop --------------------------------------------------------
 
@@ -212,7 +272,10 @@ class PortfolioService:
             t.swaps_24h += s.swaps_24h
             t.swaps_7d += s.swaps_7d
             t.loss_today += s.loss_today
+            t.loss_yesterday += s.loss_yesterday
             t.loss_week += s.loss_week
+            t.profit_yesterday += s.profit_yesterday
+            t.profit_week += s.profit_week
             t.fee_today += s.fee_today
             t.fee_yesterday += s.fee_yesterday
             t.fee_this_week += s.fee_this_week

@@ -18,6 +18,7 @@ Endpoint (verified live 2026-07-10):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -61,10 +62,13 @@ def _day(value: date | datetime | str) -> str:
 class CCViewClient:
     """Shared, anonymous ccview reader (one session, many parties)."""
 
-    def __init__(self, *, base: str = DEFAULT_CCVIEW_BASE) -> None:
+    def __init__(self, *, base: str = DEFAULT_CCVIEW_BASE, max_concurrency: int = 3) -> None:
         self.base = base.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
         self._authed = False
+        # ccview rate-limits aggressively (HTTP 429). Cap our own concurrency so
+        # a full portfolio sweep cannot storm it, and back off on any 429.
+        self._sem = asyncio.Semaphore(max_concurrency)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -102,17 +106,26 @@ class CCViewClient:
             "party_id": party_id, "limit": str(limit), "offset": "0",
             "start": _day(start), "end": _day(end),
         }
-        session = await self._ensure_session()
-        async with session.get(url, params=params) as resp:
-            body = await resp.text()
-            status = resp.status
-        if status == 403:
-            # Session expired — re-init once and retry.
-            self._authed = False
-            session = await self._ensure_session()
-            async with session.get(url, params=params) as resp:
-                body = await resp.text()
-                status = resp.status
+        body = ""
+        status = 0
+        delay = 1.0
+        async with self._sem:
+            for attempt in range(4):
+                session = await self._ensure_session()
+                async with session.get(url, params=params) as resp:
+                    body = await resp.text()
+                    status = resp.status
+                    retry_after = resp.headers.get("Retry-After")
+                if status == 403:            # session expired — re-init and retry
+                    self._authed = False
+                    continue
+                if status == 429 and attempt < 3:   # rate-limited — back off
+                    wait = (float(retry_after) if retry_after and retry_after.isdigit()
+                            else delay)
+                    await asyncio.sleep(min(wait, 10.0))
+                    delay *= 2
+                    continue
+                break
         if status >= 400:
             raise CCViewError(f"ccview HTTP {status}: {body[:200]}")
         try:

@@ -140,24 +140,61 @@ class WebClient:
 
     # -- trading history -----------------------------------------------------
 
-    async def fetch_trading_history(self) -> list[Trade]:
-        data = await self._get_json("/v1/history/trading")
-        if not isinstance(data, dict):
-            raise WebClientError("history: unexpected payload")
+    @staticmethod
+    def _row_to_trade(row: dict) -> Trade:
+        return Trade(
+            timestamp=_parse_ts(row["timestamp_utc"]),
+            input_id=row.get("token_input_instrument_id", ""),
+            input_admin=row.get("token_input_instrument_admin", ""),
+            output_id=row.get("token_output_instrument_id", ""),
+            output_admin=row.get("token_output_instrument_admin", ""),
+            amount_input=_dec(row.get("amount_input")),
+            amount_output=_dec(row.get("amount_output")),
+            pool_cid=row.get("pool_cid", ""),
+        )
+
+    async def fetch_trading_history(
+        self, *, page_limit: int = 200, max_pages: int = 12, cover_days: int = 8,
+    ) -> list[Trade]:
+        """Recent trades (newest first), paged until the window is covered.
+
+        The endpoint returns at most one page of the newest trades. The weekly
+        loss needs MORE than today's page: at ~50 swaps/day the current week can
+        exceed a single page, so if we only read page one the week silently
+        "resets" to today as older rows fall off it. We therefore page by
+        ``offset`` until a page is short/empty, adds no new rows (an endpoint
+        that ignores paging just repeats page one — dedup catches it and stops),
+        the oldest row seen predates ``cover_days`` (we only need this week plus
+        yesterday), or the page cap is hit."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=cover_days)
         trades: list[Trade] = []
-        for row in data.get("history_trading", []):
-            trades.append(
-                Trade(
-                    timestamp=_parse_ts(row["timestamp_utc"]),
-                    input_id=row.get("token_input_instrument_id", ""),
-                    input_admin=row.get("token_input_instrument_admin", ""),
-                    output_id=row.get("token_output_instrument_id", ""),
-                    output_admin=row.get("token_output_instrument_admin", ""),
-                    amount_input=_dec(row.get("amount_input")),
-                    amount_output=_dec(row.get("amount_output")),
-                    pool_cid=row.get("pool_cid", ""),
-                )
-            )
+        seen: set[tuple] = set()
+        for page in range(max_pages):
+            path = (f"/v1/history/trading?limit={page_limit}"
+                    f"&offset={page * page_limit}")
+            data = await self._get_json(path)
+            if not isinstance(data, dict):
+                raise WebClientError("history: unexpected payload")
+            rows = data.get("history_trading", [])
+            new_in_page = 0
+            oldest: datetime | None = None
+            for row in rows:
+                t = self._row_to_trade(row)
+                key = (row.get("timestamp_utc", ""), t.pool_cid,
+                       str(t.amount_input), str(t.amount_output),
+                       t.input_id, t.output_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                trades.append(t)
+                new_in_page += 1
+                oldest = t.timestamp if oldest is None else min(oldest, t.timestamp)
+            # Stop: no fresh rows (paging ignored / history exhausted), a short
+            # last page, or we have paged back past the window we care about.
+            if new_in_page == 0 or len(rows) < page_limit:
+                break
+            if oldest is not None and oldest < cutoff:
+                break
         return trades
 
     @staticmethod

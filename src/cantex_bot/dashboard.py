@@ -149,7 +149,7 @@ class Dashboard:
             (f"{t.loading} loading", "yellow" if t.loading else _DIM),
         ))
         grid = Table.grid(expand=True, padding=(0, 3))
-        for _ in range(6):
+        for _ in range(7):
             grid.add_column(justify="left")
         lo = _money(t.fee_min_today, 2) if t.fee_min_today is not None else "—"
         av = _money(t.fee_avg_today, 2) if t.fee_avg_today is not None else "—"
@@ -165,6 +165,8 @@ class Dashboard:
             Text.assemble(("swaps_today ", _DIM), (f"{t.swaps_today:,}", "cyan")),
             Text.assemble(("loss d/w ", _DIM), self._loss_part(t.loss_today),
                           ("/", _DIM), self._loss_part(t.loss_week)),
+            Text.assemble(("profit y/w ", _DIM), self._profit_part(t.profit_yesterday),
+                          ("/", _DIM), self._profit_part(t.profit_week)),
         )
         return Group(head, grid)
 
@@ -209,8 +211,19 @@ class Dashboard:
         return _money(v, 2), "red" if v > 0 else "green3"
 
     def _loss_cell(self, day: Decimal, week: Decimal) -> Text:
-        """Daily / this-week loss in USDCX as 'd/w'."""
+        """Today / this-week loss in CC as 'd/w'."""
         return Text.assemble(self._loss_part(day), ("/", _DIM), self._loss_part(week))
+
+    @staticmethod
+    def _profit_part(v: Decimal) -> tuple[str, str]:
+        """(text, style) for one profit value: green if a gain (>0), red if a loss."""
+        if v == 0:
+            return "0.00", _DIM
+        return _money(v, 2), "green3" if v > 0 else "red"
+
+    def _profit_cell(self, yest: Decimal, week: Decimal) -> Text:
+        """Yesterday / this-week profit in CC as 'y/w' = rebates - (fee + loss)."""
+        return Text.assemble(self._profit_part(yest), ("/", _DIM), self._profit_part(week))
 
     def _route_cell(self, name: str) -> Text:
         """The trade route the strategy is on / heading to (own column)."""
@@ -263,6 +276,7 @@ class Dashboard:
         t.add_column("FEE now", justify="right", no_wrap=True)
         t.add_column("SWAP d/t", justify="right", no_wrap=True)
         t.add_column("LOSS d/w", justify="right", no_wrap=True)
+        t.add_column("PROFIT y/w", justify="right", no_wrap=True)
         t.add_column("FEE t/y/w", justify="right", no_wrap=True)
         t.add_column("REB y/w/lw", justify="right", no_wrap=True)
         t.add_column("ROUTE", no_wrap=True, overflow="ellipsis")
@@ -271,7 +285,7 @@ class Dashboard:
             s = self.service.snaps[name]
             dot, dstyle = _STATUS.get(s.status, ("○", _DIM))
             if s.status == "loading":
-                t.add_row(Text(dot, dstyle), name, *["[dim]…[/dim]"] * 9, "[dim]loading[/dim]")
+                t.add_row(Text(dot, dstyle), name, *["[dim]…[/dim]"] * 10, "[dim]loading[/dim]")
                 continue
             # FEE now: read live so it tracks the strategy's fresh quotes,
             # not just the slower portfolio sweep.
@@ -285,6 +299,7 @@ class Dashboard:
                 Text(fee_now, "yellow" if live_fee is not None else _DIM),
                 self._swap_cell(name, s),
                 self._loss_cell(s.loss_today, s.loss_week),
+                self._profit_cell(s.profit_yesterday, s.profit_week),
                 _fee3(s.fee_today, s.fee_yesterday, s.fee_this_week),
                 _fee3(s.reb_yesterday, s.reb_this_week, s.reb_last_week),
                 self._route_cell(name),

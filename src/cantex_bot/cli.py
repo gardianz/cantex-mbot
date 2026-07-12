@@ -392,12 +392,13 @@ class App:
     async def _cmd_help(self, _arg: str) -> str:
         return (
             "Cantex bot commands:\n"
-            "/stats  — per-wallet target progress, loss (day/week), fee today\n"
+            "/stats  — per-wallet target, loss d/w, profit y/w, fee today (all CC)\n"
             "/help   — this message"
         )
 
     async def _cmd_stats(self, _arg: str) -> str:
-        """Per-wallet table: TARGET (done/target), LOSS d/w (USDCX), FEE today (CC)."""
+        """Per-wallet table (all CC): TARGET (done/target), LOSS d/w, PROFIT y/w
+        (rebates - fee - loss), FEE today."""
         from datetime import datetime, timezone
 
         # Fresh numbers: if the background cache is cold, sweep once inline.
@@ -405,10 +406,9 @@ class App:
             await self.service.refresh_once()
 
         default_target = getattr(self.config.strategy1, "daily_swap_target", 0)
-        rows: list[tuple[str, str, str, str]] = []
+        rows: list[tuple[str, str, str, str, str]] = []
         d_done = d_target = 0
-        loss_d = loss_w = Decimal(0)
-        fee_sum = Decimal(0)
+        loss_d = loss_w = prof_y = prof_w = fee_sum = Decimal(0)
         for name in self.manager.names:
             s = self.service.snaps.get(name)
             if s is None:
@@ -422,29 +422,36 @@ class App:
             d_target += target
             loss_d += s.loss_today
             loss_w += s.loss_week
+            prof_y += s.profit_yesterday
+            prof_w += s.profit_week
             fee_sum += s.fee_today
             flag = "" if s.status == "ok" else f" ({s.status})"
             rows.append((
                 name[:12],
                 f"{done}/{target}",
                 f"{_sig(s.loss_today)}/{_sig(s.loss_week)}",
+                f"{_sig(s.profit_yesterday)}/{_sig(s.profit_week)}",
                 f"{s.fee_today:.3f}{flag}",
             ))
 
         w0 = max([12] + [len(r[0]) for r in rows])
         w1 = max([6] + [len(r[1]) for r in rows])
-        w2 = max([9] + [len(r[2]) for r in rows])
-        header = f"{'WALLET':<{w0}}  {'TARGET':>{w1}}  {'LOSS d/w':>{w2}}  FEE(CC)"
+        w2 = max([8] + [len(r[2]) for r in rows])
+        w3 = max([9] + [len(r[3]) for r in rows])
+        header = (f"{'WALLET':<{w0}}  {'TARGET':>{w1}}  {'LOSS d/w':>{w2}}  "
+                  f"{'PROFIT y/w':>{w3}}  FEE(CC)")
         lines = [header, "-" * len(header)]
-        for name, tgt, loss, fee in rows:
-            lines.append(f"{name:<{w0}}  {tgt:>{w1}}  {loss:>{w2}}  {fee}")
+        for name, tgt, loss, prof, fee in rows:
+            lines.append(f"{name:<{w0}}  {tgt:>{w1}}  {loss:>{w2}}  {prof:>{w3}}  {fee}")
         total = (
             f"{'TOTAL':<{w0}}  {f'{d_done}/{d_target}':>{w1}}  "
-            f"{f'{_sig(loss_d)}/{_sig(loss_w)}':>{w2}}  {fee_sum:.3f}"
+            f"{f'{_sig(loss_d)}/{_sig(loss_w)}':>{w2}}  "
+            f"{f'{_sig(prof_y)}/{_sig(prof_w)}':>{w3}}  {fee_sum:.3f}"
         )
         lines += ["-" * len(header), total]
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        title = f"📊 Cantex stats — {stamp}  ({len(rows)} wallets)"
+        title = (f"📊 Cantex stats — {stamp}  ({len(rows)} wallets)  "
+                 f"loss/profit/fee in CC")
         return title + "\n\n" + "\n".join(lines)
 
     # -- main loop -----------------------------------------------------------

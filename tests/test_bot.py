@@ -1333,3 +1333,32 @@ async def test_execute_swap_bypass_guards_overrides_reject(tmp_path):
         sell_symbol="USDCX", buy_symbol="CBTC", direction="buy", bypass_guards=True)
     assert out2.ok and out2.counted and not out2.reject_reasons
     store.close()
+
+
+# -- per-pair fees + base column ---------------------------------------------
+
+def test_pair_fee_stats(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.record_fee("w1", "A->B", Decimal("0.70"))
+    store.record_fee("w2", "A->B", Decimal("0.72"))
+    store.record_fee("w1", "C->D", Decimal("0.90"))
+    stats = {p: (lat, mn, av, n) for p, lat, mn, av, n in store.pair_fee_stats()}
+    assert set(stats) == {"A->B", "C->D"}
+    lat, mn, av, n = stats["A->B"]
+    assert n == 2 and mn == Decimal("0.7") and lat == Decimal("0.72")  # latest row
+    assert stats["C->D"][3] == 1
+    store.close()
+
+
+def test_dashboard_base_column_follows_runstate():
+    from cantex_bot.dashboard import Dashboard
+    from cantex_bot.runstate import RunState
+    svc = _fake_portfolio()
+    cfg = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"),
+        strategy1=SimpleNamespace(daily_swap_target=50, cc_symbol="CC",
+                                  usdcx_symbol="USDCX"))
+    assert Dashboard(svc, cfg)._base_symbol() == "USDCX"          # default
+    rs = RunState()
+    rs.begin(["w1"], ["USDCX"], base_symbol="frxusd.b")
+    assert Dashboard(svc, cfg, rs)._base_symbol() == "FRXUSD.B"   # follows run

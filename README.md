@@ -37,9 +37,12 @@ built on the official `cantex_sdk`.
   cache with bounded concurrency (`max_concurrency`), and the dashboard paints
   from that cache instantly. Rows show `loading` until their first refresh lands.
 - **Dashboard** (`rich`) — a portfolio summary (totals across all wallets) over a
-  paged, scrollable per-wallet table (USDCX, CC, swaps t/24h/7d, fee 7d, rebate
-  last-week + `Paid` status), plus a live LOG panel. Scroll with ↑↓/PgUp/PgDn,
-  `g`/`G` top/end, `r` refresh, `q` back.
+  paged, scrollable per-wallet table. The first balance column tracks the active
+  **base currency** (USDCX by default, or the strategy's base), alongside CC,
+  the pair token, swaps d/t, loss & profit (CC), fees, rebate + `Paid` status,
+  route and status. Below it a **PAIR FEES** panel shows each pair's current
+  network fee (they differ per pool) with today's min/avg, plus a live LOG
+  panel. Scroll with ↑↓/PgUp/PgDn, `g`/`G` top/end, `r` refresh, `q` back.
 - **Instant menu, lazy auth** — the menu appears immediately; each wallet
   authenticates on first use (not all up front), so hundreds of unused wallets
   cost nothing.

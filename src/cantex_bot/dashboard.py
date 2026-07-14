@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _ACCENT = "cyan"
 _BORDER = "grey37"
 _DIM = "grey42"
+_MAX_PAIR_ROWS = 14      # cap on rows in the PAIR FEES panel
 
 
 def _money(d: Decimal, places: int = 4) -> str:
@@ -88,18 +89,32 @@ class Dashboard:
         self.console = Console()
         self.offset = 0
         self._dirty = asyncio.Event()
+        self._pairs: list = []      # per-pair fee stats for the current render
 
     def _default_target(self) -> int:
         s1 = getattr(self.config, "strategy1", None)
         return getattr(s1, "daily_swap_target", 0)
 
+    def _base_symbol(self) -> str:
+        """The base currency shown in the first balance column (strategy base, or
+        USDCX)."""
+        if self.run_state is not None and getattr(self.run_state, "base_symbol", None):
+            return self.run_state.base_symbol.upper()
+        s1 = getattr(self.config, "strategy1", None)
+        return getattr(s1, "usdcx_symbol", "USDCX").upper()
+
     # -- rendering -----------------------------------------------------------
 
     def _page_size(self) -> int:
-        # header(2) + summary(4) + table head(2) + log(10) + footer(2) ≈ 20
-        return max(4, self.console.size.height - 20)
+        # header(2) + summary(4) + table head(2) + log(10) + footer(2) ≈ 20,
+        # minus the pair-fee panel when shown.
+        pf = len(self._pairs)
+        panel = (min(pf, _MAX_PAIR_ROWS) + 3) if pf else 0
+        return max(4, self.console.size.height - 20 - panel)
 
     def render(self) -> Group:
+        pf = getattr(self.service.store, "pair_fee_stats", None)
+        self._pairs = pf() if callable(pf) else []
         page = self._page_size()
         names = self.service.manager.names
         n = len(names)
@@ -109,16 +124,15 @@ class Dashboard:
         if self.offset < 0:
             self.offset = 0
         visible = names[self.offset:self.offset + page]
-        return Group(
-            self._header(),
-            Text(""),
-            self._summary(),
-            Text(""),
-            self._wallet_table(visible),
-            Text(""),
-            self._log_panel(),
-            self._footer(n, page),
-        )
+        parts = [
+            self._header(), Text(""),
+            self._summary(), Text(""),
+            self._wallet_table(visible), Text(""),
+        ]
+        if self._pairs:
+            parts += [self._pair_fee_panel(), Text("")]
+        parts += [self._log_panel(), self._footer(n, page)]
+        return Group(*parts)
 
     def _header(self) -> Table:
         net = self.config.network
@@ -154,7 +168,7 @@ class Dashboard:
         lo = _money(t.fee_min_today, 2) if t.fee_min_today is not None else "—"
         av = _money(t.fee_avg_today, 2) if t.fee_avg_today is not None else "—"
         grid.add_row(
-            Text.assemble(("USDCX ", _DIM), (_money(t.usdcx, 2), "white"),
+            Text.assemble((f"{self._base_symbol()} ", _DIM), (_money(t.base_bal, 2), "white"),
                           ("  CC ", _DIM), (_money(t.cc, 2), "white")),
             Text.assemble(("fee t/y/w ", _DIM),
                           (_fee3(t.fee_today, t.fee_yesterday, t.fee_this_week))),
@@ -270,7 +284,7 @@ class Dashboard:
         )
         t.add_column("", width=1)                       # status dot
         t.add_column("WALLET", style=_ACCENT, no_wrap=True)
-        t.add_column("USDCX", justify="right", no_wrap=True)
+        t.add_column(self._base_symbol(), justify="right", no_wrap=True)  # base balance
         t.add_column("CC", justify="right", no_wrap=True)
         t.add_column(self._token_header(), justify="right", no_wrap=True)
         t.add_column("FEE now", justify="right", no_wrap=True)
@@ -293,7 +307,7 @@ class Dashboard:
             fee_now = _money(live_fee, 2) if live_fee is not None else "—"
             t.add_row(
                 Text(dot, dstyle), name,
-                _num(s.usdcx, "white", 2),
+                _num(s.base_bal, "white", 2),
                 _num(s.cc, "white", 2),
                 self._token_cell(s),
                 Text(fee_now, "yellow" if live_fee is not None else _DIM),
@@ -305,6 +319,32 @@ class Dashboard:
                 self._route_cell(name),
                 self._status_cell(name, s),
             )
+        return t
+
+    def _pair_fee_panel(self) -> Table:
+        """Latest network fee per pair (they differ per pool), with today's
+        min/avg and observation count."""
+        t = Table(
+            box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
+            title="PAIR FEES (network, CC)", title_style=f"bold {_ACCENT}",
+            title_justify="left",
+        )
+        t.add_column("PAIR", no_wrap=True, overflow="ellipsis")
+        t.add_column("now", justify="right", no_wrap=True)
+        t.add_column("min", justify="right", no_wrap=True)
+        t.add_column("avg", justify="right", no_wrap=True)
+        t.add_column("n", justify="right", no_wrap=True)
+        for pair, latest, mn, av, n in self._pairs[:_MAX_PAIR_ROWS]:
+            t.add_row(
+                Text(pair, "white"),
+                Text(_money(latest, 4), "yellow"),
+                Text(_money(mn, 4), "green3"),
+                Text(_money(av, 4), _DIM),
+                Text(str(n), _DIM),
+            )
+        extra = len(self._pairs) - _MAX_PAIR_ROWS
+        if extra > 0:
+            t.add_row(Text(f"(+{extra} more)", _DIM), "", "", "", "")
         return t
 
     def _log_panel(self) -> Table:

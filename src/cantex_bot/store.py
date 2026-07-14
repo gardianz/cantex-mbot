@@ -210,6 +210,32 @@ class Store:
             ).fetchone()
         return Decimal(str(row["network_fee"])) if row else None
 
+    def pair_fee_stats(
+        self, day: str | None = None
+    ) -> list[tuple[str, Decimal, Decimal, Decimal, int]]:
+        """Per-pair network-fee stats for today (UTC), across all wallets:
+        ``(pair, latest, min, avg, count)`` sorted by pair. Network fee is
+        per-pool so this shows the current fee of every pair the bot has quoted
+        today (the pairs differ, so a single 'FEE now' cannot represent them)."""
+        day = day or _today()
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT pair, MIN(network_fee) AS mn, AVG(network_fee) AS av,
+                          COUNT(*) AS n,
+                          (SELECT network_fee FROM fee_obs f2
+                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             ORDER BY ts DESC LIMIT 1) AS latest
+                   FROM fee_obs f WHERE day = ? GROUP BY pair ORDER BY pair""",
+                (day,),
+            ).fetchall()
+        out: list[tuple[str, Decimal, Decimal, Decimal, int]] = []
+        for r in rows:
+            out.append((
+                r["pair"], Decimal(str(r["latest"])), Decimal(str(r["mn"])),
+                Decimal(str(r["av"])), int(r["n"]),
+            ))
+        return out
+
     def fee_stats_today(
         self, wallet: str, day: str | None = None
     ) -> tuple[Decimal | None, Decimal | None, int]:

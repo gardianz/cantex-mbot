@@ -33,6 +33,8 @@ class WalletSnap:
     status: str = "loading"          # loading | ok | error
     error: str | None = None
     usdcx: Decimal = Decimal(0)
+    base_symbol: str = "USDCX"        # strategy base currency in force
+    base_bal: Decimal = Decimal(0)    # balance of the base currency (shown col 1)
     cc: Decimal = Decimal(0)          # always-shown reward token (Amulet)
     # Balances of the strategy's selected pair tokens: [(symbol, amount), ...].
     tokens: list[tuple[str, Decimal]] = field(default_factory=list)
@@ -68,6 +70,7 @@ class Totals:
     err: int = 0
     loading: int = 0
     usdcx: Decimal = Decimal(0)
+    base_bal: Decimal = Decimal(0)
     cc: Decimal = Decimal(0)
     swaps_today: int = 0
     swaps_24h: int = 0
@@ -141,7 +144,10 @@ class PortfolioService:
             try:
                 await wallet.ensure_auth()
                 info = await wallet.sdk.get_account_info()
+                base = self._active_base()
                 snap.usdcx = self._balance(info, self.usdcx_symbol)
+                snap.base_symbol = base
+                snap.base_bal = self._balance(info, base)
                 snap.cc = self._balance(info, self.cc_symbol)
                 snap.tokens = [(sym, self._balance(info, sym)) for sym in self._focus_tokens()]
                 if wallet.web is not None:
@@ -188,8 +194,9 @@ class PortfolioService:
 
     @staticmethod
     def _balance(info, symbol: str) -> Decimal:
+        want = symbol.upper()
         for tok in getattr(info, "tokens", []) or []:
-            if (tok.instrument_symbol or tok.instrument.id).upper() == symbol:
+            if (tok.instrument_symbol or tok.instrument.id).upper() == want:
                 return tok.unlocked_amount
         return Decimal(0)
 
@@ -285,6 +292,7 @@ class PortfolioService:
             else:
                 t.loading += 1
             t.usdcx += s.usdcx
+            t.base_bal += s.base_bal
             t.cc += s.cc
             t.swaps_today += s.swaps_today
             t.swaps_24h += s.swaps_24h

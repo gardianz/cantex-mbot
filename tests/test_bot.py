@@ -1432,3 +1432,65 @@ async def test_strategy2_lowest_fee_pair_picks_min_and_records(tmp_path):
     recorded = {p for p, *_ in store.pair_fee_stats()}
     assert recorded == {"USDCX->CBTC", "USDCX->CETH"}              # all probed fees logged
     store.close()
+
+
+# -- dashboard cursor + fee probe --------------------------------------------
+
+def test_dashboard_cursor_navigation():
+    from cantex_bot.dashboard import Dashboard
+    svc = SimpleNamespace(
+        manager=SimpleNamespace(names=[f"w{i}" for i in range(10)]),
+        store=SimpleNamespace())
+    cfg = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"),
+        strategy1=SimpleNamespace(daily_swap_target=1, cc_symbol="CC", usdcx_symbol="USDCX"))
+    d = Dashboard(svc, cfg)
+    n, page = 10, 3
+    assert d._on_key(b"\x1b[B", page, n) is False      # down
+    assert d.cursor == 1 and d.offset == 0
+    for _ in range(5):
+        d._on_key(b"\x1b[B", page, n)                  # cursor -> 6
+    assert d.cursor == 6 and d.offset == 4             # scrolled to keep visible
+    d._on_key(b"g", page, n)
+    assert d.cursor == 0 and d.offset == 0
+    d._on_key(b"G", page, n)
+    assert d.cursor == 9 and d.offset == 7
+    d._on_key(b"\x1b[A", page, n)                      # up
+    assert d.cursor == 8
+    assert d._on_key(b"q", page, n) is True            # quit
+
+
+@pytest.mark.asyncio
+async def test_maybe_probe_fees_records_all_pairs(tmp_path):
+    from cantex_bot.markets import Pair
+    svc = _fake_portfolio()
+    store = Store(tmp_path / "s.db")
+    svc.store = store
+    usdcx = InstrumentId("a", "USDCX")
+    cbtc = InstrumentId("a", "CBTC")
+    ceth = InstrumentId("a", "CETH")
+
+    class _M:
+        def instrument(self, s):
+            return {"USDCX": usdcx, "CBTC": cbtc, "CETH": ceth,
+                    "CC": InstrumentId("a", "CC")}[s.upper()]
+
+        def trade_pairs(self, base, exclude_symbols=()):
+            return [Pair(cbtc, "CBTC", usdcx, ""), Pair(ceth, "CETH", usdcx, "")]
+
+    svc._market = _M()
+    svc._cc_price = Decimal("1")
+    svc.fee_probe_interval = 0.0            # always due
+    wallet = svc.manager.get("w1")
+    wallet.authed = True
+    fees = {"CBTC": Decimal("0.5"), "CETH": Decimal("0.7")}
+
+    def quote(amount, sell, buy):
+        return SimpleNamespace(fees=SimpleNamespace(
+            network_fee=SimpleNamespace(amount=fees[buy.id])))
+
+    wallet.sdk.get_swap_quote = AsyncMock(side_effect=quote)
+    await svc._maybe_probe_fees()
+    recorded = {p for p, *_ in store.pair_fee_stats()}
+    assert recorded == {"USDCX->CBTC", "USDCX->CETH"}   # every pair probed
+    store.close()

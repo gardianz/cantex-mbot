@@ -46,9 +46,11 @@ built on the official `cantex_sdk`.
   paged, scrollable per-wallet table. The first balance column tracks the active
   **base currency** (USDCX by default, or the strategy's base), alongside CC,
   the pair token, swaps d/t, loss & profit (CC), fees, rebate + `Paid` status,
-  route and status. Below it a **PAIR FEES** panel shows each pair's current
-  network fee (they differ per pool) with today's min/avg, plus a live LOG
-  panel. Scroll with ↑↓/PgUp/PgDn, `g`/`G` top/end, `r` refresh, `q` back.
+  route and status. A highlighted **cursor** (`▸`) marks the current wallet;
+  move it with ↑↓/PgUp/PgDn, `g`/`G` top/end (the view scrolls to follow),
+  `r` refresh, `q` back. Below it a **PAIR FEES** panel shows every pair's
+  current network fee (they differ per pool) with today's min/avg — a background
+  probe quotes base→each pool token so all pairs appear, not only swapped ones.
 - **Instant menu, lazy auth** — the menu appears immediately; each wallet
   authenticates on first use (not all up front), so hundreds of unused wallets
   cost nothing.

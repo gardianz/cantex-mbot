@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 _ACCENT = "cyan"
 _BORDER = "grey37"
 _DIM = "grey42"
-_MAX_PAIR_ROWS = 14      # cap on rows in the PAIR FEES panel
+_SELECTED_ROW = "on grey27"   # background of the highlighted (cursor) wallet row
+_MAX_PAIR_ROWS = 30      # cap on rows in the PAIR FEES panel
 
 
 def _money(d: Decimal, places: int = 4) -> str:
@@ -87,7 +88,8 @@ class Dashboard:
         self.config = config
         self.run_state = run_state
         self.console = Console()
-        self.offset = 0
+        self.offset = 0             # index of the first visible row
+        self.cursor = 0             # highlighted wallet row (absolute index)
         self._dirty = asyncio.Event()
         self._pairs: list = []      # per-pair fee stats for the current render
 
@@ -295,18 +297,24 @@ class Dashboard:
         t.add_column("REB y/w/lw", justify="right", no_wrap=True)
         t.add_column("ROUTE", no_wrap=True, overflow="ellipsis")
         t.add_column("STATUS", ratio=1, no_wrap=True, overflow="ellipsis")
-        for name in visible:
+        for i, name in enumerate(visible):
+            selected = (self.offset + i) == self.cursor
+            row_style = _SELECTED_ROW if selected else None
             s = self.service.snaps[name]
             dot, dstyle = _STATUS.get(s.status, ("○", _DIM))
+            # A '▸' pointer (keeping the status colour) marks the selected row.
+            mark = Text("▸", f"bold {dstyle}") if selected else Text(dot, dstyle)
+            wname = Text(name, "bold white" if selected else _ACCENT)
             if s.status == "loading":
-                t.add_row(Text(dot, dstyle), name, *["[dim]…[/dim]"] * 10, "[dim]loading[/dim]")
+                t.add_row(mark, wname, *["[dim]…[/dim]"] * 10, "[dim]loading[/dim]",
+                          style=row_style)
                 continue
             # FEE now: read live so it tracks the strategy's fresh quotes,
             # not just the slower portfolio sweep.
             live_fee = self.service.store.latest_fee(name)
             fee_now = _money(live_fee, 2) if live_fee is not None else "—"
             t.add_row(
-                Text(dot, dstyle), name,
+                mark, wname,
                 _num(s.base_bal, "white", 2),
                 _num(s.cc, "white", 2),
                 self._token_cell(s),
@@ -318,6 +326,7 @@ class Dashboard:
                 _fee3(s.reb_yesterday, s.reb_this_week, s.reb_last_week),
                 self._route_cell(name),
                 self._status_cell(name, s),
+                style=row_style,
             )
         return t
 
@@ -370,36 +379,46 @@ class Dashboard:
         t = Table.grid(expand=True, padding=(0, 1))
         t.add_column(justify="left", ratio=1)
         t.add_column(justify="right")
+        sel = self.service.manager.names[self.cursor] if n else "—"
         t.add_row(
             Text.assemble(
                 (f"rows {start}-{end}/{n}  ", "grey62"),
-                (f"page {cur}/{pages}", "white"),
+                (f"page {cur}/{pages}  ", "white"),
+                ("▸ ", _ACCENT), (f"{sel} ({self.cursor + 1}/{n})", "bold white"),
             ),
-            Text("↑↓ scroll · PgUp/Dn · g/G top/end · r refresh · q back", _DIM),
+            Text("↑↓ move · PgUp/Dn · g/G top/end · r refresh · q back", _DIM),
         )
         return t
 
     # -- key handling --------------------------------------------------------
 
     def _on_key(self, data: bytes, page: int, n: int) -> bool:
-        """Apply a key press. Returns True if the caller should quit."""
+        """Apply a key press. Returns True if the caller should quit. Arrow keys
+        move a highlighted cursor over the wallet rows; the view scrolls only when
+        the cursor would leave the visible page."""
         max_off = max(0, n - page)
         if data in (b"q", b"\x1b"):  # q or lone ESC
             return True
         if data in (b"\x1b[A", b"k"):
-            self.offset -= 1
+            self.cursor -= 1
         elif data in (b"\x1b[B", b"j"):
-            self.offset += 1
+            self.cursor += 1
         elif data in (b"\x1b[5~", b"\x02"):  # PgUp / Ctrl-B
-            self.offset -= page
+            self.cursor -= page
         elif data in (b"\x1b[6~", b"\x06"):  # PgDn / Ctrl-F
-            self.offset += page
+            self.cursor += page
         elif data in (b"g", b"\x1b[H"):
-            self.offset = 0
+            self.cursor = 0
         elif data in (b"G", b"\x1b[F"):
-            self.offset = max_off
+            self.cursor = n - 1
         elif data == b"r":
             asyncio.ensure_future(self.service.refresh_all())
+        # Clamp cursor, then scroll the window just enough to keep it visible.
+        self.cursor = max(0, min(self.cursor, max(0, n - 1)))
+        if self.cursor < self.offset:
+            self.offset = self.cursor
+        elif self.cursor >= self.offset + page:
+            self.offset = self.cursor - page + 1
         self.offset = max(0, min(self.offset, max_off))
         self._dirty.set()
         return False

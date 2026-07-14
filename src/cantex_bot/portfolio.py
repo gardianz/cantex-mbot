@@ -126,6 +126,10 @@ class PortfolioService:
         self._cc_price_base = ""
         self._cc_price_ts = 0.0
         self._cc_price_ttl = 60.0
+        # Periodically quote base->every pool token so the dashboard's PAIR FEES
+        # panel lists ALL pairs, not just the ones actually swapped.
+        self.fee_probe_interval = 90.0
+        self._last_fee_probe = 0.0
 
     # -- one wallet ----------------------------------------------------------
 
@@ -251,6 +255,37 @@ class PortfolioService:
             return_exceptions=True,
         )
         self._sweeps += 1
+        await self._maybe_probe_fees()
+
+    async def _maybe_probe_fees(self) -> None:
+        """Quote base->every pool token (from one authed wallet) so PAIR FEES
+        covers all pairs. Throttled by ``fee_probe_interval``; best-effort."""
+        now = time.monotonic()
+        if now - self._last_fee_probe < self.fee_probe_interval:
+            return
+        if self._market is None or self._cc_price <= 0:
+            return  # no market/price yet (first sweeps) — nothing to size a quote
+        base_symbol = self._active_base()
+        wallet = next((self.manager.get(n) for n in self.manager.names
+                       if getattr(self.manager.get(n), "authed", False)), None)
+        if wallet is None:
+            return
+        try:
+            base = self._market.instrument(base_symbol)
+            pairs = self._market.trade_pairs(base_symbol, exclude_symbols=(self.cc_symbol,))
+        except Exception:  # noqa: BLE001
+            return
+        notional = self._cc_price * Decimal(10)  # ~10 CC worth in the base
+        self._last_fee_probe = now
+        for pair in pairs:
+            try:
+                async with self.manager.sem:
+                    q = await wallet.sdk.get_swap_quote(notional, base, pair.token)
+            except Exception:  # noqa: BLE001 - a probe failure must not break the sweep
+                continue
+            self.store.record_fee(
+                wallet.name, f"{base_symbol}->{pair.token_symbol}",
+                q.fees.network_fee.amount)
 
     async def _run(self) -> None:
         while not self._stop.is_set():

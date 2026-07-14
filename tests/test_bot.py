@@ -1362,3 +1362,73 @@ def test_dashboard_base_column_follows_runstate():
     rs = RunState()
     rs.begin(["w1"], ["USDCX"], base_symbol="frxusd.b")
     assert Dashboard(svc, cfg, rs)._base_symbol() == "FRXUSD.B"   # follows run
+
+
+# -- Strategy 2 (auto lowest-fee) --------------------------------------------
+
+def _s2(store):
+    from cantex_bot.strategies.strategy2 import Strategy2
+    from cantex_bot.config import Strategy1Config
+    return Strategy2(SimpleNamespace(wallets={}, names=[]), SimpleNamespace(),
+                     Strategy1Config(), notifier(), store, tokens=["CBTC", "CETH"])
+
+
+def _s2_pairs():
+    from cantex_bot.markets import Pair
+    usdcx = InstrumentId("a", "USDCX")
+    cbtc = InstrumentId("a", "CBTC")
+    ceth = InstrumentId("a", "CETH")
+    pairs = [Pair(cbtc, "CBTC", usdcx, ""), Pair(ceth, "CETH", usdcx, "")]
+    return usdcx, InstrumentId("a", "CC"), cbtc, ceth, pairs
+
+
+@pytest.mark.asyncio
+async def test_strategy2_pick_sells_held_first():
+    usdcx, cc, cbtc, ceth, pairs = _s2_pairs()
+    bals = {usdcx: Decimal("100"), cbtc: Decimal("0.5"), ceth: Decimal("0"), cc: Decimal("50")}
+    info = SimpleNamespace(get_balance=lambda i: bals[i])
+    wallet = SimpleNamespace(name="w1",
+                             sdk=SimpleNamespace(get_account_info=AsyncMock(return_value=info)))
+    strat = _s2(None)
+    strat._token_cc_value = AsyncMock(return_value=Decimal("110"))  # >= min ticket
+    strat._lowest_fee_pair = AsyncMock()                            # must NOT run
+    pair, sellable, tbal, ubal, cbal = await strat._pick(
+        wallet, pairs, usdcx, cc, {"notional": Decimal("10")})
+    assert sellable and pair.token_symbol == "CBTC" and tbal == Decimal("0.5")
+    strat._lowest_fee_pair.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strategy2_pick_buys_lowest_fee_when_flat():
+    usdcx, cc, cbtc, ceth, pairs = _s2_pairs()
+    bals = {usdcx: Decimal("100"), cbtc: Decimal("0"), ceth: Decimal("0"), cc: Decimal("50")}
+    info = SimpleNamespace(get_balance=lambda i: bals[i])
+    wallet = SimpleNamespace(name="w1",
+                             sdk=SimpleNamespace(get_account_info=AsyncMock(return_value=info)))
+    strat = _s2(None)
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
+    strat._lowest_fee_pair = AsyncMock(return_value=pairs[1])       # CETH
+    pair, sellable, tbal, ubal, cbal = await strat._pick(
+        wallet, pairs, usdcx, cc, {"notional": Decimal("10")})
+    assert not sellable and pair.token_symbol == "CETH"
+    strat._lowest_fee_pair.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_strategy2_lowest_fee_pair_picks_min_and_records(tmp_path):
+    usdcx, cc, cbtc, ceth, pairs = _s2_pairs()
+    fees = {"CBTC": Decimal("0.80"), "CETH": Decimal("0.60")}
+
+    def quote(amount, sell, buy):
+        return SimpleNamespace(fees=SimpleNamespace(
+            network_fee=SimpleNamespace(amount=fees[buy.id])))
+
+    wallet = SimpleNamespace(name="w1",
+                             sdk=SimpleNamespace(get_swap_quote=AsyncMock(side_effect=quote)))
+    store = Store(tmp_path / "s.db")
+    strat = _s2(store)
+    best = await strat._lowest_fee_pair(wallet, pairs, usdcx, Decimal("10"))
+    assert best.token_symbol == "CETH"                             # lowest fee
+    recorded = {p for p, *_ in store.pair_fee_stats()}
+    assert recorded == {"USDCX->CBTC", "USDCX->CETH"}              # all probed fees logged
+    store.close()

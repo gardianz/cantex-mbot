@@ -21,6 +21,7 @@ from .runstate import RunState
 from .scheduler import StrategyScheduler
 from .store import Store
 from .strategies.strategy1 import Strategy1
+from .strategies.strategy2 import Strategy2
 from .swap_all import AmountError, AmountSpec, swap_selected
 from .swapper import SwapEngine
 from .telegram import TelegramCommandBot, TelegramNotifier
@@ -144,8 +145,18 @@ class App:
             return None
 
     async def action_strategy1(self) -> None:
+        await self._launch_strategy(Strategy1, "Strategy 1")
+
+    async def action_strategy2(self) -> None:
+        await self._launch_strategy(Strategy2, "Strategy 2 (auto lowest-fee)")
+
+    async def _launch_strategy(self, strategy_cls, title: str) -> None:
+        """Shared setup for the base<->token strategies: pick run mode, base
+        token, candidate pairs, execution mode, then run with the live
+        dashboard. ``strategy_cls`` picks targets (Strategy1 = round-robin,
+        Strategy2 = lowest fee)."""
         mode = await questionary.select(
-            "Strategy 1 run mode?",
+            f"{title} run mode?",
             choices=["Run once (today)", "Run daily (loop)", "Back"],
         ).ask_async()
         if not mode or mode == "Back":
@@ -168,24 +179,25 @@ class App:
         if not base_sym:
             return
 
-        # Choose which base<->token pairs to cycle (default: all).
+        # Choose the candidate base<->token pairs (default: all). Strategy2 will
+        # auto-pick the lowest-fee one of these on each buy.
         syms = [p.token_symbol
                 for p in market.trade_pairs(base_sym, exclude_symbols=(cc,))]
         if not syms:
             console.print(f"[red]No tradeable tokens for base {base_sym}.[/red]")
             return
         tokens = await questionary.checkbox(
-            f"Pairs to trade ({base_sym} <-> token; space toggle, enter confirm):",
+            f"Candidate pairs ({base_sym} <-> token; space toggle, enter confirm):",
             choices=[questionary.Choice(s, checked=True) for s in syms],
         ).ask_async()
         if not tokens:
             console.print("[yellow]No pair selected — nothing to run.[/yellow]")
             return
         console.print(
-            f"Trading {len(tokens)} pair(s) [base {base_sym}]: {', '.join(tokens)}")
+            f"{title}: {len(tokens)} pair(s) [base {base_sym}]: {', '.join(tokens)}")
 
         await self._choose_execution_mode()
-        strategy = Strategy1(
+        strategy = strategy_cls(
             self.manager, self.engine, self.config.strategy1, self.notifier, self.store,
             run_state=self.run_state, tokens=tokens, base_symbol=base_sym,
         )
@@ -515,6 +527,7 @@ class App:
         actions = {
             "Dashboard (live)": self.action_dashboard,
             "Strategy 1": self.action_strategy1,
+            "Strategy 2 (auto lowest-fee)": self.action_strategy2,
             "Swap 1x all pairs": self.action_swap_all,
             "Manual swap": self.action_manual_swap,
             "Web check (history + rebates)": self.action_web_check,

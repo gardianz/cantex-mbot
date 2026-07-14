@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 class Strategy1(Strategy):
     name = "strategy1"
+    label = "Strategy1"          # display name in logs / Telegram (subclasses override)
 
     def __init__(
         self,
@@ -69,7 +70,7 @@ class Strategy1(Strategy):
 
     async def run(self, stop: asyncio.Event) -> None:
         await self.notifier.send(
-            f"▶️ Strategy1 start (base {self.base_symbol}, "
+            f"▶️ {self.label} start (base {self.base_symbol}, "
             f"target {self.config.daily_swap_target}/wallet, "
             f"cc_units={self.config.cc_units}, dry_run={self.engine.dry_run})"
         )
@@ -87,11 +88,11 @@ class Strategy1(Strategy):
                 self.run_state.end()
         for name, res in zip(self.manager.names, results):
             if isinstance(res, Exception):
-                logger.error("Strategy1 wallet %s crashed: %s", name, res)
+                logger.error("%s wallet %s crashed: %s", self.label, name, res)
                 if self.run_state is not None:
                     self.run_state.finish(name, status=run_status.ERROR)
-                await self.notifier.send(f"❌ Strategy1 [{name}] crashed: {res}")
-        await self.notifier.send("⏹️ Strategy1 finished")
+                await self.notifier.send(f"❌ {self.label} [{name}] crashed: {res}")
+        await self.notifier.send(f"⏹️ {self.label} finished")
 
     async def _selected_tokens(self) -> list[str]:
         """Token symbols the strategy will trade this run."""
@@ -123,7 +124,7 @@ class Strategy1(Strategy):
             logger.warning("[%s] no tradeable pairs (tokens=%s)", wallet.name, self.tokens)
             self._st(wallet.name, status=run_status.STOPPED)
             await self.notifier.send(
-                f"⚠️ Strategy1 [{wallet.name}] no tradeable pairs "
+                f"⚠️ {self.label} [{wallet.name}] no tradeable pairs "
                 f"(selected: {self.tokens or 'all'})"
             )
             return
@@ -143,7 +144,8 @@ class Strategy1(Strategy):
         max_consecutive_fail = max(6, len(pairs) * 2)
         consecutive_fail = 0
         session_executed = 0
-        idx = 0
+        # Per-wallet selection state for `_pick` (round-robin index + buy size).
+        state = {"idx": 0, "notional": buy_notional}
 
         # Daily target counts successful swaps from the web trading history.
         prior_web = await self._web_swaps_today(wallet)
@@ -162,14 +164,14 @@ class Strategy1(Strategy):
                 session_executed = 0
                 consecutive_fail = 0
                 insufficient_streak = 0
-                idx = 0
+                state["idx"] = 0
                 self._web_cache.pop(wallet.name, None)
                 prior_web = await self._web_swaps_today(wallet)
                 self._st(wallet.name, status=run_status.RUNNING,
                          route="", plan="new day", done=0)
                 logger.info("[%s] new UTC day — daily target reset", wallet.name)
                 await self.notifier.send(
-                    f"🔄 Strategy1 [{wallet.name}] new UTC day — target reset")
+                    f"🔄 {self.label} [{wallet.name}] new UTC day — target reset")
 
             done = await self._current_done(wallet, prior_web, session_executed)
             self._st(wallet.name, done=done)
@@ -198,22 +200,9 @@ class Strategy1(Strategy):
                     break
                 continue
 
-            pair = pairs[idx % len(pairs)]
-            idx += 1
-            token_bal, usdcx_bal, cc_bal = await self._balances(
-                wallet, pair.token, usdcx, cc)
+            pair, sellable, token_bal, usdcx_bal, cc_bal = await self._pick(
+                wallet, pairs, usdcx, cc, state)
             tok = pair.token_symbol
-
-            # A held token is only sellable if it is worth at least the min ticket
-            # (10 CC). A smaller amount is dust — ignore it and buy instead.
-            sellable = False
-            if token_bal > 0:
-                cc_value = await self._token_cc_value(wallet, pair.token, token_bal, cc)
-                sellable = cc_value >= self.config.min_ticket_cc
-                if not sellable:
-                    logger.info("[%s] %s %s is dust (~%s CC < %s) — buying instead",
-                                wallet.name, token_bal, tok, cc_value,
-                                self.config.min_ticket_cc)
 
             # ROUTE (shown in its own dashboard column) vs STATUS (the phase).
             if sellable:
@@ -319,9 +308,9 @@ class Strategy1(Strategy):
                 wallet.name,
                 status=run_status.DONE if done >= target else run_status.STOPPED,
             )
-        logger.info("[%s] Strategy1 done: %d/%d swaps today", wallet.name, done, target)
+        logger.info("[%s] %s done: %d/%d swaps today", wallet.name, self.label, done, target)
         await self.notifier.send(
-            f"🏁 Strategy1 [{wallet.name}] {done}/{target} swaps today (web-synced)"
+            f"🏁 {self.label} [{wallet.name}] {done}/{target} swaps today (web-synced)"
         )
 
     async def _web_swaps_today(self, wallet: Wallet, ttl: float = 15.0) -> int:
@@ -431,3 +420,25 @@ class Strategy1(Strategy):
             return q.returned_amount
         except CantexError:
             return Decimal(0)
+
+    async def _pick(self, wallet, pairs, usdcx, cc, state):
+        """Choose the next (pair, sellable) and read balances for it.
+
+        Strategy1: plain round-robin over the pairs. A held token worth at least
+        the min ticket is sold; a smaller (dust) amount is ignored so the pair is
+        bought instead. Subclasses override this to change target selection (e.g.
+        Strategy2 picks the lowest-fee pair). Returns
+        ``(pair, sellable, token_bal, usdcx_bal, cc_bal)``."""
+        pair = pairs[state["idx"] % len(pairs)]
+        state["idx"] += 1
+        token_bal, usdcx_bal, cc_bal = await self._balances(
+            wallet, pair.token, usdcx, cc)
+        sellable = False
+        if token_bal > 0:
+            cc_value = await self._token_cc_value(wallet, pair.token, token_bal, cc)
+            sellable = cc_value >= self.config.min_ticket_cc
+            if not sellable:
+                logger.info("[%s] %s %s is dust (~%s CC < %s) — buying instead",
+                            wallet.name, token_bal, pair.token_symbol, cc_value,
+                            self.config.min_ticket_cc)
+        return pair, sellable, token_bal, usdcx_bal, cc_bal

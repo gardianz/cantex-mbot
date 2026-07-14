@@ -15,6 +15,12 @@ built on the official `cantex_sdk`.
   history** (with the local counter as a fallback), so it stays in sync with
   what the exchange actually recorded. Selecting the pairs drops you straight
   into the live dashboard.
+- **Strategy 2 (auto lowest-fee)** — same as Strategy 1, but the destination is
+  not round-robin: on each buy the bot quotes every candidate pair and picks the
+  one with the **lowest network fee**, keeping the base token fixed. Once a
+  wallet holds a token it stays on it — it will not switch, only wait (guards)
+  for that token's fee to drop and sell it back to base, then pick a fresh
+  lowest-fee destination. Same target, guards, and dashboard as Strategy 1.
 - **Swap (pick & go)** — choose which wallets (one, several, or all), a
   direction — **buy** (USDCX→token), **sell** (token→USDCX), or **swap**
   (token→token, routed multi-hop via CC) — the token(s), and an amount given as
@@ -182,9 +188,10 @@ This bot trades **real funds on mainnet**. Set `dry_run = false` and arm by typi
 python -m cantex_bot          # or: cantex-bot
 ```
 
-Menu: Dashboard · Strategy 1 · Swap 1× all pairs · Manual swap · Web check ·
-Wallet status · Quit. The menu shows immediately (auth runs in the background);
-live execution requires typing `LIVE` to arm.
+Menu: Dashboard · Strategy 1 · Strategy 2 (auto lowest-fee) · Swap 1× all pairs ·
+Manual swap · Web check · Wallet status · Add wallets · Quit. The menu shows
+immediately (auth runs in the background); live execution requires typing `LIVE`
+to arm.
 
 **Web check** reads each wallet's history, weekly rebate, and on-chain fee — use
 it to confirm the keys and data endpoints work before relying on them.

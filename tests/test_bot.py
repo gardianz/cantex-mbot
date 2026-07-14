@@ -1339,14 +1339,16 @@ async def test_execute_swap_bypass_guards_overrides_reject(tmp_path):
 
 def test_pair_fee_stats(tmp_path):
     store = Store(tmp_path / "s.db")
-    store.record_fee("w1", "A->B", Decimal("0.70"))
-    store.record_fee("w2", "A->B", Decimal("0.72"))
+    store.record_fee("w1", "A->B", Decimal("0.70"), Decimal("0.05"), Decimal("0.10"))
+    store.record_fee("w2", "A->B", Decimal("0.72"), Decimal("0.06"), Decimal("0.11"))
     store.record_fee("w1", "C->D", Decimal("0.90"))
-    stats = {p: (lat, mn, av, n) for p, lat, mn, av, n in store.pair_fee_stats()}
+    stats = {p: (lat, mn, av, slip, pool, n)
+             for p, lat, mn, av, slip, pool, n in store.pair_fee_stats()}
     assert set(stats) == {"A->B", "C->D"}
-    lat, mn, av, n = stats["A->B"]
+    lat, mn, av, slip, pool, n = stats["A->B"]
     assert n == 2 and mn == Decimal("0.7") and lat == Decimal("0.72")  # latest row
-    assert stats["C->D"][3] == 1
+    assert slip == Decimal("0.06") and pool == Decimal("0.11")         # latest slip/pool
+    assert stats["C->D"][5] == 1                                       # count
     store.close()
 
 
@@ -1369,7 +1371,8 @@ def test_dashboard_base_column_follows_runstate():
 def _s2(store):
     from cantex_bot.strategies.strategy2 import Strategy2
     from cantex_bot.config import Strategy1Config
-    return Strategy2(SimpleNamespace(wallets={}, names=[]), SimpleNamespace(),
+    engine = SimpleNamespace(guard=SwapGuard(GuardConfig()))
+    return Strategy2(SimpleNamespace(wallets={}, names=[]), engine,
                      Strategy1Config(), notifier(), store, tokens=["CBTC", "CETH"])
 
 
@@ -1420,8 +1423,7 @@ async def test_strategy2_lowest_fee_pair_picks_min_and_records(tmp_path):
     fees = {"CBTC": Decimal("0.80"), "CETH": Decimal("0.60")}
 
     def quote(amount, sell, buy):
-        return SimpleNamespace(fees=SimpleNamespace(
-            network_fee=SimpleNamespace(amount=fees[buy.id])))
+        return make_quote(net=str(fees[buy.id]))
 
     wallet = SimpleNamespace(name="w1",
                              sdk=SimpleNamespace(get_swap_quote=AsyncMock(side_effect=quote)))
@@ -1486,8 +1488,7 @@ async def test_maybe_probe_fees_records_all_pairs(tmp_path):
     fees = {"CBTC": Decimal("0.5"), "CETH": Decimal("0.7")}
 
     def quote(amount, sell, buy):
-        return SimpleNamespace(fees=SimpleNamespace(
-            network_fee=SimpleNamespace(amount=fees[buy.id])))
+        return make_quote(net=str(fees[buy.id]))
 
     wallet.sdk.get_swap_quote = AsyncMock(side_effect=quote)
     await svc._maybe_probe_fees()

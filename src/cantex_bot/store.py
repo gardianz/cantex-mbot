@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS fee_obs (
     day         TEXT NOT NULL,           -- YYYY-MM-DD (UTC)
     wallet      TEXT NOT NULL,
     pair        TEXT NOT NULL,
-    network_fee REAL NOT NULL            -- CC, absolute
+    network_fee REAL NOT NULL,           -- CC, absolute
+    slippage    REAL NOT NULL DEFAULT 0, -- percent
+    pool_fee    REAL NOT NULL DEFAULT 0  -- percent
 );
 CREATE INDEX IF NOT EXISTS idx_fee_wallet_day ON fee_obs (wallet, day);
 """
@@ -87,6 +89,12 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migrate older DBs: add fee_obs.slippage / pool_fee if missing.
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(fee_obs)")}
+            if "slippage" not in cols:
+                self._conn.execute("ALTER TABLE fee_obs ADD COLUMN slippage REAL NOT NULL DEFAULT 0")
+            if "pool_fee" not in cols:
+                self._conn.execute("ALTER TABLE fee_obs ADD COLUMN pool_fee REAL NOT NULL DEFAULT 0")
             self._conn.commit()
 
     def close(self) -> None:
@@ -191,13 +199,19 @@ class Store:
 
     # -- network-fee observations --------------------------------------------
 
-    def record_fee(self, wallet: str, pair: str, network_fee: Decimal) -> None:
-        """Log an observed network fee (from any quote) for today's stats."""
+    def record_fee(
+        self, wallet: str, pair: str, network_fee: Decimal,
+        slippage: Decimal = Decimal(0), pool_fee: Decimal = Decimal(0),
+    ) -> None:
+        """Log an observed network fee (CC) plus slippage and pool fee (percent)
+        from a quote, for today's per-pair stats."""
         day = datetime.now(timezone.utc).date().isoformat()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee) VALUES (?,?,?,?,?)",
-                (time.time(), day, wallet, pair, float(network_fee)),
+                "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee, slippage, "
+                "pool_fee) VALUES (?,?,?,?,?,?,?)",
+                (time.time(), day, wallet, pair, float(network_fee),
+                 float(slippage), float(pool_fee)),
             )
             self._conn.commit()
 
@@ -212,11 +226,12 @@ class Store:
 
     def pair_fee_stats(
         self, day: str | None = None
-    ) -> list[tuple[str, Decimal, Decimal, Decimal, int]]:
-        """Per-pair network-fee stats for today (UTC), across all wallets:
-        ``(pair, latest, min, avg, count)`` sorted by pair. Network fee is
-        per-pool so this shows the current fee of every pair the bot has quoted
-        today (the pairs differ, so a single 'FEE now' cannot represent them)."""
+    ) -> list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]]:
+        """Per-pair fee stats for today (UTC), across all wallets:
+        ``(pair, latest_net, min_net, avg_net, latest_slippage, latest_pool_fee,
+        count)`` sorted by pair. Network fee is in CC; slippage/pool fee are the
+        latest observed values in percent. Pairs differ per pool, so a single
+        'FEE now' cannot represent them."""
         day = day or _today()
         with self._lock:
             rows = self._conn.execute(
@@ -224,15 +239,22 @@ class Store:
                           COUNT(*) AS n,
                           (SELECT network_fee FROM fee_obs f2
                              WHERE f2.pair = f.pair AND f2.day = f.day
-                             ORDER BY ts DESC LIMIT 1) AS latest
+                             ORDER BY ts DESC LIMIT 1) AS latest,
+                          (SELECT slippage FROM fee_obs f2
+                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             ORDER BY ts DESC LIMIT 1) AS slip,
+                          (SELECT pool_fee FROM fee_obs f2
+                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             ORDER BY ts DESC LIMIT 1) AS pool
                    FROM fee_obs f WHERE day = ? GROUP BY pair ORDER BY pair""",
                 (day,),
             ).fetchall()
-        out: list[tuple[str, Decimal, Decimal, Decimal, int]] = []
+        out: list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]] = []
         for r in rows:
             out.append((
                 r["pair"], Decimal(str(r["latest"])), Decimal(str(r["mn"])),
-                Decimal(str(r["av"])), int(r["n"]),
+                Decimal(str(r["av"])), Decimal(str(r["slip"])),
+                Decimal(str(r["pool"])), int(r["n"]),
             ))
         return out
 

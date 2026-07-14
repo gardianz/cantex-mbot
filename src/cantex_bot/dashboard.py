@@ -331,29 +331,34 @@ class Dashboard:
         return t
 
     def _pair_fee_panel(self) -> Table:
-        """Latest network fee per pair (they differ per pool), with today's
-        min/avg and observation count."""
+        """Per pair (they differ per pool): latest network fee (CC) with today's
+        min/avg, plus the latest slippage and pool fee (percent), and the number
+        of fee observations today (n)."""
         t = Table(
             box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
-            title="PAIR FEES (network, CC)", title_style=f"bold {_ACCENT}",
-            title_justify="left",
+            title="PAIR FEES  (net fee CC · slippage/pool %)",
+            title_style=f"bold {_ACCENT}", title_justify="left",
         )
         t.add_column("PAIR", no_wrap=True, overflow="ellipsis")
         t.add_column("now", justify="right", no_wrap=True)
         t.add_column("min", justify="right", no_wrap=True)
         t.add_column("avg", justify="right", no_wrap=True)
+        t.add_column("slip%", justify="right", no_wrap=True)
+        t.add_column("pool%", justify="right", no_wrap=True)
         t.add_column("n", justify="right", no_wrap=True)
-        for pair, latest, mn, av, n in self._pairs[:_MAX_PAIR_ROWS]:
+        for pair, latest, mn, av, slip, pool, n in self._pairs[:_MAX_PAIR_ROWS]:
             t.add_row(
                 Text(pair, "white"),
                 Text(_money(latest, 4), "yellow"),
                 Text(_money(mn, 4), "green3"),
                 Text(_money(av, 4), _DIM),
+                Text(_money(slip, 3), "cyan"),
+                Text(_money(pool, 3), "magenta"),
                 Text(str(n), _DIM),
             )
         extra = len(self._pairs) - _MAX_PAIR_ROWS
         if extra > 0:
-            t.add_row(Text(f"(+{extra} more)", _DIM), "", "", "", "")
+            t.add_row(Text(f"(+{extra} more)", _DIM), "", "", "", "", "", "")
         return t
 
     def _log_panel(self) -> Table:

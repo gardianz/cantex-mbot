@@ -43,15 +43,21 @@ class SwapGuard:
             return Decimal(0)
         return max(p.fees.fee_percentage for p in quote.pools)
 
+    @staticmethod
+    def quote_metrics(quote: SwapQuote) -> tuple[Decimal, Decimal, Decimal]:
+        """(network_fee CC, slippage %, pool_fee %) from a quote — the numbers the
+        guard and the dashboard's PAIR FEES panel both read."""
+        slippage = quote.prices.slippage * _PCT
+        pool_fee = max(SwapGuard._max_pool_fee(quote), quote.fees.fee_percentage) * _PCT
+        return quote.fees.network_fee.amount, slippage, pool_fee
+
     def evaluate(self, quote: SwapQuote) -> GuardResult:
         c = self.config
         # API returns fractions -> convert to percent to match the config units.
-        slippage = quote.prices.slippage * _PCT
         # Cantex charges a pool fee (%) + a network fee (in CC); no admin fee.
         # Guard the pool fee against both the per-pool value and the top-level
         # quote fee percentage, whichever is higher.
-        pool_fee = max(self._max_pool_fee(quote), quote.fees.fee_percentage) * _PCT
-        network_fee = quote.fees.network_fee.amount  # absolute, in CC
+        network_fee, slippage, pool_fee = self.quote_metrics(quote)
 
         details = {
             "slippage_pct": slippage,

@@ -49,8 +49,10 @@ built on the official `cantex_sdk`.
   route and status. A highlighted **cursor** (`▸`) marks the current wallet;
   move it with ↑↓/PgUp/PgDn, `g`/`G` top/end (the view scrolls to follow),
   `r` refresh, `q` back. Below it a **PAIR FEES** panel shows every pair's
-  current network fee (they differ per pool) with today's min/avg — a background
-  probe quotes base→each pool token so all pairs appear, not only swapped ones.
+  current network fee (they differ per pool) with today's min/avg, the latest
+  slippage and pool fee (percent), and `n` = how many fee observations were
+  recorded today for that pair. A background probe quotes base→each pool token
+  so all pairs appear, not only swapped ones.
 - **Instant menu, lazy auth** — the menu appears immediately; each wallet
   authenticates on first use (not all up front), so hundreds of unused wallets
   cost nothing.

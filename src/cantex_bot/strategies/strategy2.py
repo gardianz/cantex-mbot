@@ -60,9 +60,9 @@ class Strategy2(Strategy1):
                 logger.debug("[%s] fee quote %s failed: %s",
                              wallet.name, pair.token_symbol, exc)
                 continue
-            fee = q.fees.network_fee.amount
+            fee, slip, pool = self.engine.guard.quote_metrics(q)
             self.store.record_fee(
-                wallet.name, f"{self.base_symbol}->{pair.token_symbol}", fee)
+                wallet.name, f"{self.base_symbol}->{pair.token_symbol}", fee, slip, pool)
             if best_fee is None or fee < best_fee:
                 best_fee, best = fee, pair
         if best is not None:

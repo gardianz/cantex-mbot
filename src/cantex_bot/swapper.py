@@ -96,9 +96,10 @@ class SwapEngine:
             return out
         out.quote = quote
         out.buy_amount = quote.returned_amount
-        # Record the observed network fee for today's min/avg stats.
+        # Record the observed network fee + slippage + pool fee for today's stats.
+        net, slip, pool = self.guard.quote_metrics(quote)
         self.store.record_fee(
-            wallet.name, f"{sell_symbol}->{buy_symbol}", quote.fees.network_fee.amount
+            wallet.name, f"{sell_symbol}->{buy_symbol}", net, slip, pool
         )
 
         # 2. Guard — unless explicitly bypassed (manual 1x swap override).

@@ -283,9 +283,10 @@ class PortfolioService:
                     q = await wallet.sdk.get_swap_quote(notional, base, pair.token)
             except Exception:  # noqa: BLE001 - a probe failure must not break the sweep
                 continue
+            from .guards import SwapGuard
+            net, slip, pool = SwapGuard.quote_metrics(q)
             self.store.record_fee(
-                wallet.name, f"{base_symbol}->{pair.token_symbol}",
-                q.fees.network_fee.amount)
+                wallet.name, f"{base_symbol}->{pair.token_symbol}", net, slip, pool)
 
     async def _run(self) -> None:
         while not self._stop.is_set():

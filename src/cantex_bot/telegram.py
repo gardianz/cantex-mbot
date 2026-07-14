@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -18,19 +19,21 @@ _MAX_MSG = 3900
 class TelegramNotifier:
     """Fire-and-forget Telegram sender. Never raises to the caller."""
 
-    # Disable after this many consecutive failures (e.g. a wrong bot token
-    # returning 404) so the logs are not flooded.
+    # After this many consecutive failures, PAUSE (not permanently disable) for a
+    # cooldown so the logs aren't flooded — then retry, so a transient network
+    # blip can't kill Telegram for the whole session.
     _MAX_FAILS = 5
+    _COOLDOWN = 60.0
 
     def __init__(self, config: TelegramConfig) -> None:
         self.config = config
         self._session: aiohttp.ClientSession | None = None
         self._fails = 0
-        self._disabled = False
+        self._paused_until = 0.0
 
     @property
     def enabled(self) -> bool:
-        return self.config.usable and not self._disabled
+        return self.config.usable and time.monotonic() >= self._paused_until
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -64,10 +67,11 @@ class TelegramNotifier:
     def _note_failure(self, why: str) -> None:
         self._fails += 1
         if self._fails >= self._MAX_FAILS:
-            self._disabled = True
+            self._paused_until = time.monotonic() + self._COOLDOWN
+            self._fails = 0
             logger.warning(
-                "Telegram disabled after %d consecutive failures (last: %s). "
-                "Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.", self._fails, why,
+                "Telegram paused %.0fs after repeated failures (last: %s). "
+                "Check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.", self._COOLDOWN, why,
             )
         else:
             logger.warning("Telegram send failed (%d/%d): %s",

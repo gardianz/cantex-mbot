@@ -149,8 +149,9 @@ class Dashboard:
         return max(4, self.console.size.height - 20 - panel)
 
     def render(self) -> Group:
-        pf = getattr(self.service.store, "pair_fee_stats", None)
-        self._pairs = pf() if callable(pf) else []
+        # Read the cached per-pair stats (PortfolioService computes them off the
+        # event loop). Never query the DB from render — it runs every tick/key.
+        self._pairs = getattr(self.service, "pair_fees", []) or []
         page = self._page_size()
         names = self.service.manager.names
         n = len(names)
@@ -343,9 +344,9 @@ class Dashboard:
                 t.add_row(mark, wname, *["[dim]…[/dim]"] * 10, "[dim]loading[/dim]",
                           style=row_style)
                 continue
-            # FEE now: read live so it tracks the strategy's fresh quotes,
-            # not just the slower portfolio sweep.
-            live_fee = self.service.store.latest_fee(name)
+            # FEE now: the last observed quote fee (cached on the snap; avoids a
+            # per-row DB query on every render).
+            live_fee = s.fee_now
             fee_now = _money(live_fee, 2) if live_fee is not None else "—"
             t.add_row(
                 mark, wname,

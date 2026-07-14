@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS fee_obs (
     pool_fee    REAL NOT NULL DEFAULT 0  -- percent
 );
 CREATE INDEX IF NOT EXISTS idx_fee_wallet_day ON fee_obs (wallet, day);
+CREATE INDEX IF NOT EXISTS idx_fee_pair_day_ts ON fee_obs (pair, day, ts);
+CREATE INDEX IF NOT EXISTS idx_fee_wallet_ts ON fee_obs (wallet, ts);
 """
 
 
@@ -95,6 +97,13 @@ class Store:
                 self._conn.execute("ALTER TABLE fee_obs ADD COLUMN slippage REAL NOT NULL DEFAULT 0")
             if "pool_fee" not in cols:
                 self._conn.execute("ALTER TABLE fee_obs ADD COLUMN pool_fee REAL NOT NULL DEFAULT 0")
+            # Normalise legacy pair case once (so queries need no UPPER()), and
+            # drop fee rows older than 2 days to keep the table (and its stats
+            # query) fast — only today's rows are ever read.
+            self._conn.execute(
+                "UPDATE fee_obs SET pair = UPPER(pair) WHERE pair <> UPPER(pair)")
+            cutoff = (datetime.now(timezone.utc).date() - timedelta(days=2)).isoformat()
+            self._conn.execute("DELETE FROM fee_obs WHERE day < ?", (cutoff,))
             self._conn.commit()
 
     def close(self) -> None:
@@ -238,23 +247,22 @@ class Store:
         'FEE now' cannot represent them."""
         day = day or _today()
         with self._lock:
-            # Group case-insensitively so legacy mixed-case rows (USDCX vs USDCx)
-            # collapse into one pair; the latest/slip/pool subqueries match the
-            # same way.
+            # Pairs are stored upper-cased (record_fee + a one-time migration),
+            # so plain equality here is index-friendly (idx_fee_pair_day_ts).
             rows = self._conn.execute(
-                """SELECT UPPER(pair) AS pair, MIN(network_fee) AS mn,
+                """SELECT pair, MIN(network_fee) AS mn,
                           AVG(network_fee) AS av, COUNT(*) AS n,
                           (SELECT network_fee FROM fee_obs f2
-                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
+                             WHERE f2.pair = f.pair AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS latest,
                           (SELECT slippage FROM fee_obs f2
-                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
+                             WHERE f2.pair = f.pair AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS slip,
                           (SELECT pool_fee FROM fee_obs f2
-                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
+                             WHERE f2.pair = f.pair AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS pool
                    FROM fee_obs f WHERE day = ?
-                   GROUP BY UPPER(pair) ORDER BY UPPER(pair)""",
+                   GROUP BY pair ORDER BY pair""",
                 (day,),
             ).fetchall()
         out: list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]] = []

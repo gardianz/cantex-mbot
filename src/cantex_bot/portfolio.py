@@ -119,6 +119,9 @@ class PortfolioService:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._sweeps = 0
+        # Per-pair fee stats, recomputed once per sweep (off the render path so
+        # the dashboard never runs the heavy GROUP BY on the event loop).
+        self.pair_fees: list = []
         # CC price (base-token per 1 CC) for converting base-denominated loss to
         # CC — market-wide, cached briefly, keyed by the base symbol in force.
         self._market = None
@@ -256,6 +259,12 @@ class PortfolioService:
         )
         self._sweeps += 1
         await self._maybe_probe_fees()
+        # Recompute per-pair fee stats off the event loop (the query GROUPs over a
+        # large fee_obs table). The dashboard reads this cache, never the DB.
+        try:
+            self.pair_fees = await asyncio.to_thread(self.store.pair_fee_stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pair_fee_stats failed: %s", exc)
 
     async def _maybe_probe_fees(self) -> None:
         """Quote base->every pool token (from one authed wallet) so PAIR FEES

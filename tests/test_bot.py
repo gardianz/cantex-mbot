@@ -1542,17 +1542,21 @@ def test_loss_fifo_same_token():
 
 
 def test_pair_fee_stats_merges_case(tmp_path):
-    """A pair must be one row regardless of symbol case (USDCX vs USDCx),
-    including legacy rows written before normalisation."""
+    """A pair must be one row regardless of symbol case (USDCX vs USDCx). Legacy
+    mixed-case rows are normalised by the startup migration."""
     from datetime import datetime, timezone
-    store = Store(tmp_path / "s.db")
+    p = tmp_path / "s.db"
     today = datetime.now(timezone.utc).date().isoformat()
-    # Legacy raw row (bypasses record_fee's upper-casing).
+    store = Store(p)
+    # Legacy raw mixed-case row, as an old DB would hold it.
     store._conn.execute(
         "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee, slippage, "
         "pool_fee) VALUES (?,?,?,?,?,?,?)",
         (1.0, today, "w2", "USDCx->FRXUSD.B", 0.72, 0, 0))
     store._conn.commit()
+    store.close()
+    # Re-open: the migration upper-cases legacy pairs so they merge.
+    store = Store(p)
     store.record_fee("w1", "USDCX->FRXUSD.B", Decimal("0.70"))
     rows = store.pair_fee_stats()
     assert [r[0] for r in rows] == ["USDCX->FRXUSD.B"]   # single merged pair
@@ -1611,3 +1615,17 @@ def test_dashboard_burst_of_arrows_moves_cursor():
     for k in keys:
         d._on_key(k, 5, 10)
     assert d.cursor == 3                                # all applied, not dropped
+
+
+def test_notifier_pauses_then_recovers():
+    """Repeated failures pause Telegram for a cooldown, not forever (a transient
+    blip must not kill it for the whole session)."""
+    import time as _t
+    from cantex_bot.telegram import TelegramNotifier
+    n = TelegramNotifier(TelegramConfig(enabled=True, bot_token="t", chat_id="1"))
+    assert n.enabled
+    for _ in range(5):
+        n._note_failure("boom")
+    assert not n.enabled                     # paused after _MAX_FAILS
+    n._paused_until = _t.monotonic() - 1      # cooldown elapsed
+    assert n.enabled                          # recovers, not permanently disabled

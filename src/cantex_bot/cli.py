@@ -205,43 +205,61 @@ class App:
             choices=[
                 "buy  (USDCX -> token)",
                 "sell (token -> USDCX)",
+                "swap (token -> token)",
                 "Back",
             ],
         ).ask_async()
         if not direction or direction == "Back":
             return
-        dir_key = "buy" if direction.startswith("buy") else "sell"
+        dir_key = ("buy" if direction.startswith("buy")
+                   else "sell" if direction.startswith("sell") else "swap")
 
-        # 3. Which tokens — load the market from the first selected wallet.
+        # 3. Load the market from the first selected wallet.
         usdcx_sym = self.config.strategy1.usdcx_symbol
         cc_sym = self.config.strategy1.cc_symbol
         try:
             first = self.manager.get(wallet_names[0])
             await first.ensure_auth()
             market = await MarketMap.build(first.sdk)
-            token_syms = [
-                p.token_symbol
-                for p in market.trade_pairs(usdcx_sym, exclude_symbols=(cc_sym,))
-            ]
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Cannot load market: {exc}[/red]")
             return
-        if not token_syms:
-            console.print("[red]No tradeable tokens found.[/red]")
-            return
+
+        # 4. Pick the sell token (token->token) and the buy token(s).
+        sell_sym = None
+        if dir_key == "swap":
+            all_syms = market.pool_token_symbols()
+            if not all_syms:
+                console.print("[red]No pool tokens found.[/red]")
+                return
+            sell_sym = await questionary.select(
+                "Sell token (token -> token):", choices=all_syms,
+            ).ask_async()
+            if not sell_sym:
+                return
+            choices = [s for s in all_syms if s.upper() != sell_sym.upper()]
+            prompt = f"Buy tokens (swap {sell_sym} -> …; space to toggle):"
+        else:
+            choices = [
+                p.token_symbol
+                for p in market.trade_pairs(usdcx_sym, exclude_symbols=(cc_sym,))
+            ]
+            if not choices:
+                console.print("[red]No tradeable tokens found.[/red]")
+                return
+            prompt = f"Tokens to {dir_key} (space to toggle):"
         tokens = await questionary.checkbox(
-            f"Tokens to {dir_key} (space to toggle):",
-            choices=[questionary.Choice(s) for s in token_syms],
+            prompt, choices=[questionary.Choice(s) for s in choices],
         ).ask_async()
         if not tokens:
             console.print("[yellow]No token selected.[/yellow]")
             return
 
-        # 4. Amount — absolute or percent of balance.
-        base = usdcx_sym if dir_key == "buy" else "token"
+        # 5. Amount — absolute or percent of balance.
+        base = usdcx_sym if dir_key == "buy" else sell_sym if dir_key == "swap" else "token"
         amount_raw = await questionary.text(
             f"Amount per swap ({base}) — value (e.g. 5) or percent (e.g. 25%):",
-            default="100%" if dir_key == "sell" else "",
+            default="100%" if dir_key in ("sell", "swap") else "",
         ).ask_async()
         try:
             amount = AmountSpec.parse(amount_raw or "")
@@ -249,9 +267,10 @@ class App:
             console.print(f"[red]Bad amount: {exc}[/red]")
             return
 
-        # 5. Confirm + arm, then run.
+        # 6. Confirm + arm, then run.
+        head = (f"SWAP {sell_sym} ->" if dir_key == "swap" else dir_key.upper())
         console.print(
-            f"[cyan]{dir_key.upper()}[/cyan] {amount} on {len(tokens)} token(s) "
+            f"[cyan]{head}[/cyan] {amount} on {len(tokens)} token(s) "
             f"x {len(wallet_names)} wallet(s): {', '.join(tokens)}"
         )
         await self._choose_execution_mode()
@@ -259,6 +278,7 @@ class App:
             self.manager, self.engine,
             wallet_names=wallet_names, token_symbols=tokens,
             usdcx_symbol=usdcx_sym, direction=dir_key, amount=amount,
+            sell_symbol=sell_sym,
         )
         for wallet, outcomes in results.items():
             ok = sum(1 for o in outcomes if o.ok)

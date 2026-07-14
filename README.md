@@ -12,9 +12,12 @@ built on the official `cantex_sdk`.
   tokens; sell side dumps 100% of the token's unlocked balance. The daily target
   is counted from the **web trading history** (with the local counter as a
   fallback), so it stays in sync with what the exchange actually recorded.
-- **Swap (pick & go)** — choose which wallets (one, several, or all), which
-  USDCX-paired tokens, the direction, and an amount given as an absolute value
-  or a **percent of balance** (e.g. `25%`, `100%`). One swap per wallet×token.
+- **Swap (pick & go)** — choose which wallets (one, several, or all), a
+  direction — **buy** (USDCX→token), **sell** (token→USDCX), or **swap**
+  (token→token, routed multi-hop via CC) — the token(s), and an amount given as
+  an absolute value or a **percent of balance** (e.g. `25%`, `100%`). For
+  token→token you pick the sell token once, then the buy tokens. One swap per
+  wallet×token.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

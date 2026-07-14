@@ -1187,3 +1187,59 @@ async def test_fee_ttl_throttles_ccview(monkeypatch):
     calls_after_first = svc.ccview.party_fee.await_count
     await svc.refresh_all()  # immediate second sweep, within fee_ttl
     assert svc.ccview.party_fee.await_count == calls_after_first  # no new ccview calls
+
+
+# -- swap_selected token -> token --------------------------------------------
+
+class _FakeMarket:
+    def __init__(self):
+        self._m = {s: InstrumentId("D", s) for s in ("USDCX", "CBTC", "CETH")}
+
+    def instrument(self, sym):
+        return self._m[sym.upper()]
+
+
+class _FakeEngine:
+    def __init__(self):
+        self.calls = []
+
+    async def execute_swap(self, wallet, *, sell, buy, sell_amount,
+                           sell_symbol, buy_symbol, direction, **_):
+        self.calls.append((sell_symbol, buy_symbol, sell_amount, direction))
+        return SimpleNamespace(ok=True, error=None, counted=True,
+                               reject_reasons=[], guard=None)
+
+
+def _swap_fakes():
+    info = SimpleNamespace(get_balance=lambda inst: Decimal("100"))
+    wallet = SimpleNamespace(
+        name="w1", ensure_auth=AsyncMock(),
+        sdk=SimpleNamespace(get_account_info=AsyncMock(return_value=info)))
+    manager = SimpleNamespace(get=lambda n: wallet)
+    return manager, _FakeEngine()
+
+
+@pytest.mark.asyncio
+async def test_swap_selected_token_to_token(monkeypatch):
+    from cantex_bot import swap_all
+    from cantex_bot.swap_all import AmountSpec, swap_selected
+    monkeypatch.setattr(swap_all.MarketMap, "build",
+                        AsyncMock(return_value=_FakeMarket()))
+    manager, eng = _swap_fakes()
+    await swap_selected(
+        manager, eng, wallet_names=["w1"], token_symbols=["CETH", "CBTC"],
+        usdcx_symbol="USDCX", direction="swap", amount=AmountSpec.parse("100%"),
+        sell_symbol="CBTC", cooldown=0)
+    # CBTC->CBTC is skipped; only CBTC->CETH fires, 100% of the 100 CBTC balance.
+    assert len(eng.calls) == 1
+    assert eng.calls[0] == ("CBTC", "CETH", Decimal("100"), "swap")
+
+
+@pytest.mark.asyncio
+async def test_swap_selected_swap_requires_sell_symbol():
+    from cantex_bot.swap_all import AmountSpec, swap_selected
+    with pytest.raises(ValueError):
+        await swap_selected(
+            SimpleNamespace(), SimpleNamespace(), wallet_names=["w1"],
+            token_symbols=["CETH"], usdcx_symbol="USDCX", direction="swap",
+            amount=AmountSpec.parse("5"))

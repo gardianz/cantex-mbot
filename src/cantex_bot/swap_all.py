@@ -1,8 +1,8 @@
 """One-shot swaps across a chosen set of wallets, tokens, and amount.
 
-The interactive CLI collects: which wallets, which USDCX-paired tokens, the
-direction (buy USDCX->token / sell token->USDCX), and an amount that is either
-an absolute value or a percent of the relevant balance.
+The interactive CLI collects: which wallets, a direction (buy USDCX->token /
+sell token->USDCX / swap token->token), which tokens, and an amount that is
+either an absolute value or a percent of the relevant balance.
 """
 from __future__ import annotations
 
@@ -66,20 +66,28 @@ async def swap_selected(
     usdcx_symbol: str,
     direction: str,
     amount: AmountSpec,
+    sell_symbol: str | None = None,
     cooldown: float = 1.0,
 ) -> dict[str, list[SwapOutcome]]:
-    """One swap per (wallet, token). ``direction`` is 'buy' or 'sell'.
+    """One swap per (wallet, token). ``direction`` is 'buy', 'sell', or 'swap'.
 
     buy  = USDCX -> token, sized from the USDCX balance.
     sell = token -> USDCX, sized from the token balance.
+    swap = ``sell_symbol`` -> token (token->token), sized from the sell token's
+           balance; the Cantex swap endpoint routes multi-hop (e.g. via CC), so
+           any pool token is reachable from any other. A buy token equal to the
+           sell token is skipped.
     Balances are re-read before each swap so a percent never over-spends.
     """
+    if direction == "swap" and not sell_symbol:
+        raise ValueError("direction 'swap' requires sell_symbol")
     results: dict[str, list[SwapOutcome]] = {}
     for name in wallet_names:
         wallet = manager.get(name)
         await wallet.ensure_auth()
         market = await MarketMap.build(wallet.sdk)
         usdcx = market.instrument(usdcx_symbol)
+        sell_inst = market.instrument(sell_symbol) if direction == "swap" else None
         outcomes: list[SwapOutcome] = []
         for sym in token_symbols:
             try:
@@ -91,9 +99,14 @@ async def swap_selected(
             if direction == "buy":
                 sell_amount = amount.resolve(info.get_balance(usdcx))
                 sell, buy, ssym, bsym = usdcx, token, usdcx_symbol, sym
-            else:
+            elif direction == "sell":
                 sell_amount = amount.resolve(info.get_balance(token))
                 sell, buy, ssym, bsym = token, usdcx, sym, usdcx_symbol
+            else:  # "swap" token -> token
+                if sym.upper() == sell_symbol.upper():
+                    continue  # cannot swap a token into itself
+                sell_amount = amount.resolve(info.get_balance(sell_inst))
+                sell, buy, ssym, bsym = sell_inst, token, sell_symbol, sym
             if sell_amount <= 0:
                 logger.info("[%s] skip %s: zero amount", name, sym)
                 continue

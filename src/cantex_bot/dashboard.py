@@ -67,6 +67,39 @@ def _fee3(a: Decimal, b: Decimal, c: Decimal) -> Text:
     return Text.assemble(part(a), ("/", _DIM), part(b), ("/", _DIM), part(c))
 
 
+def _split_keys(data: bytes) -> tuple[list[bytes], bytes]:
+    """Split a raw stdin read into individual key tokens, returning
+    ``(keys, remainder)`` where remainder is a trailing INCOMPLETE escape
+    sequence to prepend to the next read.
+
+    A single read can hold several key presses at once (fast arrow presses) or a
+    partial escape; matching the whole buffer against one pattern dropped those,
+    which made scrolling feel stuck. Each ``ESC [ … final`` CSI sequence and each
+    plain byte becomes its own token."""
+    keys: list[bytes] = []
+    i, n = 0, len(data)
+    while i < n:
+        if data[i] != 0x1B:                      # plain byte (letters, etc.)
+            keys.append(data[i:i + 1])
+            i += 1
+            continue
+        rest = data[i:]
+        if len(rest) == 1:                       # bare ESC at end — hold (may be
+            return keys, rest                    # the head of a split arrow key)
+        if rest[1:2] == b"[":                     # CSI: ESC [ params final(0x40-7E)
+            j = i + 2
+            while j < n and not (0x40 <= data[j] <= 0x7E):
+                j += 1
+            if j >= n:                            # incomplete CSI — hold the rest
+                return keys, data[i:]
+            keys.append(data[i:j + 1])
+            i = j + 1
+        else:                                     # standalone ESC + following key
+            keys.append(b"\x1b")
+            i += 1
+    return keys, b""
+
+
 _STATUS = {
     "ok": ("●", "green3"),
     "error": ("●", "red"),
@@ -90,6 +123,7 @@ class Dashboard:
         self.console = Console()
         self.offset = 0             # index of the first visible row
         self.cursor = 0             # highlighted wallet row (absolute index)
+        self._keybuf = b""          # trailing partial escape from the last read
         self._dirty = asyncio.Event()
         self._pairs: list = []      # per-pair fee stats for the current render
 
@@ -446,12 +480,17 @@ class Dashboard:
 
             def _readable() -> None:
                 try:
-                    data = os.read(fd, 64)
+                    data = os.read(fd, 256)
                 except OSError:
                     return
-                if self._on_key(data, self._page_size(), len(self.service.manager.names)):
-                    quit_flag["v"] = True
-                    stop.set()
+                keys, self._keybuf = _split_keys(self._keybuf + data)
+                page = self._page_size()
+                n = len(self.service.manager.names)
+                for key in keys:               # apply EVERY key in the burst
+                    if self._on_key(key, page, n):
+                        quit_flag["v"] = True
+                        stop.set()
+                        break
             loop.add_reader(fd, _readable)
         try:
             with Live(

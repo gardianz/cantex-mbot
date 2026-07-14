@@ -1580,3 +1580,34 @@ async def test_swap_selected_updates_run_state(monkeypatch):
     assert v.done == 2 and v.target == 2       # both swaps ok
     assert v.status == "done"
     assert v.route == "buy USDCX→CETH"         # last route shown
+
+
+# -- dashboard key tokeniser (smooth scrolling) ------------------------------
+
+def test_split_keys_multiple_and_partial():
+    from cantex_bot.dashboard import _split_keys
+    keys, rem = _split_keys(b"\x1b[A\x1b[A\x1b[B")     # three arrows in one read
+    assert keys == [b"\x1b[A", b"\x1b[A", b"\x1b[B"] and rem == b""
+    keys, rem = _split_keys(b"j\x1b")                  # bare ESC at end -> held
+    assert keys == [b"j"] and rem == b"\x1b"
+    keys, rem = _split_keys(b"\x1b[")                  # incomplete CSI -> held
+    assert keys == [] and rem == b"\x1b["
+    keys, rem = _split_keys(rem + b"A")                # next read completes it
+    assert keys == [b"\x1b[A"] and rem == b""
+    keys, rem = _split_keys(b"gGq")                    # plain letters
+    assert keys == [b"g", b"G", b"q"] and rem == b""
+
+
+def test_dashboard_burst_of_arrows_moves_cursor():
+    from cantex_bot.dashboard import Dashboard, _split_keys
+    svc = SimpleNamespace(
+        manager=SimpleNamespace(names=[f"w{i}" for i in range(10)]),
+        store=SimpleNamespace())
+    cfg = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"),
+        strategy1=SimpleNamespace(daily_swap_target=1, cc_symbol="CC", usdcx_symbol="USDCX"))
+    d = Dashboard(svc, cfg)
+    keys, _ = _split_keys(b"\x1b[B\x1b[B\x1b[B")        # 3 downs arriving together
+    for k in keys:
+        d._on_key(k, 5, 10)
+    assert d.cursor == 3                                # all applied, not dropped

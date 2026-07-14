@@ -1558,3 +1558,25 @@ def test_pair_fee_stats_merges_case(tmp_path):
     assert [r[0] for r in rows] == ["USDCX->FRXUSD.B"]   # single merged pair
     assert rows[0][6] == 2                               # both observations
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_swap_selected_updates_run_state(monkeypatch):
+    """Swap 1x publishes per-wallet progress so the dashboard ROUTE/STATUS/SWAP
+    columns move instead of sitting idle."""
+    from cantex_bot import swap_all
+    from cantex_bot.swap_all import AmountSpec, swap_selected
+    from cantex_bot.runstate import RunState
+    monkeypatch.setattr(swap_all.MarketMap, "build",
+                        AsyncMock(return_value=_FakeMarket()))
+    manager, eng = _swap_fakes()
+    rs = RunState()
+    await swap_selected(
+        manager, eng, wallet_names=["w1"], token_symbols=["CBTC", "CETH"],
+        usdcx_symbol="USDCX", direction="buy", amount=AmountSpec.parse("10"),
+        run_state=rs, cooldown=0)
+    v = rs.view("w1")
+    assert v.finished and not v.active         # frozen on the dashboard after run
+    assert v.done == 2 and v.target == 2       # both swaps ok
+    assert v.status == "done"
+    assert v.route == "buy USDCX→CETH"         # last route shown

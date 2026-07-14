@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
 from .markets import MarketMap
+from . import runstate as run_status
 from .swapper import SwapEngine, SwapOutcome
 from .wallets import WalletManager
 
@@ -68,6 +69,7 @@ async def swap_selected(
     amount: AmountSpec,
     sell_symbol: str | None = None,
     bypass_guards: bool = False,
+    run_state=None,
     cooldown: float = 1.0,
 ) -> dict[str, list[SwapOutcome]]:
     """One swap per (wallet, token). ``direction`` is 'buy', 'sell', or 'swap'.
@@ -84,6 +86,26 @@ async def swap_selected(
     """
     if direction == "swap" and not sell_symbol:
         raise ValueError("direction 'swap' requires sell_symbol")
+
+    def _st(name: str, **kw) -> None:
+        """Publish per-wallet progress to the dashboard (ROUTE/STATUS columns),
+        if a run_state was provided."""
+        if run_state is not None:
+            run_state.set(name, **kw)
+
+    # Mark the involved wallets active so the dashboard lights up their rows.
+    # SWAP d/t shows progress: done = successful swaps, target = planned swaps.
+    if run_state is not None:
+        for name in wallet_names:
+            v = run_state.view(name)
+            v.active = True
+            v.finished = False
+            v.status = run_status.RUNNING
+            v.route = ""
+            v.plan = "queued"
+            v.done = 0
+            v.target = len(token_symbols)
+
     results: dict[str, list[SwapOutcome]] = {}
     for name in wallet_names:
         wallet = manager.get(name)
@@ -113,12 +135,30 @@ async def swap_selected(
             if sell_amount <= 0:
                 logger.info("[%s] skip %s: zero amount", name, sym)
                 continue
+            route = f"{direction} {ssym}→{bsym}"
+            _st(name, status=run_status.SWAPPING, route=route, plan="proses swap")
             out = await engine.execute_swap(
                 wallet, sell=sell, buy=buy, sell_amount=sell_amount,
                 sell_symbol=ssym, buy_symbol=bsym, direction=direction,
                 bypass_guards=bypass_guards,
             )
             outcomes.append(out)
+            done = sum(1 for o in outcomes if o.ok)
+            if out.ok:
+                _st(name, status=run_status.RUNNING, route=route,
+                    plan="swap berhasil", done=done)
+            elif out.reject_reasons:
+                _st(name, status=run_status.WAITING, route=route,
+                    plan="guard reject", done=done)
+            else:
+                _st(name, status=run_status.ERROR, route=route,
+                    plan="swap gagal", done=done)
             await asyncio.sleep(cooldown)
+        # Freeze the wallet's final line on the dashboard (keeps STATUS, clears
+        # the live ROUTE) instead of reverting to the rebate note.
+        if run_state is not None:
+            ok = sum(1 for o in outcomes if o.ok)
+            status = run_status.DONE if ok and ok == len(outcomes) else run_status.STOPPED
+            run_state.finish(name, status=status)
         results[name] = outcomes
     return results

@@ -316,6 +316,7 @@ class App:
             wallet_names=wallet_names, token_symbols=tokens,
             usdcx_symbol=usdcx_sym, direction=dir_key, amount=amount,
             sell_symbol=sell_sym, bypass_guards=bool(bypass),
+            run_state=self.run_state,
         ))
         console.print("[dim]Swapping — live dashboard below. Ctrl-C/q to return.[/dim]")
         dash = Dashboard(self.service, self.config, self.run_state)

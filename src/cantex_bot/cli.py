@@ -283,19 +283,38 @@ class App:
             console.print(f"[red]Bad amount: {exc}[/red]")
             return
 
-        # 6. Confirm + arm, then run.
+        # 6. Confirm + arm.
         head = (f"SWAP {sell_sym} ->" if dir_key == "swap" else dir_key.upper())
         console.print(
             f"[cyan]{head}[/cyan] {amount} on {len(tokens)} token(s) "
             f"x {len(wallet_names)} wallet(s): {', '.join(tokens)}"
         )
         await self._choose_execution_mode()
-        results = await swap_selected(
+        bypass = await questionary.confirm(
+            "Bypass ALL guards (fee / slippage / pool fee / network fee) and "
+            "execute regardless? Real-money risk.", default=False,
+        ).ask_async()
+        if bypass:
+            console.print("[bold red]Guards BYPASSED for this run.[/bold red]")
+
+        # 7. Run the swaps in the background and drop into the live dashboard so
+        # progress is visible; print the per-wallet summary once it closes.
+        task = asyncio.create_task(swap_selected(
             self.manager, self.engine,
             wallet_names=wallet_names, token_symbols=tokens,
             usdcx_symbol=usdcx_sym, direction=dir_key, amount=amount,
-            sell_symbol=sell_sym,
-        )
+            sell_symbol=sell_sym, bypass_guards=bool(bypass),
+        ))
+        console.print("[dim]Swapping — live dashboard below. Ctrl-C/q to return.[/dim]")
+        dash = Dashboard(self.service, self.config, self.run_state)
+        try:
+            await self._run_cancellable(dash.run)
+        finally:
+            try:
+                results = await task
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Swap run error: {exc}[/red]")
+                return
         for wallet, outcomes in results.items():
             ok = sum(1 for o in outcomes if o.ok)
             console.print(f"[{wallet}] {ok}/{len(outcomes)} ok")

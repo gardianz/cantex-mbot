@@ -67,6 +67,7 @@ async def swap_selected(
     direction: str,
     amount: AmountSpec,
     sell_symbol: str | None = None,
+    bypass_guards: bool = False,
     cooldown: float = 1.0,
 ) -> dict[str, list[SwapOutcome]]:
     """One swap per (wallet, token). ``direction`` is 'buy', 'sell', or 'swap'.
@@ -78,6 +79,8 @@ async def swap_selected(
            any pool token is reachable from any other. A buy token equal to the
            sell token is skipped.
     Balances are re-read before each swap so a percent never over-spends.
+    ``bypass_guards`` executes each swap regardless of the fee/slippage guards
+    (a manual override — real-money risk).
     """
     if direction == "swap" and not sell_symbol:
         raise ValueError("direction 'swap' requires sell_symbol")
@@ -113,6 +116,7 @@ async def swap_selected(
             out = await engine.execute_swap(
                 wallet, sell=sell, buy=buy, sell_amount=sell_amount,
                 sell_symbol=ssym, buy_symbol=bsym, direction=direction,
+                bypass_guards=bypass_guards,
             )
             outcomes.append(out)
             await asyncio.sleep(cooldown)

@@ -1308,3 +1308,28 @@ async def test_cc_price_keyed_by_base():
 
     # base == CC is 1:1 with no quote.
     assert await svc._ensure_cc_price(wallet, "CC") == Decimal("1")
+
+
+# -- guard bypass (manual 1x swap override) ----------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_swap_bypass_guards_overrides_reject(tmp_path):
+    store = Store(tmp_path / "s.db")
+    engine = SwapEngine(SwapGuard(GuardConfig(max_slippage=Decimal("0.1"))),
+                        store, notifier(), dry_run=True)
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(return_value=make_quote(slippage="5")))
+    wallet = fake_wallet(sdk)
+    a, b = InstrumentId("d", "USDCX"), InstrumentId("d", "CBTC")
+
+    # Guards on: the high-slippage quote is rejected, nothing executes.
+    out = await engine.execute_swap(
+        wallet, sell=a, buy=b, sell_amount=Decimal("5"),
+        sell_symbol="USDCX", buy_symbol="CBTC", direction="buy")
+    assert out.reject_reasons and not out.ok
+
+    # Bypass: the same quote executes (dry-run here), counted, no reject.
+    out2 = await engine.execute_swap(
+        wallet, sell=a, buy=b, sell_amount=Decimal("5"),
+        sell_symbol="USDCX", buy_symbol="CBTC", direction="buy", bypass_guards=True)
+    assert out2.ok and out2.counted and not out2.reject_reasons
+    store.close()

@@ -66,6 +66,7 @@ class SwapEngine:
         buy_symbol: str,
         direction: str,
         quiet_reject: bool = False,
+        bypass_guards: bool = False,
     ) -> SwapOutcome:
         out = SwapOutcome(
             wallet=wallet.name,
@@ -100,21 +101,26 @@ class SwapEngine:
             wallet.name, f"{sell_symbol}->{buy_symbol}", quote.fees.network_fee.amount
         )
 
-        # 2. Guard
+        # 2. Guard — unless explicitly bypassed (manual 1x swap override).
         result = self.guard.evaluate(quote)
         out.guard = result
         if not result.ok:
-            out.reject_reasons = result.reasons
-            if quiet_reject:
-                # Polling mode: conditions not met yet is expected, not an error.
-                logger.info("%s waiting (fee/slippage too high): %s",
-                            tag, "; ".join(result.reasons))
+            if bypass_guards:
+                # Execute regardless: record the breached limits but do NOT
+                # reject. Real-money risk — deliberately chosen in the CLI.
+                logger.warning("%s GUARD BYPASSED: %s", tag, "; ".join(result.reasons))
             else:
-                logger.warning("%s GUARD REJECT: %s", tag, "; ".join(result.reasons))
-                await self.notifier.send(
-                    f"🛑 {tag}\nGuard reject: {'; '.join(result.reasons)}"
-                )
-            return out
+                out.reject_reasons = result.reasons
+                if quiet_reject:
+                    # Polling mode: conditions not met yet is expected, not an error.
+                    logger.info("%s waiting (fee/slippage too high): %s",
+                                tag, "; ".join(result.reasons))
+                else:
+                    logger.warning("%s GUARD REJECT: %s", tag, "; ".join(result.reasons))
+                    await self.notifier.send(
+                        f"🛑 {tag}\nGuard reject: {'; '.join(result.reasons)}"
+                    )
+                return out
 
         # 3. Dry-run: record intent, count, stop.
         if self.dry_run:
@@ -135,10 +141,11 @@ class SwapEngine:
 
         # 4. Live
         out.submitted_attempt = True  # from here on an error may still have settled
+        # Bypass also lifts the SDK-level network-fee cap so it can't reject.
+        max_fee = Decimal("1000000000") if bypass_guards else self.guard.config.max_network_fee
         try:
             event = await wallet.sdk.swap_and_confirm(
-                sell_amount, sell, buy,
-                max_network_fee=self.guard.config.max_network_fee,
+                sell_amount, sell, buy, max_network_fee=max_fee,
             )
         except CantexError as exc:
             out.error = f"swap failed: {exc}"

@@ -20,7 +20,10 @@ built on the official `cantex_sdk`.
   (token→token, routed multi-hop via CC) — the token(s), and an amount given as
   an absolute value or a **percent of balance** (e.g. `25%`, `100%`). For
   token→token you pick the sell token once, then the buy tokens. One swap per
-  wallet×token.
+  wallet×token. It runs in the background and drops you into the **live
+  dashboard** so you can watch it. An optional **Bypass guards** toggle
+  (default off) executes every swap regardless of the fee/slippage limits — a
+  manual override, real-money risk.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

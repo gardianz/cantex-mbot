@@ -206,6 +206,10 @@ class Store:
         """Log an observed network fee (CC) plus slippage and pool fee (percent)
         from a quote, for today's per-pair stats."""
         day = datetime.now(timezone.utc).date().isoformat()
+        # Normalise case so a pair is one row: base is upper-cased but token
+        # symbols keep their source case (USDCx, cETH), which would otherwise
+        # split e.g. "USDCX->FRXUSD.B" and "USDCx->FRXUSD.B" into two rows.
+        pair = pair.upper()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee, slippage, "
@@ -234,19 +238,23 @@ class Store:
         'FEE now' cannot represent them."""
         day = day or _today()
         with self._lock:
+            # Group case-insensitively so legacy mixed-case rows (USDCX vs USDCx)
+            # collapse into one pair; the latest/slip/pool subqueries match the
+            # same way.
             rows = self._conn.execute(
-                """SELECT pair, MIN(network_fee) AS mn, AVG(network_fee) AS av,
-                          COUNT(*) AS n,
+                """SELECT UPPER(pair) AS pair, MIN(network_fee) AS mn,
+                          AVG(network_fee) AS av, COUNT(*) AS n,
                           (SELECT network_fee FROM fee_obs f2
-                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS latest,
                           (SELECT slippage FROM fee_obs f2
-                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS slip,
                           (SELECT pool_fee FROM fee_obs f2
-                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             WHERE UPPER(f2.pair) = UPPER(f.pair) AND f2.day = f.day
                              ORDER BY ts DESC LIMIT 1) AS pool
-                   FROM fee_obs f WHERE day = ? GROUP BY pair ORDER BY pair""",
+                   FROM fee_obs f WHERE day = ?
+                   GROUP BY UPPER(pair) ORDER BY UPPER(pair)""",
                 (day,),
             ).fetchall()
         out: list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]] = []

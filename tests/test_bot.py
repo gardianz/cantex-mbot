@@ -1539,3 +1539,22 @@ def test_loss_fifo_same_token():
         tr(4, "CBTC", "USDCX", "1.0", "18"),   # closes second buy: 20-18 = 2
     ]
     assert WebClient.daily_loss(trades, usdcx_symbol="USDCX", day=now) == Decimal("3")
+
+
+def test_pair_fee_stats_merges_case(tmp_path):
+    """A pair must be one row regardless of symbol case (USDCX vs USDCx),
+    including legacy rows written before normalisation."""
+    from datetime import datetime, timezone
+    store = Store(tmp_path / "s.db")
+    today = datetime.now(timezone.utc).date().isoformat()
+    # Legacy raw row (bypasses record_fee's upper-casing).
+    store._conn.execute(
+        "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee, slippage, "
+        "pool_fee) VALUES (?,?,?,?,?,?,?)",
+        (1.0, today, "w2", "USDCx->FRXUSD.B", 0.72, 0, 0))
+    store._conn.commit()
+    store.record_fee("w1", "USDCX->FRXUSD.B", Decimal("0.70"))
+    rows = store.pair_fee_stats()
+    assert [r[0] for r in rows] == ["USDCX->FRXUSD.B"]   # single merged pair
+    assert rows[0][6] == 2                               # both observations
+    store.close()

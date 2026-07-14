@@ -42,6 +42,7 @@ class Strategy1(Strategy):
         store: Store,
         run_state: "RunState | None" = None,
         tokens: list[str] | None = None,
+        base_symbol: str | None = None,
     ) -> None:
         self.manager = manager
         self.engine = engine
@@ -49,23 +50,27 @@ class Strategy1(Strategy):
         self.notifier = notifier
         self.store = store
         self.run_state = run_state
-        # Token symbols to trade against the base (USDCX). None => every pool
-        # token (minus USDCX and CC). Chosen interactively in the CLI.
+        # Base token to cycle against (default USDCX). Any pool token works —
+        # the swap endpoint routes token->token multi-hop via CC.
+        self.base_symbol = (base_symbol or config.usdcx_symbol).upper()
+        # Token symbols to trade against the base. None => every pool token
+        # (minus the base and CC). Chosen interactively in the CLI.
         self.tokens = tokens
         # Per-wallet cache of (monotonic_ts, web_swaps_today) for the poll loop.
         self._web_cache: dict[str, tuple[float, int]] = {}
 
     def _pairs_for(self, market: MarketMap):
-        """USDCX<->token pairs to trade, honouring the chosen token subset."""
+        """base<->token pairs to trade, honouring the chosen token subset."""
         return market.trade_pairs(
-            self.config.usdcx_symbol,
+            self.base_symbol,
             only_symbols=self.tokens,
             exclude_symbols=(self.config.cc_symbol,),
         )
 
     async def run(self, stop: asyncio.Event) -> None:
         await self.notifier.send(
-            f"▶️ Strategy1 start (target {self.config.daily_swap_target}/wallet, "
+            f"▶️ Strategy1 start (base {self.base_symbol}, "
+            f"target {self.config.daily_swap_target}/wallet, "
             f"cc_units={self.config.cc_units}, dry_run={self.engine.dry_run})"
         )
         if self.run_state is not None:
@@ -110,7 +115,7 @@ class Strategy1(Strategy):
     async def _run_wallet(self, wallet: Wallet, stop: asyncio.Event) -> None:
         await wallet.ensure_auth()
         market = await MarketMap.build(wallet.sdk)
-        usdcx = market.instrument(self.config.usdcx_symbol)
+        usdcx = market.instrument(self.base_symbol)
         cc = market.instrument(self.config.cc_symbol)
         pairs = self._pairs_for(market)
         if not pairs:
@@ -144,7 +149,7 @@ class Strategy1(Strategy):
         logger.info("[%s] web swaps already today: %d", wallet.name, prior_web)
 
         insufficient_streak = 0
-        usym = self.config.usdcx_symbol
+        usym = self.base_symbol
         run_day = datetime.now(timezone.utc).date()
         while not stop.is_set():
             # UTC day rollover: the daily swap target resets at 00:00 UTC (Cantex

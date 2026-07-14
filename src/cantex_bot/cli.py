@@ -133,15 +133,12 @@ class App:
         dash = Dashboard(self.service, self.config, self.run_state)
         await self._run_cancellable(dash.run)
 
-    async def _tradeable_tokens(self) -> list[str] | None:
-        """USDCX-tradeable token symbols (minus CC), from the first wallet."""
-        usdcx = self.config.strategy1.usdcx_symbol
-        cc = self.config.strategy1.cc_symbol
+    async def _first_market(self) -> "MarketMap | None":
+        """Build the market map from the first wallet (for token pickers)."""
         try:
             first = self.manager.get(self.manager.names[0])
             await first.ensure_auth()
-            market = await MarketMap.build(first.sdk)
-            return [p.token_symbol for p in market.trade_pairs(usdcx, exclude_symbols=(cc,))]
+            return await MarketMap.build(first.sdk)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]Cannot load market: {exc}[/red]")
             return None
@@ -154,24 +151,43 @@ class App:
         if not mode or mode == "Back":
             return
 
-        # Choose which USDCX<->token pairs to cycle (default: all).
-        syms = await self._tradeable_tokens()
+        market = await self._first_market()
+        if market is None:
+            return
+        usdcx = self.config.strategy1.usdcx_symbol
+        cc = self.config.strategy1.cc_symbol
+
+        # Base token to cycle against (default USDCX; any pool token works —
+        # the swap endpoint routes token->token multi-hop via CC).
+        bases = [usdcx] + [b for b in market.pool_token_symbols()
+                           if b.upper() != usdcx.upper()]
+        base_sym = await questionary.select(
+            "Base token to cycle against (base <-> token):",
+            choices=bases, default=usdcx,
+        ).ask_async()
+        if not base_sym:
+            return
+
+        # Choose which base<->token pairs to cycle (default: all).
+        syms = [p.token_symbol
+                for p in market.trade_pairs(base_sym, exclude_symbols=(cc,))]
         if not syms:
-            console.print("[red]No tradeable tokens found.[/red]")
+            console.print(f"[red]No tradeable tokens for base {base_sym}.[/red]")
             return
         tokens = await questionary.checkbox(
-            "Pairs to trade (USDCX <-> token; space toggle, enter confirm):",
+            f"Pairs to trade ({base_sym} <-> token; space toggle, enter confirm):",
             choices=[questionary.Choice(s, checked=True) for s in syms],
         ).ask_async()
         if not tokens:
             console.print("[yellow]No pair selected — nothing to run.[/yellow]")
             return
-        console.print(f"Trading {len(tokens)} pair(s): {', '.join(tokens)}")
+        console.print(
+            f"Trading {len(tokens)} pair(s) [base {base_sym}]: {', '.join(tokens)}")
 
         await self._choose_execution_mode()
         strategy = Strategy1(
             self.manager, self.engine, self.config.strategy1, self.notifier, self.store,
-            run_state=self.run_state, tokens=tokens,
+            run_state=self.run_state, tokens=tokens, base_symbol=base_sym,
         )
         scheduler = StrategyScheduler(strategy, self.notifier)
         runner = scheduler.run_daily if mode.startswith("Run daily") else scheduler.run_once

@@ -7,11 +7,14 @@ built on the official `cantex_sdk`.
 
 - **Multi-wallet** — one authenticated SDK session per wallet.
 - **Interactive CLI** menu (`questionary`).
-- **Strategy 1** — cycle USDCX ⇄ every USDCX pair, back and forth, until a daily
-  per-wallet swap target is hit. Buy side is sized to the market value of *N* CC
-  tokens; sell side dumps 100% of the token's unlocked balance. The daily target
-  is counted from the **web trading history** (with the local counter as a
-  fallback), so it stays in sync with what the exchange actually recorded.
+- **Strategy 1** — cycle a **base token ⇄ each selected pair**, back and forth,
+  until a daily per-wallet swap target is hit. The base defaults to USDCX but
+  can be **any pool token** (token→token, routed multi-hop via CC). Buy side is
+  sized to the market value of *N* CC tokens; sell side dumps 100% of the
+  token's unlocked balance. The daily target is counted from the **web trading
+  history** (with the local counter as a fallback), so it stays in sync with
+  what the exchange actually recorded. Selecting the pairs drops you straight
+  into the live dashboard.
 - **Swap (pick & go)** — choose which wallets (one, several, or all), a
   direction — **buy** (USDCX→token), **sell** (token→USDCX), or **swap**
   (token→token, routed multi-hop via CC) — the token(s), and an amount given as

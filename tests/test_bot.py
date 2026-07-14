@@ -1243,3 +1243,30 @@ async def test_swap_selected_swap_requires_sell_symbol():
             SimpleNamespace(), SimpleNamespace(), wallet_names=["w1"],
             token_symbols=["CETH"], usdcx_symbol="USDCX", direction="swap",
             amount=AmountSpec.parse("5"))
+
+
+# -- Strategy1 base token (token -> token) -----------------------------------
+
+def test_strategy1_base_symbol_defaults_and_overrides():
+    from cantex_bot.strategies.strategy1 import Strategy1
+    from cantex_bot.config import Strategy1Config
+    mgr = SimpleNamespace(wallets={}, names=[])
+    cfg = Strategy1Config()
+    s_default = Strategy1(mgr, SimpleNamespace(), cfg, notifier(), None)
+    assert s_default.base_symbol == cfg.usdcx_symbol.upper()
+    s_base = Strategy1(mgr, SimpleNamespace(), cfg, notifier(), None,
+                       base_symbol="cbtc")
+    assert s_base.base_symbol == "CBTC"
+
+    class _RecMarket:
+        def __init__(self):
+            self.args = None
+
+        def trade_pairs(self, base, *, only_symbols=None, exclude_symbols=()):
+            self.args = (base, only_symbols, exclude_symbols)
+            return []
+
+    m = _RecMarket()
+    s_base.tokens = ["CETH"]
+    s_base._pairs_for(m)
+    assert m.args[0] == "CBTC" and m.args[1] == ["CETH"]  # base threaded through

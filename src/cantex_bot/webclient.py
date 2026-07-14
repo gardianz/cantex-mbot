@@ -210,42 +210,44 @@ class WebClient:
 
     @staticmethod
     def _loss_over(
-        trades: list[Trade], usdcx_symbol: str,
+        trades: list[Trade], base_symbol: str,
         keep: Callable[[Trade], bool],
     ) -> Decimal:
-        """USDCX lost over the COMPLETE buy->sell cycles among the kept trades.
+        """Base-currency lost over COMPLETE base->token->base cycles, PAIRED BY
+        TOKEN and accumulated per cycle.
 
-        Loss is measured purely in USDCX: what leaves the wallet on the buy leg
-        minus what comes back on the sell leg. Only the USDCX-touching legs
-        matter, so this works whether the history records a swap as one direct
-        row (``USDCx->CBTC``) or expands the CC hop (``USDCx->CC`` + ``CC->CBTC``)
-        — the intermediate CC legs are simply ignored.
+        Loss is measured in the ``base_symbol`` currency: what leaves the wallet
+        buying a token minus what comes back selling that SAME token. Only legs
+        with the base on one side matter (the intermediate CC hop, if the history
+        ever expands it, is ignored).
 
-        Walking the kept rows in time order:
-          * a row whose **input** is USDCX opens a buy — remember the USDCX spent;
-          * a row whose **output** is USDCX closes the matching sell — if a buy is
-            open, the cycle is COMPLETE: ``loss += spent - received`` (positive =
-            loss, negative = gain), and the buy is cleared.
+        Walking the kept rows in time order, keyed by the *other* token so a buy
+        is only ever closed by a sell of the same token (a FIFO queue per token):
+          * ``base -> X`` opens a buy of X — push the base spent;
+          * ``X -> base`` closes the oldest open buy of X — the cycle is COMPLETE:
+            ``loss += spent - received`` (positive = loss, negative = gain).
 
-        Incomplete cycles are ignored: a leading sell (``CBTC->USDCx`` whose buy
-        fell outside the window → no open buy) is skipped, and a trailing buy
-        still holding the token at window end (no closing sell) never counts.
+        Pairing by token is what makes this correct when several tokens are cycled
+        at once, or when the base token was changed mid-run: a ``base->A`` buy is
+        never mis-closed by an unrelated ``B->base`` sell (the bug that produced
+        wildly wrong losses). Incomplete cycles are ignored: a leading sell with
+        no open buy is skipped, and a trailing buy never sold never counts.
         """
         def sym(s: str) -> str:
             return (s or "").upper()
 
-        u = sym(usdcx_symbol)
+        b = sym(base_symbol)
         window = sorted((t for t in trades if keep(t)), key=lambda t: t.timestamp)
         loss = Decimal(0)
-        spent: Decimal | None = None  # USDCX of an open buy awaiting its sell
+        open_spent: dict[str, list[Decimal]] = {}  # token -> FIFO of base spent
         for t in window:
             inp, out = sym(t.input_id), sym(t.output_id)
-            if inp == u and out != u:            # USDCX leaves: buy opens
-                spent = t.amount_input
-            elif out == u and inp != u:          # USDCX returns: sell closes
-                if spent is not None:            # ...only if a buy is open
-                    loss += spent - t.amount_output
-                    spent = None
+            if inp == b and out != b:            # base -> token X : buy opens
+                open_spent.setdefault(out, []).append(t.amount_input)
+            elif out == b and inp != b:          # token X -> base : sell closes
+                queue = open_spent.get(inp)
+                if queue:                        # ...only if a buy of X is open
+                    loss += queue.pop(0) - t.amount_output
         return loss
 
     @staticmethod

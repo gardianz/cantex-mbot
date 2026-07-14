@@ -1494,3 +1494,47 @@ async def test_maybe_probe_fees_records_all_pairs(tmp_path):
     recorded = {p for p, *_ in store.pair_fee_stats()}
     assert recorded == {"USDCX->CBTC", "USDCX->CETH"}   # every pair probed
     store.close()
+
+
+# -- loss pairs by token (base-change / multi-token fix) ---------------------
+
+def test_loss_pairs_by_token_not_cross():
+    """Interleaved cycles of different tokens must pair per token, not close a
+    CBTC buy with a FRXUSD.B sell (the base-change 'kacau' bug)."""
+    from cantex_bot.webclient import WebClient, Trade
+    now = datetime.now(timezone.utc)
+
+    def tr(i, inp, out, ai, ao):
+        return Trade(timestamp=now.replace(microsecond=i), input_id=inp,
+                     input_admin="", output_id=out, output_admin="",
+                     amount_input=Decimal(ai), amount_output=Decimal(ao),
+                     pool_cid=f"p{i}")
+
+    trades = [
+        tr(1, "USDCX", "CBTC", "20", "0.001"),        # buy CBTC, spent 20
+        tr(2, "USDCX", "FRXUSD.B", "200", "199"),     # buy FRXUSD.B, spent 200
+        tr(3, "CBTC", "USDCX", "0.001", "19"),        # sell CBTC -> 20-19 = 1
+        tr(4, "FRXUSD.B", "USDCX", "199", "195"),     # sell FRXUSD.B -> 200-195 = 5
+    ]
+    loss = WebClient.daily_loss(trades, usdcx_symbol="USDCX", day=now)
+    assert loss == Decimal("6")   # 1 + 5, NOT the cross-paired 200-19 = 181
+
+
+def test_loss_fifo_same_token():
+    """Two buys then two sells of the same token pair FIFO."""
+    from cantex_bot.webclient import WebClient, Trade
+    now = datetime.now(timezone.utc)
+
+    def tr(i, inp, out, ai, ao):
+        return Trade(timestamp=now.replace(microsecond=i), input_id=inp,
+                     input_admin="", output_id=out, output_admin="",
+                     amount_input=Decimal(ai), amount_output=Decimal(ao),
+                     pool_cid=f"p{i}")
+
+    trades = [
+        tr(1, "USDCX", "CBTC", "10", "0.5"),
+        tr(2, "USDCX", "CBTC", "20", "1.0"),
+        tr(3, "CBTC", "USDCX", "0.5", "9"),    # closes first buy: 10-9 = 1
+        tr(4, "CBTC", "USDCX", "1.0", "18"),   # closes second buy: 20-18 = 2
+    ]
+    assert WebClient.daily_loss(trades, usdcx_symbol="USDCX", day=now) == Decimal("3")

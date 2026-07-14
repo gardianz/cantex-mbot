@@ -75,7 +75,8 @@ class Strategy1(Strategy):
         )
         if self.run_state is not None:
             selected = await self._selected_tokens()
-            self.run_state.begin(self.manager.names, selected)
+            self.run_state.begin(self.manager.names, selected,
+                                 base_symbol=self.base_symbol)
         try:
             results = await asyncio.gather(
                 *(self._run_wallet(w, stop) for w in self.manager.wallets.values()),

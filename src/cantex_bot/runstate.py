@@ -38,6 +38,9 @@ class RunState:
         self.strategy_active: bool = False
         # None => show all token balances; a list => only these symbols.
         self.selected_tokens: list[str] | None = None
+        # Base token the active/last strategy cycles against (USDCX by default).
+        # Loss/profit are measured in this currency then converted to CC.
+        self.base_symbol: str = "USDCX"
 
     def view(self, name: str) -> StratView:
         v = self.views.get(name)
@@ -46,9 +49,11 @@ class RunState:
             self.views[name] = v
         return v
 
-    def begin(self, names: list[str], selected_tokens: list[str]) -> None:
+    def begin(self, names: list[str], selected_tokens: list[str],
+              base_symbol: str = "USDCX") -> None:
         self.strategy_active = True
         self.selected_tokens = list(selected_tokens)
+        self.base_symbol = (base_symbol or "USDCX").upper()
         for n in names:
             v = self.view(n)
             v.active = True

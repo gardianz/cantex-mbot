@@ -1270,3 +1270,41 @@ def test_strategy1_base_symbol_defaults_and_overrides():
     s_base.tokens = ["CETH"]
     s_base._pairs_for(m)
     assert m.args[0] == "CBTC" and m.args[1] == ["CETH"]  # base threaded through
+
+
+# -- base-aware loss / CC price ----------------------------------------------
+
+def test_active_base_follows_runstate():
+    from cantex_bot.runstate import RunState
+    svc = _fake_portfolio()
+    assert svc._active_base() == "USDCX"                 # no strategy -> USDCX
+    rs = RunState()
+    rs.begin(["w1"], ["CETH"], base_symbol="cbtc")
+    svc.run_state = rs
+    assert svc._active_base() == "CBTC"                  # follows the run's base
+
+
+@pytest.mark.asyncio
+async def test_cc_price_keyed_by_base():
+    svc = _fake_portfolio()
+
+    class _M:
+        def instrument(self, s):
+            return InstrumentId("D", s.upper())
+
+    svc._market = _M()  # skip MarketMap.build
+    wallet = svc.manager.get("w1")
+
+    wallet.sdk.get_swap_quote = AsyncMock(
+        return_value=SimpleNamespace(returned_amount=Decimal("20")))
+    assert await svc._ensure_cc_price(wallet, "USDCX") == Decimal("2")  # 20/10
+    assert svc._cc_price_base == "USDCX"
+
+    # A base change forces a refetch (not the cached USDCX price).
+    wallet.sdk.get_swap_quote = AsyncMock(
+        return_value=SimpleNamespace(returned_amount=Decimal("50")))
+    assert await svc._ensure_cc_price(wallet, "CBTC") == Decimal("5")   # 50/10
+    assert svc._cc_price_base == "CBTC"
+
+    # base == CC is 1:1 with no quote.
+    assert await svc._ensure_cc_price(wallet, "CC") == Decimal("1")

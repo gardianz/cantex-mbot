@@ -116,10 +116,11 @@ class PortfolioService:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._sweeps = 0
-        # CC price (USDCX per 1 CC) for converting USDCX loss to CC — market-wide,
-        # cached briefly and shared across wallets.
+        # CC price (base-token per 1 CC) for converting base-denominated loss to
+        # CC — market-wide, cached briefly, keyed by the base symbol in force.
         self._market = None
         self._cc_price = Decimal(0)
+        self._cc_price_base = ""
         self._cc_price_ts = 0.0
         self._cc_price_ttl = 60.0
 
@@ -148,15 +149,17 @@ class PortfolioService:
                     snap.swaps_today = WebClient.count_today(trades)
                     snap.swaps_24h = WebClient.count_since(trades, _DAY)
                     snap.swaps_7d = WebClient.count_since(trades, _WEEK)
-                    # USDCX loss over each window, then converted to CC.
-                    cc_price = await self._ensure_cc_price(wallet)
+                    # Loss over each window in the active base currency, then
+                    # converted to CC (base = USDCX unless a strategy set another).
+                    base = self._active_base()
+                    cc_price = await self._ensure_cc_price(wallet, base)
                     yesterday = datetime.now(timezone.utc) - timedelta(days=1)
                     snap.loss_today = self._to_cc(WebClient.daily_loss(
-                        trades, usdcx_symbol=self.usdcx_symbol), cc_price)
+                        trades, usdcx_symbol=base), cc_price)
                     snap.loss_yesterday = self._to_cc(WebClient.daily_loss(
-                        trades, usdcx_symbol=self.usdcx_symbol, day=yesterday), cc_price)
+                        trades, usdcx_symbol=base, day=yesterday), cc_price)
                     snap.loss_week = self._to_cc(WebClient.weekly_loss(
-                        trades, usdcx_symbol=self.usdcx_symbol), cc_price)
+                        trades, usdcx_symbol=base), cc_price)
                     reb = await wallet.web.fetch_rebates()
                     snap.reb_yesterday = reb.yesterday
                     snap.reb_this_week = reb.this_week
@@ -190,27 +193,42 @@ class PortfolioService:
                 return tok.unlocked_amount
         return Decimal(0)
 
-    async def _ensure_cc_price(self, wallet) -> Decimal:
-        """USDCX per 1 CC via a pricing quote, cached market-wide. 0 if it can't
-        be priced (loss then shows 0 CC until the next successful quote)."""
+    def _active_base(self) -> str:
+        """The base currency loss is measured in: the running/last strategy's
+        base token, else USDCX."""
+        if self.run_state is not None and getattr(self.run_state, "base_symbol", None):
+            return self.run_state.base_symbol.upper()
+        return self.usdcx_symbol
+
+    async def _ensure_cc_price(self, wallet, base_symbol: str) -> Decimal:
+        """``base_symbol`` per 1 CC via a pricing quote, cached market-wide and
+        keyed by base. 0 if it can't be priced (loss then shows 0 CC until the
+        next successful quote)."""
+        base_symbol = base_symbol.upper()
         now = time.monotonic()
-        if self._cc_price > 0 and now - self._cc_price_ts < self._cc_price_ttl:
+        if (self._cc_price_base == base_symbol and self._cc_price > 0
+                and now - self._cc_price_ts < self._cc_price_ttl):
             return self._cc_price
         try:
             if self._market is None:
                 from .markets import MarketMap
                 self._market = await MarketMap.build(wallet.sdk)
             cc = self._market.instrument(self.cc_symbol)
-            usdcx = self._market.instrument(self.usdcx_symbol)
+            base = self._market.instrument(base_symbol)
+            if base == cc:                       # base IS CC: 1 CC = 1 CC
+                self._cc_price, self._cc_price_base, self._cc_price_ts = (
+                    Decimal(1), base_symbol, now)
+                return self._cc_price
             probe = Decimal(10)  # a small-but-non-dust ticket
-            q = await wallet.sdk.get_swap_quote(probe, cc, usdcx)
-            price = q.returned_amount / probe
+            q = await wallet.sdk.get_swap_quote(probe, cc, base)
+            price = q.returned_amount / probe    # base per 1 CC
             if price > 0:
-                self._cc_price = price
-                self._cc_price_ts = now
+                self._cc_price, self._cc_price_base, self._cc_price_ts = (
+                    price, base_symbol, now)
         except Exception as exc:  # noqa: BLE001 - pricing is best-effort
-            logger.debug("cc price quote failed: %s", exc)
-        return self._cc_price
+            logger.debug("cc price quote (base %s) failed: %s", base_symbol, exc)
+        # Never return a price cached for a DIFFERENT base.
+        return self._cc_price if self._cc_price_base == base_symbol else Decimal(0)
 
     @staticmethod
     def _to_cc(usdcx_amount: Decimal, cc_price: Decimal) -> Decimal:

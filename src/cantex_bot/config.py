@@ -60,9 +60,9 @@ class Strategy1Config:
     # Refuse to sell a token back while the round trip would lose more than this
     # percent of what was spent buying it — wait for the price to recover instead.
     max_cycle_loss_pct: Decimal = Decimal("1.0")
-    # Stop a wallet for the rest of the UTC day once today's realised loss (in the
-    # base currency) reaches this much.
-    max_daily_loss_base: Decimal = Decimal("0")
+    # Stop a wallet for the rest of the UTC day once today's realised loss reaches
+    # this many CC — the same unit as the dashboard's LOSS column.
+    max_daily_loss_cc: Decimal = Decimal("0")
     # How long a sell may be held back by max_cycle_loss_pct before it is sold
     # anyway (seconds). Prevents a wallet being stuck in a token forever; 0 waits
     # indefinitely (until the next UTC day).
@@ -177,8 +177,8 @@ def load_config(
         poll_far_ratio=float(s1.get("poll_far_ratio", 0.3)),
         max_cycle_loss_pct=_dec(s1.get("max_cycle_loss_pct"),
                                 Strategy1Config.max_cycle_loss_pct),
-        max_daily_loss_base=_dec(s1.get("max_daily_loss_base"),
-                                 Strategy1Config.max_daily_loss_base),
+        max_daily_loss_cc=_dec(s1.get("max_daily_loss_cc"),
+                               Strategy1Config.max_daily_loss_cc),
         cycle_loss_wait_seconds=float(s1.get("cycle_loss_wait_seconds", 1800.0)),
     )
 

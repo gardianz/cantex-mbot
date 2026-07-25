@@ -34,8 +34,9 @@ built on the official `cantex_sdk`.
   extra limits cap the damage: `max_cycle_loss_pct` holds a sell back while the
   round trip would lose more than that percent of what the buy cost (waiting for
   the price to recover, up to `cycle_loss_wait_seconds`), and
-  `max_daily_loss_base` pauses a wallet for the rest of the UTC day once today's
-  realised loss reaches the budget. Set either to `0` to disable.
+  `max_daily_loss_cc` pauses a wallet for the rest of the UTC day once today's
+  realised loss reaches that many **CC** — the same unit as the dashboard's LOSS
+  column. Set either to `0` to disable.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

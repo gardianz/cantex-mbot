@@ -199,17 +199,19 @@ class Strategy1(Strategy):
                 continue
             # Daily loss budget: once today's realised loss reaches the cap, stop
             # trading this wallet until the next UTC day (the rollover resets it).
-            budget = self.config.max_daily_loss_base
+            # Measured in CC, the same unit as the dashboard's LOSS column.
+            budget = self.config.max_daily_loss_cc
             if budget > 0:
-                loss_today = await self._daily_loss_base(wallet)
-                if loss_today >= budget:
-                    logger.warning("[%s] daily loss %s >= budget %s — idle until "
-                                   "next UTC day", wallet.name, loss_today, budget)
+                loss_cc = self._to_cc(
+                    await self._daily_loss_base(wallet), state["notional"])
+                if loss_cc >= budget:
+                    logger.warning("[%s] daily loss %s CC >= budget %s CC — idle "
+                                   "until next UTC day", wallet.name, loss_cc, budget)
                     self._st(wallet.name, status=run_status.STOPPED, route="",
-                             plan=f"loss limit {loss_today:.2f}")
+                             plan=f"loss limit {loss_cc:.2f} CC")
                     await self.notifier.send(
-                        f"🛑 {self.label} [{wallet.name}] daily loss {loss_today:.2f} "
-                        f"{self.base_symbol} >= budget {budget} — paused for today")
+                        f"🛑 {self.label} [{wallet.name}] daily loss {loss_cc:.2f} CC "
+                        f">= budget {budget} CC — paused for today")
                     if not await self._wait_next_day(stop):
                         break
                     continue
@@ -395,6 +397,15 @@ class Strategy1(Strategy):
             val = cached[1] if cached else Decimal(0)
         self._loss_cache[wallet.name] = (now, val)
         return val
+
+    def _to_cc(self, base_amount: Decimal, notional: Decimal) -> Decimal:
+        """Convert a base-currency amount to CC. ``notional`` is what
+        ``cc_units`` CC is worth in the base (already quoted for the buy size),
+        so ``base per CC = notional / cc_units``. 0 when it can't be priced."""
+        units = self.config.cc_units
+        if notional <= 0 or units <= 0:
+            return Decimal(0)
+        return base_amount / (notional / units)
 
     async def _cycle_loss_pct(
         self, wallet: Wallet, token: InstrumentId, token_symbol: str,

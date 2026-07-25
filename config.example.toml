@@ -46,9 +46,9 @@ max_cycle_loss_pct = 1.0
 # ...but never hold longer than this (seconds), so a wallet is not stuck in a
 # token forever after a real price move. 0 = hold until the next UTC day.
 cycle_loss_wait_seconds = 1800
-# Stop a wallet for the rest of the UTC day once today's realised loss (in the
-# base currency, from the trading history) reaches this. 0 = no budget.
-max_daily_loss_base = 0
+# Stop a wallet for the rest of the UTC day once today's realised loss reaches
+# this many CC — the same unit as the dashboard's LOSS column. 0 = no budget.
+max_daily_loss_cc = 0
 
 [swap_all]
 # Amount (in the sell instrument) used by the one-shot "swap 1x all pairs" command.

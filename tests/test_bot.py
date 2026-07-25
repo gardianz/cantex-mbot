@@ -1713,3 +1713,14 @@ async def test_daily_loss_base_cached(tmp_path):
     await strat._daily_loss_base(wallet)                 # served from cache
     assert web.fetch_trading_history.await_count == 1
     store.close()
+
+
+def test_daily_loss_budget_is_in_cc(tmp_path):
+    """The budget uses CC (the dashboard's LOSS unit): base loss is converted
+    with the same CC price the buy notional was quoted at."""
+    store = Store(tmp_path / "s.db")
+    strat = _brake_strat(store, cc_units=Decimal("5"))
+    notional = Decimal("50")            # 5 CC is worth 50 base => 10 base per CC
+    assert strat._to_cc(Decimal("30"), notional) == Decimal("3")   # 30 base = 3 CC
+    assert strat._to_cc(Decimal("30"), Decimal("0")) == Decimal("0")  # unpriced
+    store.close()

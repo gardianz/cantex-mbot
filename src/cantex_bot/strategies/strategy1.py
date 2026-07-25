@@ -13,6 +13,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from cantex_sdk import CantexError, InstrumentId
 
@@ -59,6 +60,10 @@ class Strategy1(Strategy):
         self.tokens = tokens
         # Per-wallet cache of (monotonic_ts, web_swaps_today) for the poll loop.
         self._web_cache: dict[str, tuple[float, int]] = {}
+        # Per-wallet cache of (monotonic_ts, loss_today_in_base) for the budget.
+        self._loss_cache: dict[str, tuple[float, Decimal]] = {}
+        # When a sell was first held back by the cycle-loss brake: (wallet, token).
+        self._held_since: dict[tuple[str, str], float] = {}
 
     def _pairs_for(self, market: MarketMap):
         """base<->token pairs to trade, honouring the chosen token subset."""
@@ -166,6 +171,7 @@ class Strategy1(Strategy):
                 insufficient_streak = 0
                 state["idx"] = 0
                 self._web_cache.pop(wallet.name, None)
+                self._loss_cache.pop(wallet.name, None)
                 prior_web = await self._web_swaps_today(wallet)
                 self._st(wallet.name, status=run_status.RUNNING,
                          route="", plan="new day", done=0)
@@ -191,6 +197,22 @@ class Strategy1(Strategy):
                 if not await self._wait_next_day(stop):
                     break
                 continue
+            # Daily loss budget: once today's realised loss reaches the cap, stop
+            # trading this wallet until the next UTC day (the rollover resets it).
+            budget = self.config.max_daily_loss_base
+            if budget > 0:
+                loss_today = await self._daily_loss_base(wallet)
+                if loss_today >= budget:
+                    logger.warning("[%s] daily loss %s >= budget %s — idle until "
+                                   "next UTC day", wallet.name, loss_today, budget)
+                    self._st(wallet.name, status=run_status.STOPPED, route="",
+                             plan=f"loss limit {loss_today:.2f}")
+                    await self.notifier.send(
+                        f"🛑 {self.label} [{wallet.name}] daily loss {loss_today:.2f} "
+                        f"{self.base_symbol} >= budget {budget} — paused for today")
+                    if not await self._wait_next_day(stop):
+                        break
+                    continue
             if insufficient_streak >= self.config.insufficient_retries:
                 logger.warning("[%s] insufficient balance after %d retries — "
                                "idle until next UTC day", wallet.name, insufficient_streak)
@@ -218,6 +240,28 @@ class Strategy1(Strategy):
                             wallet.name, usdcx_bal, buy_notional, tok)
                 await asyncio.sleep(self.config.cooldown_seconds)
                 continue
+
+            # Cycle-loss brake: the per-leg guards cannot see a round trip, so a
+            # sell-back at a bad price would still execute. Hold the sell while it
+            # would lose more than max_cycle_loss_pct of what the buy cost, and let
+            # it through once the price recovers (or the hold times out, so a
+            # wallet is never stuck in a token forever).
+            cap = self.config.max_cycle_loss_pct
+            if step == "sell" and cap > 0:
+                loss_pct = await self._cycle_loss_pct(
+                    wallet, pair.token, tok, token_bal, usdcx)
+                if loss_pct is not None and loss_pct > cap:
+                    if not self._hold_expired(wallet.name, tok):
+                        self._st(wallet.name, status=run_status.WAITING, route=route,
+                                 plan=f"tunggu harga -{loss_pct:.2f}%")
+                        logger.info("[%s] holding %s: round trip would lose %.2f%% "
+                                    "(> %s%%)", wallet.name, tok, loss_pct, cap)
+                        await asyncio.sleep(self._poll_interval(
+                            SimpleNamespace(guard=None)))
+                        continue
+                    logger.warning("[%s] %s held too long (loss %.2f%%) — selling "
+                                   "anyway", wallet.name, tok, loss_pct)
+                self._clear_hold(wallet.name, tok)
 
             # Snapshot the web swap count so an ambiguous outcome (below) can be
             # reconciled against the trading history.
@@ -333,6 +377,53 @@ class Strategy1(Strategy):
             val = cached[1] if cached else 0
         self._web_cache[wallet.name] = (now, val)
         return val
+
+    async def _daily_loss_base(self, wallet: Wallet, ttl: float = 60.0) -> Decimal:
+        """Today's realised loss (UTC) in the BASE currency, from the trading
+        history. Cached per wallet; 0 when there is no web access."""
+        if wallet.web is None:
+            return Decimal(0)
+        now = time.monotonic()
+        cached = self._loss_cache.get(wallet.name)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        try:
+            trades = await wallet.web.fetch_trading_history()
+            val = WebClient.daily_loss(trades, usdcx_symbol=self.base_symbol)
+        except WebClientError as exc:
+            logger.debug("[%s] loss fetch failed: %s", wallet.name, exc)
+            val = cached[1] if cached else Decimal(0)
+        self._loss_cache[wallet.name] = (now, val)
+        return val
+
+    async def _cycle_loss_pct(
+        self, wallet: Wallet, token: InstrumentId, token_symbol: str,
+        amount: Decimal, base: InstrumentId,
+    ) -> Decimal | None:
+        """Loss of the round trip that selling ``amount`` now would close, as a
+        percent of the base spent buying it (positive = loss). None when it can't
+        be measured (no recorded buy, or the quote failed) — the caller then lets
+        the sell through rather than blocking on missing data."""
+        spent = self.store.last_buy_cost(wallet.name, self.base_symbol, token_symbol)
+        if spent is None or spent <= 0:
+            return None
+        try:
+            q = await wallet.sdk.get_swap_quote(amount, token, base)
+        except CantexError:
+            return None
+        return (spent - q.returned_amount) / spent * Decimal(100)
+
+    def _hold_expired(self, wallet_name: str, token_symbol: str) -> bool:
+        """True once a sell has been held back by the cycle-loss brake for longer
+        than ``cycle_loss_wait_seconds`` (0 = wait indefinitely). Prevents a
+        wallet being stuck in a token forever after a real price move."""
+        limit = self.config.cycle_loss_wait_seconds
+        key = (wallet_name, token_symbol)
+        first = self._held_since.setdefault(key, time.monotonic())
+        return bool(limit) and (time.monotonic() - first) >= limit
+
+    def _clear_hold(self, wallet_name: str, token_symbol: str) -> None:
+        self._held_since.pop((wallet_name, token_symbol), None)
 
     async def _confirm_via_history(self, wallet: Wallet, pre_web: int) -> bool:
         """After an ambiguous swap, poll the trading history: a today-count above

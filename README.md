@@ -30,6 +30,12 @@ built on the official `cantex_sdk`.
   dashboard** so you can watch it. An optional **Bypass guards** toggle
   (default off) executes every swap regardless of the fee/slippage limits — a
   manual override, real-money risk.
+- **Loss brakes** — the per-leg guards cannot see a whole round trip, so two
+  extra limits cap the damage: `max_cycle_loss_pct` holds a sell back while the
+  round trip would lose more than that percent of what the buy cost (waiting for
+  the price to recover, up to `cycle_loss_wait_seconds`), and
+  `max_daily_loss_base` pauses a wallet for the rest of the UTC day once today's
+  realised loss reaches the budget. Set either to `0` to disable.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

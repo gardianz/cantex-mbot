@@ -37,6 +37,19 @@ poll_min_seconds = 0.5     # interval when fee is at/near the threshold
 poll_max_seconds = 5.0     # interval when fee is far above the threshold
 poll_far_ratio = 0.3       # fee >= 30% above threshold -> use poll_max
 
+# Loss brakes. The [guards] limits are per-leg and cannot see a whole round
+# trip, so a sell-back at a bad price still executes. These cap the damage;
+# set either to 0 to disable it.
+# Refuse to sell a token back while the round trip would lose more than this
+# percent of what the buy cost — wait for the price to recover instead.
+max_cycle_loss_pct = 1.0
+# ...but never hold longer than this (seconds), so a wallet is not stuck in a
+# token forever after a real price move. 0 = hold until the next UTC day.
+cycle_loss_wait_seconds = 1800
+# Stop a wallet for the rest of the UTC day once today's realised loss (in the
+# base currency, from the trading history) reaches this. 0 = no budget.
+max_daily_loss_base = 0
+
 [swap_all]
 # Amount (in the sell instrument) used by the one-shot "swap 1x all pairs" command.
 sell_amount = 1

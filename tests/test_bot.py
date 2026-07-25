@@ -1113,9 +1113,14 @@ async def test_command_bot_unknown_command(monkeypatch):
 # -- history pagination + loss-in-CC + profit --------------------------------
 
 def _hrow(i: int) -> dict:
-    """A distinct trading-history row (unique pool_cid + amount for dedup)."""
+    """A distinct trading-history row (unique pool_cid + amount for dedup).
+
+    The timestamp is 'now' so the row always sits inside fetch_trading_history's
+    cover_days window (a fixed date would fall out of it as time passes and stop
+    the paging early)."""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f+00")
     return {
-        "timestamp_utc": "2026-07-10 10:00:00.0+00",
+        "timestamp_utc": stamp,
         "token_input_instrument_id": "USDCX", "token_output_instrument_id": "cBTC",
         "amount_input": str(i), "amount_output": "1", "pool_cid": f"p{i}",
     }
@@ -1629,3 +1634,82 @@ def test_notifier_pauses_then_recovers():
     assert not n.enabled                     # paused after _MAX_FAILS
     n._paused_until = _t.monotonic() - 1      # cooldown elapsed
     assert n.enabled                          # recovers, not permanently disabled
+
+
+# -- loss brakes (cycle-loss guard + daily budget) ---------------------------
+
+def _brake_strat(store, **cfg):
+    from cantex_bot.strategies.strategy1 import Strategy1
+    from cantex_bot.config import Strategy1Config
+    engine = SimpleNamespace(guard=SwapGuard(GuardConfig()), dry_run=True)
+    return Strategy1(SimpleNamespace(wallets={}, names=[]), engine,
+                     Strategy1Config(**cfg), notifier(), store)
+
+
+def test_last_buy_cost(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.record_swap(SwapRecord(wallet="w1", direction="buy", sell_symbol="USDCX",
+                                 buy_symbol="CBTC", sell_amount=Decimal("10"),
+                                 buy_amount=Decimal("1")))
+    store.record_swap(SwapRecord(wallet="w1", direction="buy", sell_symbol="USDCX",
+                                 buy_symbol="CBTC", sell_amount=Decimal("12"),
+                                 buy_amount=Decimal("1")))
+    assert store.last_buy_cost("w1", "usdcx", "cbtc") == Decimal("12")  # newest
+    assert store.last_buy_cost("w1", "USDCX", "CETH") is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_cycle_loss_pct_measures_round_trip(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.record_swap(SwapRecord(wallet="w1", direction="buy", sell_symbol="USDCX",
+                                 buy_symbol="CBTC", sell_amount=Decimal("100"),
+                                 buy_amount=Decimal("1")))
+    strat = _brake_strat(store)
+    base = InstrumentId("a", "USDCX"); tok = InstrumentId("a", "CBTC")
+    wallet = SimpleNamespace(name="w1", sdk=SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote(returned="97"))))
+    pct = await strat._cycle_loss_pct(wallet, tok, "CBTC", Decimal("1"), base)
+    assert pct == Decimal("3")            # spent 100, back 97 => 3% loss
+    # No recorded buy -> None (unmeasurable, caller lets the sell through).
+    assert await strat._cycle_loss_pct(
+        wallet, tok, "CETH", Decimal("1"), base) is None
+    store.close()
+
+
+def test_hold_expires_after_wait(tmp_path):
+    import time as _t
+    store = Store(tmp_path / "s.db")
+    strat = _brake_strat(store, cycle_loss_wait_seconds=60.0)
+    assert not strat._hold_expired("w1", "CBTC")        # just started holding
+    strat._held_since[("w1", "CBTC")] = _t.monotonic() - 61
+    assert strat._hold_expired("w1", "CBTC")            # waited long enough
+    strat._clear_hold("w1", "CBTC")
+    assert not strat._hold_expired("w1", "CBTC")        # cleared -> restart timer
+    # 0 disables the timeout entirely (hold until the price recovers).
+    s2 = _brake_strat(store, cycle_loss_wait_seconds=0)
+    s2._held_since[("w1", "CBTC")] = _t.monotonic() - 9999
+    assert not s2._hold_expired("w1", "CBTC")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_loss_base_cached(tmp_path):
+    from cantex_bot.webclient import Trade
+    store = Store(tmp_path / "s.db")
+    strat = _brake_strat(store)
+    now = datetime.now(timezone.utc)
+
+    def tr(i, inp, out, ai, ao):
+        return Trade(timestamp=now.replace(microsecond=i), input_id=inp,
+                     input_admin="", output_id=out, output_admin="",
+                     amount_input=Decimal(ai), amount_output=Decimal(ao),
+                     pool_cid=f"p{i}")
+
+    web = SimpleNamespace(fetch_trading_history=AsyncMock(return_value=[
+        tr(1, "USDCX", "CBTC", "100", "1"), tr(2, "CBTC", "USDCX", "1", "94")]))
+    wallet = SimpleNamespace(name="w1", web=web)
+    assert await strat._daily_loss_base(wallet) == Decimal("6")
+    await strat._daily_loss_base(wallet)                 # served from cache
+    assert web.fetch_trading_history.await_count == 1
+    store.close()

@@ -128,6 +128,22 @@ class Store:
             )
             self._conn.commit()
 
+    def last_buy_cost(
+        self, wallet: str, base_symbol: str, token_symbol: str,
+    ) -> Decimal | None:
+        """Base amount spent on this wallet's most recent live ``base -> token``
+        buy, or None if there is no record. Used to measure a round trip's loss
+        before selling the token back."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT sell_amount FROM swaps
+                   WHERE wallet = ? AND dry_run = 0
+                     AND UPPER(sell_symbol) = ? AND UPPER(buy_symbol) = ?
+                   ORDER BY ts DESC LIMIT 1""",
+                (wallet, base_symbol.upper(), token_symbol.upper()),
+            ).fetchone()
+        return Decimal(row["sell_amount"]) if row else None
+
     def fees_since(self, wallet: str, seconds: float, *, include_dry: bool = False) -> Decimal:
         """Total fees (admin + liquidity + network) for a wallet in the window."""
         cutoff = time.time() - seconds

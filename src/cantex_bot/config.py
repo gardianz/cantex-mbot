@@ -52,6 +52,21 @@ class Strategy1Config:
     poll_min_seconds: float = 0.5          # interval when fee is at/near threshold
     poll_max_seconds: float = 5.0          # interval when fee is far above
     poll_far_ratio: float = 0.3            # fee this fraction above threshold => poll_max
+    # -- loss brakes --------------------------------------------------------
+    # The per-leg guards (slippage / pool fee / network fee) cannot see a whole
+    # round trip, so a sell-back at a bad price still executes. These two cap the
+    # damage. Set either to 0 to disable it.
+    #
+    # Refuse to sell a token back while the round trip would lose more than this
+    # percent of what was spent buying it — wait for the price to recover instead.
+    max_cycle_loss_pct: Decimal = Decimal("1.0")
+    # Stop a wallet for the rest of the UTC day once today's realised loss (in the
+    # base currency) reaches this much.
+    max_daily_loss_base: Decimal = Decimal("0")
+    # How long a sell may be held back by max_cycle_loss_pct before it is sold
+    # anyway (seconds). Prevents a wallet being stuck in a token forever; 0 waits
+    # indefinitely (until the next UTC day).
+    cycle_loss_wait_seconds: float = 1800.0
 
 
 @dataclass(frozen=True)
@@ -160,6 +175,11 @@ def load_config(
         poll_min_seconds=float(s1.get("poll_min_seconds", 0.5)),
         poll_max_seconds=float(s1.get("poll_max_seconds", 5.0)),
         poll_far_ratio=float(s1.get("poll_far_ratio", 0.3)),
+        max_cycle_loss_pct=_dec(s1.get("max_cycle_loss_pct"),
+                                Strategy1Config.max_cycle_loss_pct),
+        max_daily_loss_base=_dec(s1.get("max_daily_loss_base"),
+                                 Strategy1Config.max_daily_loss_base),
+        cycle_loss_wait_seconds=float(s1.get("cycle_loss_wait_seconds", 1800.0)),
     )
 
     sa = raw.get("swap_all", {})

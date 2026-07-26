@@ -26,7 +26,9 @@ from .swap_all import AmountError, AmountSpec, swap_selected
 from .swapper import SwapEngine
 from .telegram import TelegramCommandBot, TelegramNotifier
 from .wallets import WalletManager
-from .withdraw import WithdrawError, validate_receiver, withdraw_selected
+from .withdraw import (
+    WithdrawError, WithdrawOutcome, validate_receiver, withdraw_selected,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -394,34 +396,45 @@ class App:
         )
         await self._choose_execution_mode()
         if not self.engine.dry_run:
-            # Transfers cannot be undone: confirm the destination itself.
             console.print(
                 "[bold red]Transfers are irreversible. Funds leave these wallets "
-                "for the address above.[/bold red]")
-            typed = await questionary.text(
-                "Re-type the LAST 6 characters of the receiver address to confirm:"
-            ).ask_async()
-            if (typed or "").strip() != receiver[-6:]:
-                console.print("[yellow]Mismatch — cancelled, nothing sent.[/yellow]")
-                return
+                f"for {receiver}.[/bold red]")
 
-        outcomes = await withdraw_selected(
-            self.manager, wallet_names=wallet_names, symbol=symbol,
-            receiver=receiver, amount=amount, keep=keep,
-            dry_run=self.engine.dry_run, run_state=self.run_state,
-            notifier=self.notifier,
-        )
-        total = sum((o.amount for o in outcomes if o.ok), Decimal(0))
-        for o in outcomes:
-            if o.error:
-                console.print(f"[{o.wallet}] [red]{o.error}[/red]")
-            elif o.skipped:
-                console.print(f"[{o.wallet}] [yellow]skip[/yellow] — {o.skipped}")
-            else:
-                tag = "[green]sent[/green]" if o.sent else "[cyan]dry-run[/cyan]"
-                console.print(f"[{o.wallet}] {tag} {o.amount} {o.symbol}")
-        ok = sum(1 for o in outcomes if o.ok)
-        console.print(f"[bold]{ok}/{len(outcomes)} wallets, {total} {symbol} "
+        # Run, then offer to retry only the wallets that errored (a timeout or a
+        # transient node error is common; skipped wallets are not failures).
+        pending = list(wallet_names)
+        final: dict[str, "WithdrawOutcome"] = {}
+        while pending:
+            outcomes = await withdraw_selected(
+                self.manager, wallet_names=pending, symbol=symbol,
+                receiver=receiver, amount=amount, keep=keep,
+                dry_run=self.engine.dry_run, run_state=self.run_state,
+                notifier=self.notifier,
+            )
+            for o in outcomes:
+                final[o.wallet] = o
+                if o.error:
+                    console.print(f"[{o.wallet}] [red]{o.error}[/red]")
+                elif o.skipped:
+                    console.print(f"[{o.wallet}] [yellow]skip[/yellow] — {o.skipped}")
+                else:
+                    tag = "[green]sent[/green]" if o.sent else "[cyan]dry-run[/cyan]"
+                    console.print(f"[{o.wallet}] {tag} {o.amount} {o.symbol}")
+            failed = [o.wallet for o in outcomes if o.error]
+            if not failed:
+                break
+            console.print(f"[red]{len(failed)} failed:[/red] {', '.join(failed)}")
+            again = await questionary.confirm(
+                f"Retry the {len(failed)} failed wallet(s)?", default=True,
+            ).ask_async()
+            if not again:
+                break
+            pending = failed
+
+        results = list(final.values())
+        total = sum((o.amount for o in results if o.ok), Decimal(0))
+        ok = sum(1 for o in results if o.ok)
+        console.print(f"[bold]{ok}/{len(results)} wallets, {total} {symbol} "
                       f"{'sent' if not self.engine.dry_run else '(dry-run)'}[/bold]")
 
     async def action_manual_swap(self) -> None:

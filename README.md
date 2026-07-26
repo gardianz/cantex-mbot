@@ -45,8 +45,9 @@ built on the official `cantex_sdk`.
   one pass (SDK `transfer`, operator key only). The amount is a value or percent
   of balance, with an optional **keep** reserve left in each wallet (default 1 CC
   — every swap pays its network fee in CC, so a drained wallet cannot trade).
-  Transfers are irreversible: it is dry-run by default, and going live asks for
-  `LIVE` plus the last 6 characters of the receiver address.
+  Transfers are irreversible, so it is dry-run by default and going live must be
+  armed by typing `LIVE`. If any wallet errors, it reports them and offers to
+  retry just those.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

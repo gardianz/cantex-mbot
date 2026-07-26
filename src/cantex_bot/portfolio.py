@@ -180,7 +180,10 @@ class PortfolioService:
                     snap.reb_status = reb.last_week_status
                 # ccview fees: throttled — reuse the last values until fee_ttl.
                 now_m = time.monotonic()
-                if now_m - snap.fee_updated >= self.fee_ttl:
+                # fee_updated == 0 means "never fetched" — always fetch then, else
+                # a process whose monotonic clock is still below fee_ttl (started
+                # soon after boot) would show no fees for the first ttl seconds.
+                if snap.fee_updated == 0 or now_m - snap.fee_updated >= self.fee_ttl:
                     fw = fee_windows()
                     snap.fee_today = (await self.ccview.party_fee(info.address, *fw["today"])).fee
                     snap.fee_yesterday = (await self.ccview.party_fee(info.address, *fw["yesterday"])).fee

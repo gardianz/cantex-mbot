@@ -26,6 +26,7 @@ from .swap_all import AmountError, AmountSpec, swap_selected
 from .swapper import SwapEngine
 from .telegram import TelegramCommandBot, TelegramNotifier
 from .wallets import WalletManager
+from .withdraw import WithdrawError, validate_receiver, withdraw_selected
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -332,6 +333,97 @@ class App:
             ok = sum(1 for o in outcomes if o.ok)
             console.print(f"[{wallet}] {ok}/{len(outcomes)} ok")
 
+    async def action_withdraw(self) -> None:
+        """Bulk withdraw: send one token from many wallets to one address."""
+        wallet_names = await questionary.checkbox(
+            "Wallets to withdraw from (space to toggle, enter to confirm):",
+            choices=[questionary.Choice(n, checked=False) for n in self.manager.names],
+        ).ask_async()
+        if not wallet_names:
+            console.print("[yellow]No wallet selected.[/yellow]")
+            return
+
+        market = await self._first_market()
+        if market is None:
+            return
+        usdcx = self.config.strategy1.usdcx_symbol
+        cc = self.config.strategy1.cc_symbol
+        syms = [usdcx, cc] + [s for s in market.pool_token_symbols()
+                              if s.upper() not in (usdcx.upper(), cc.upper())]
+        symbol = await questionary.select("Token to withdraw:", choices=syms).ask_async()
+        if not symbol:
+            return
+
+        receiver = (await questionary.text(
+            "Receiver address (Canton party id, e.g. Cantex::1220…):").ask_async() or "")
+        try:
+            receiver = validate_receiver(receiver)
+        except WithdrawError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+
+        amount_raw = await questionary.text(
+            f"Amount per wallet ({symbol}) — value (e.g. 5) or percent (e.g. 100%):",
+            default="100%",
+        ).ask_async()
+        try:
+            amount = AmountSpec.parse(amount_raw or "")
+        except AmountError as exc:
+            console.print(f"[red]Bad amount: {exc}[/red]")
+            return
+
+        # A reserve left behind: every swap pays its network fee in CC, so a
+        # wallet drained of CC can no longer trade.
+        keep_raw = await questionary.text(
+            f"Keep behind in each wallet ({symbol}, 0 = withdraw all):",
+            default="1" if symbol.upper() == cc.upper() else "0",
+        ).ask_async()
+        try:
+            keep = Decimal((keep_raw or "0").strip() or "0")
+        except InvalidOperation:
+            console.print("[red]Bad keep amount.[/red]")
+            return
+        if keep < 0:
+            console.print("[red]Keep must be >= 0.[/red]")
+            return
+
+        console.print(
+            f"[bold]WITHDRAW[/bold] {amount} {symbol} from "
+            f"{len(wallet_names)} wallet(s) → [cyan]{receiver}[/cyan]"
+            + (f"  (keeping {keep} {symbol} each)" if keep else "")
+        )
+        await self._choose_execution_mode()
+        if not self.engine.dry_run:
+            # Transfers cannot be undone: confirm the destination itself.
+            console.print(
+                "[bold red]Transfers are irreversible. Funds leave these wallets "
+                "for the address above.[/bold red]")
+            typed = await questionary.text(
+                "Re-type the LAST 6 characters of the receiver address to confirm:"
+            ).ask_async()
+            if (typed or "").strip() != receiver[-6:]:
+                console.print("[yellow]Mismatch — cancelled, nothing sent.[/yellow]")
+                return
+
+        outcomes = await withdraw_selected(
+            self.manager, wallet_names=wallet_names, symbol=symbol,
+            receiver=receiver, amount=amount, keep=keep,
+            dry_run=self.engine.dry_run, run_state=self.run_state,
+            notifier=self.notifier,
+        )
+        total = sum((o.amount for o in outcomes if o.ok), Decimal(0))
+        for o in outcomes:
+            if o.error:
+                console.print(f"[{o.wallet}] [red]{o.error}[/red]")
+            elif o.skipped:
+                console.print(f"[{o.wallet}] [yellow]skip[/yellow] — {o.skipped}")
+            else:
+                tag = "[green]sent[/green]" if o.sent else "[cyan]dry-run[/cyan]"
+                console.print(f"[{o.wallet}] {tag} {o.amount} {o.symbol}")
+        ok = sum(1 for o in outcomes if o.ok)
+        console.print(f"[bold]{ok}/{len(outcomes)} wallets, {total} {symbol} "
+                      f"{'sent' if not self.engine.dry_run else '(dry-run)'}[/bold]")
+
     async def action_manual_swap(self) -> None:
         name = await questionary.select("Wallet?", choices=self.manager.names).ask_async()
         if not name:
@@ -531,6 +623,7 @@ class App:
             "Strategy 2 (auto lowest-fee)": self.action_strategy2,
             "Swap 1x all pairs": self.action_swap_all,
             "Manual swap": self.action_manual_swap,
+            "Withdraw (bulk)": self.action_withdraw,
             "Web check (history + rebates)": self.action_web_check,
             "Wallet status": self.action_wallet_status,
             "Add wallets (bulk import)": self.action_add_wallets,

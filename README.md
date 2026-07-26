@@ -41,6 +41,12 @@ built on the official `cantex_sdk`.
   waiting out the network fee: at or above that gain it waives **only** the
   `max_network_fee` limit (slippage and pool fee still apply), since the fee is
   a fraction of the gain being risked.
+- **Bulk withdraw** — send one token from many wallets to a single address in
+  one pass (SDK `transfer`, operator key only). The amount is a value or percent
+  of balance, with an optional **keep** reserve left in each wallet (default 1 CC
+  — every swap pays its network fee in CC, so a drained wallet cannot trade).
+  Transfers are irreversible: it is dry-run by default, and going live asks for
+  `LIVE` plus the last 6 characters of the receiver address.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the
@@ -204,7 +210,7 @@ python -m cantex_bot          # or: cantex-bot
 ```
 
 Menu: Dashboard · Strategy 1 · Strategy 2 (auto lowest-fee) · Swap 1× all pairs ·
-Manual swap · Web check · Wallet status · Add wallets · Quit. The menu shows
+Manual swap · Withdraw (bulk) · Web check · Wallet status · Add wallets · Quit. The menu shows
 immediately (auth runs in the background); live execution requires typing `LIVE`
 to arm.
 

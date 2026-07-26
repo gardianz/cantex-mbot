@@ -1776,3 +1776,82 @@ async def test_execute_swap_ignore_network_fee_executes(tmp_path):
         ignore_network_fee=True)
     assert took.ok and not took.reject_reasons           # profit taken
     store.close()
+
+
+# -- bulk withdraw -----------------------------------------------------------
+
+def _wd_fakes(balance="100"):
+    from cantex_bot.markets import Pair  # noqa: F401  (market shape below)
+    inst = InstrumentId("d", "CC")
+
+    class _M:
+        def instrument(self, s):
+            return inst
+
+    info = SimpleNamespace(get_balance=lambda i: Decimal(balance))
+    sdk = SimpleNamespace(get_account_info=AsyncMock(return_value=info),
+                          transfer=AsyncMock(return_value={"ok": True}))
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+    manager = SimpleNamespace(get=lambda n: wallet)
+    return manager, wallet, _M()
+
+
+def test_validate_receiver():
+    from cantex_bot.withdraw import WithdrawError, validate_receiver
+    assert validate_receiver("  Cantex::1220abcd  ") == "Cantex::1220abcd"
+    for bad in ("", "   ", "no-colons-here", "a::b"):
+        with pytest.raises(WithdrawError):
+            validate_receiver(bad)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_dry_run_sends_nothing(monkeypatch):
+    from cantex_bot import withdraw as wd
+    manager, wallet, market = _wd_fakes()
+    monkeypatch.setattr(wd.MarketMap, "build", AsyncMock(return_value=market))
+    outs = await wd.withdraw_selected(
+        manager, wallet_names=["w1"], symbol="CC", receiver="Cantex::1220abcd",
+        amount=AmountSpec.parse("100%"), dry_run=True, cooldown=0)
+    assert outs[0].ok and outs[0].dry_run and outs[0].amount == Decimal("100")
+    wallet.sdk.transfer.assert_not_awaited()          # nothing left the wallet
+
+
+@pytest.mark.asyncio
+async def test_withdraw_live_keeps_reserve(monkeypatch):
+    from cantex_bot import withdraw as wd
+    manager, wallet, market = _wd_fakes(balance="100")
+    monkeypatch.setattr(wd.MarketMap, "build", AsyncMock(return_value=market))
+    outs = await wd.withdraw_selected(
+        manager, wallet_names=["w1"], symbol="CC", receiver="Cantex::1220abcd",
+        amount=AmountSpec.parse("100%"), keep=Decimal("10"), dry_run=False,
+        cooldown=0)
+    assert outs[0].sent and outs[0].amount == Decimal("90")   # 100 - keep 10
+    args = wallet.sdk.transfer.await_args.args
+    assert args[0] == Decimal("90") and args[2] == "Cantex::1220abcd"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_skips_when_below_keep(monkeypatch):
+    from cantex_bot import withdraw as wd
+    manager, wallet, market = _wd_fakes(balance="5")
+    monkeypatch.setattr(wd.MarketMap, "build", AsyncMock(return_value=market))
+    outs = await wd.withdraw_selected(
+        manager, wallet_names=["w1"], symbol="CC", receiver="Cantex::1220abcd",
+        amount=AmountSpec.parse("100%"), keep=Decimal("10"), dry_run=False,
+        cooldown=0)
+    assert outs[0].skipped and not outs[0].sent
+    wallet.sdk.transfer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_withdraw_isolates_wallet_failure(monkeypatch):
+    from cantex_bot import withdraw as wd
+    manager, wallet, market = _wd_fakes()
+    monkeypatch.setattr(wd.MarketMap, "build", AsyncMock(return_value=market))
+    wallet.sdk.transfer = AsyncMock(side_effect=RuntimeError("boom"))
+    outs = await wd.withdraw_selected(
+        manager, wallet_names=["w1", "w1"], symbol="CC",
+        receiver="Cantex::1220abcd", amount=AmountSpec.parse("1"),
+        dry_run=False, cooldown=0)
+    assert len(outs) == 2                       # second wallet still attempted
+    assert all(o.error == "boom" and not o.ok for o in outs)

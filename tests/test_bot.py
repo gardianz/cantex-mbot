@@ -1724,3 +1724,21 @@ def test_daily_loss_budget_is_in_cc(tmp_path):
     assert strat._to_cc(Decimal("30"), notional) == Decimal("3")   # 30 base = 3 CC
     assert strat._to_cc(Decimal("30"), Decimal("0")) == Decimal("0")  # unpriced
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_cycle_brake_lets_profitable_sells_through(tmp_path):
+    """A profitable round trip yields a NEGATIVE loss pct, which can never exceed
+    a positive cap — the brake only ever holds losing sells."""
+    store = Store(tmp_path / "s.db")
+    store.record_swap(SwapRecord(wallet="w1", direction="buy", sell_symbol="USDCX",
+                                 buy_symbol="CBTC", sell_amount=Decimal("100"),
+                                 buy_amount=Decimal("1")))
+    strat = _brake_strat(store, max_cycle_loss_pct=Decimal("0.35"))
+    base = InstrumentId("a", "USDCX"); tok = InstrumentId("a", "CBTC")
+    wallet = SimpleNamespace(name="w1", sdk=SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote(returned="105"))))
+    pct = await strat._cycle_loss_pct(wallet, tok, "CBTC", Decimal("1"), base)
+    assert pct == Decimal("-5")                       # 5% gain
+    assert not (pct > strat.config.max_cycle_loss_pct)  # never held
+    store.close()

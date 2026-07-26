@@ -255,7 +255,9 @@ class Strategy1(Strategy):
                 if loss_pct is not None and loss_pct > cap:
                     if not self._hold_expired(wallet.name, tok):
                         self._st(wallet.name, status=run_status.WAITING, route=route,
-                                 plan=f"tunggu harga -{loss_pct:.2f}%")
+                                 # signed P&L of the round trip: a hold is always
+                                 # negative (a gain never trips the brake).
+                                 plan=f"tunggu harga {-loss_pct:+.2f}%")
                         logger.info("[%s] holding %s: round trip would lose %.2f%% "
                                     "(> %s%%)", wallet.name, tok, loss_pct, cap)
                         await asyncio.sleep(self._poll_interval(

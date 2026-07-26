@@ -402,24 +402,30 @@ class App:
 
         # Run, then offer to retry only the wallets that errored (a timeout or a
         # transient node error is common; skipped wallets are not failures).
+        # Each wallet is printed as it finishes — logging is file-only, so
+        # without this a 33-wallet batch looks frozen for minutes.
+        def _line(o: WithdrawOutcome, i: int, n: int) -> None:
+            head = f"[dim]{i}/{n}[/dim] [{o.wallet}]"
+            if o.error:
+                console.print(f"{head} [red]{o.error}[/red]")
+            elif o.skipped:
+                console.print(f"{head} [yellow]skip[/yellow] — {o.skipped}")
+            else:
+                tag = "[green]sent[/green]" if o.sent else "[cyan]dry-run[/cyan]"
+                console.print(f"{head} {tag} {o.amount} {o.symbol}")
+
         pending = list(wallet_names)
-        final: dict[str, "WithdrawOutcome"] = {}
+        final: dict[str, WithdrawOutcome] = {}
         while pending:
+            console.print(f"[dim]Withdrawing from {len(pending)} wallet(s)…[/dim]")
             outcomes = await withdraw_selected(
                 self.manager, wallet_names=pending, symbol=symbol,
                 receiver=receiver, amount=amount, keep=keep,
                 dry_run=self.engine.dry_run, run_state=self.run_state,
-                notifier=self.notifier,
+                notifier=self.notifier, on_result=_line,
             )
             for o in outcomes:
                 final[o.wallet] = o
-                if o.error:
-                    console.print(f"[{o.wallet}] [red]{o.error}[/red]")
-                elif o.skipped:
-                    console.print(f"[{o.wallet}] [yellow]skip[/yellow] — {o.skipped}")
-                else:
-                    tag = "[green]sent[/green]" if o.sent else "[cyan]dry-run[/cyan]"
-                    console.print(f"[{o.wallet}] {tag} {o.amount} {o.symbol}")
             failed = [o.wallet for o in outcomes if o.error]
             if not failed:
                 break

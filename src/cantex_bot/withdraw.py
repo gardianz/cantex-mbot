@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -68,6 +69,7 @@ async def withdraw_selected(
     memo: str = "",
     run_state=None,
     notifier=None,
+    on_result: Callable[[WithdrawOutcome, int, int], None] | None = None,
     cooldown: float = 1.0,
 ) -> list[WithdrawOutcome]:
     """Send ``amount`` of ``symbol`` from each wallet to ``receiver``.
@@ -76,6 +78,9 @@ async def withdraw_selected(
     a percent applies to what is left, so a percentage can never dip into the
     reserve. Wallets with nothing to send are skipped, and one wallet's failure
     never stops the rest.
+
+    ``on_result(outcome, index, total)`` is called as each wallet finishes, so a
+    caller can report progress live instead of waiting for the whole batch.
     """
     receiver = validate_receiver(receiver)
     if keep < 0:
@@ -94,14 +99,19 @@ async def withdraw_selected(
             v.done, v.target = 0, 1
 
     outcomes: list[WithdrawOutcome] = []
-    for name in wallet_names:
+    total = len(wallet_names)
+    # The instrument registry is exchange-wide, so build it once instead of
+    # once per wallet (two API calls each — the batch felt frozen at 33 wallets).
+    market: MarketMap | None = None
+    for i, name in enumerate(wallet_names, 1):
         out = WithdrawOutcome(wallet=name, symbol=sym, receiver=receiver,
                               dry_run=dry_run)
         route = f"withdraw {sym}→{receiver[:12]}…"
         try:
             wallet = manager.get(name)
             await wallet.ensure_auth()
-            market = await MarketMap.build(wallet.sdk)
+            if market is None:
+                market = await MarketMap.build(wallet.sdk)
             instrument = market.instrument(sym)
             info = await wallet.sdk.get_account_info()
             out.balance = info.get_balance(instrument)
@@ -111,20 +121,19 @@ async def withdraw_selected(
                 out.skipped = f"nothing to send (balance {out.balance}, keep {keep})"
                 _st(name, status=run_status.STOPPED, route=route, plan="saldo kurang")
                 logger.info("[%s] withdraw skipped: %s", name, out.skipped)
-                outcomes.append(out)
-                continue
-            _st(name, status=run_status.SWAPPING, route=route,
-                plan=f"{'dry' if dry_run else 'kirim'} {out.amount:.4f}")
-            if dry_run:
-                logger.info("[%s] DRY-RUN withdraw %s %s -> %s",
-                            name, out.amount, sym, receiver[:20])
             else:
-                await wallet.sdk.transfer(out.amount, instrument, receiver, memo)
-                out.sent = True
-                logger.info("[%s] withdrew %s %s -> %s",
-                            name, out.amount, sym, receiver[:20])
-            _st(name, status=run_status.RUNNING, route=route,
-                plan="withdraw ok", done=1)
+                _st(name, status=run_status.SWAPPING, route=route,
+                    plan=f"{'dry' if dry_run else 'kirim'} {out.amount:.4f}")
+                if dry_run:
+                    logger.info("[%s] DRY-RUN withdraw %s %s -> %s",
+                                name, out.amount, sym, receiver[:20])
+                else:
+                    await wallet.sdk.transfer(out.amount, instrument, receiver, memo)
+                    out.sent = True
+                    logger.info("[%s] withdrew %s %s -> %s",
+                                name, out.amount, sym, receiver[:20])
+                _st(name, status=run_status.RUNNING, route=route,
+                    plan="withdraw ok", done=1)
         except Exception as exc:  # noqa: BLE001 - one wallet must not stop the rest
             out.error = str(exc)
             _st(name, status=run_status.ERROR, route=route, plan="withdraw gagal")
@@ -133,7 +142,10 @@ async def withdraw_selected(
             run_state.finish(
                 name, status=run_status.DONE if out.ok else run_status.STOPPED)
         outcomes.append(out)
-        await asyncio.sleep(cooldown)
+        if on_result is not None:
+            on_result(out, i, total)      # report as we go, not at the end
+        if out.sent:
+            await asyncio.sleep(cooldown)  # only pace real submissions
 
     if notifier is not None:
         ok = sum(1 for o in outcomes if o.ok)

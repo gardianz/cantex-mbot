@@ -1855,3 +1855,22 @@ async def test_withdraw_isolates_wallet_failure(monkeypatch):
         dry_run=False, cooldown=0)
     assert len(outs) == 2                       # second wallet still attempted
     assert all(o.error == "boom" and not o.ok for o in outs)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_streams_progress_and_builds_market_once(monkeypatch):
+    """Results are reported per wallet as they finish (a whole batch printed at
+    the end looks frozen), and the instrument map is built once, not per wallet."""
+    from cantex_bot import withdraw as wd
+    manager, wallet, market = _wd_fakes()
+    build = AsyncMock(return_value=market)
+    monkeypatch.setattr(wd.MarketMap, "build", build)
+    seen = []
+    outs = await wd.withdraw_selected(
+        manager, wallet_names=["w1", "w1", "w1"], symbol="CC",
+        receiver="Cantex::1220abcd", amount=AmountSpec.parse("1"),
+        dry_run=True, on_result=lambda o, i, n: seen.append((i, n, o.wallet)),
+        cooldown=0)
+    assert seen == [(1, 3, "w1"), (2, 3, "w1"), (3, 3, "w1")]  # streamed 1-by-1
+    assert build.await_count == 1                              # market reused
+    assert len(outs) == 3

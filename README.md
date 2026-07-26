@@ -36,7 +36,11 @@ built on the official `cantex_sdk`.
   the price to recover, up to `cycle_loss_wait_seconds`), and
   `max_daily_loss_cc` pauses a wallet for the rest of the UTC day once today's
   realised loss reaches that many **CC** — the same unit as the dashboard's LOSS
-  column. Set either to `0` to disable.
+  column. Set either to `0` to disable. In the other direction,
+  `min_profit_pct_override_fee` lets a clearly profitable sell close instead of
+  waiting out the network fee: at or above that gain it waives **only** the
+  `max_network_fee` limit (slippage and pool fee still apply), since the fee is
+  a fraction of the gain being risked.
 - **Guards** — every swap is rejected if slippage, pool fee, or network fee
   exceed configured limits. Cantex charges slippage + a pool fee (%) + a network
   fee (in CC); there is **no admin fee**. `max_network_fee` is also passed to the

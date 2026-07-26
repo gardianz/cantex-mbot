@@ -51,7 +51,10 @@ class SwapGuard:
         pool_fee = max(SwapGuard._max_pool_fee(quote), quote.fees.fee_percentage) * _PCT
         return quote.fees.network_fee.amount, slippage, pool_fee
 
-    def evaluate(self, quote: SwapQuote) -> GuardResult:
+    def evaluate(self, quote: SwapQuote, *, ignore_network_fee: bool = False) -> GuardResult:
+        """``ignore_network_fee`` waives ONLY the network-fee limit (slippage and
+        pool fee stay enforced) — used to let a clearly profitable round trip
+        close instead of waiting out a fee that costs less than the profit."""
         c = self.config
         # API returns fractions -> convert to percent to match the config units.
         # Cantex charges a pool fee (%) + a network fee (in CC); no admin fee.
@@ -69,7 +72,7 @@ class SwapGuard:
             reasons.append(f"slippage {slippage} > {c.max_slippage}")
         if pool_fee > c.max_pool_fee_pct:
             reasons.append(f"pool fee {pool_fee} > {c.max_pool_fee_pct}")
-        if network_fee > c.max_network_fee:
+        if network_fee > c.max_network_fee and not ignore_network_fee:
             reasons.append(f"network fee {network_fee} > {c.max_network_fee}")
 
         return GuardResult(ok=not reasons, reasons=reasons, details=details)

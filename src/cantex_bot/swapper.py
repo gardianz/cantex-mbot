@@ -67,6 +67,7 @@ class SwapEngine:
         direction: str,
         quiet_reject: bool = False,
         bypass_guards: bool = False,
+        ignore_network_fee: bool = False,
     ) -> SwapOutcome:
         out = SwapOutcome(
             wallet=wallet.name,
@@ -103,7 +104,7 @@ class SwapEngine:
         )
 
         # 2. Guard — unless explicitly bypassed (manual 1x swap override).
-        result = self.guard.evaluate(quote)
+        result = self.guard.evaluate(quote, ignore_network_fee=ignore_network_fee)
         out.guard = result
         if not result.ok:
             if bypass_guards:
@@ -142,8 +143,10 @@ class SwapEngine:
 
         # 4. Live
         out.submitted_attempt = True  # from here on an error may still have settled
-        # Bypass also lifts the SDK-level network-fee cap so it can't reject.
-        max_fee = Decimal("1000000000") if bypass_guards else self.guard.config.max_network_fee
+        # A bypass (or a waived fee limit) must also lift the SDK-level network-fee
+        # cap, or the SDK would reject the swap the guard just allowed.
+        max_fee = (Decimal("1000000000") if (bypass_guards or ignore_network_fee)
+                   else self.guard.config.max_network_fee)
         try:
             event = await wallet.sdk.swap_and_confirm(
                 sell_amount, sell, buy, max_network_fee=max_fee,

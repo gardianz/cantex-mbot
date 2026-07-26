@@ -249,10 +249,20 @@ class Strategy1(Strategy):
             # it through once the price recovers (or the hold times out, so a
             # wallet is never stuck in a token forever).
             cap = self.config.max_cycle_loss_pct
-            if step == "sell" and cap > 0:
+            min_profit = self.config.min_profit_pct_override_fee
+            take_profit = False
+            loss_pct = None
+            if step == "sell" and (cap > 0 or min_profit > 0):
                 loss_pct = await self._cycle_loss_pct(
                     wallet, pair.token, tok, token_bal, usdcx)
-                if loss_pct is not None and loss_pct > cap:
+                # Profitable enough to stop waiting out the network fee? The fee
+                # is a fraction of the gain, so holding risks the gain for nothing.
+                if loss_pct is not None and min_profit > 0 and -loss_pct >= min_profit:
+                    take_profit = True
+                    logger.info("[%s] taking profit on %s: round trip +%.2f%% "
+                                "(>= %s%%) — waiving the network-fee limit",
+                                wallet.name, tok, -loss_pct, min_profit)
+                if loss_pct is not None and cap > 0 and loss_pct > cap:
                     if not self._hold_expired(wallet.name, tok):
                         self._st(wallet.name, status=run_status.WAITING, route=route,
                                  # Word it, don't sign it: the LOSS column reads
@@ -271,13 +281,15 @@ class Strategy1(Strategy):
             # Snapshot the web swap count so an ambiguous outcome (below) can be
             # reconciled against the trading history.
             pre_web = await self._web_swaps_today(wallet)
-            self._st(wallet.name, status=run_status.SWAPPING,
-                     route=route, plan="proses swap")
+            self._st(wallet.name, status=run_status.SWAPPING, route=route,
+                     plan=(f"ambil profit {-loss_pct:.2f}%" if take_profit
+                           else "proses swap"))
             if sellable:
                 out = await self.engine.execute_swap(
                     wallet, sell=pair.token, buy=usdcx, sell_amount=token_bal,
                     sell_symbol=tok, buy_symbol=usym,
                     direction="sell", quiet_reject=True,
+                    ignore_network_fee=take_profit,
                 )
             else:
                 out = await self.engine.execute_swap(

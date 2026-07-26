@@ -1742,3 +1742,37 @@ async def test_cycle_brake_lets_profitable_sells_through(tmp_path):
     assert pct == Decimal("-5")                       # 5% gain
     assert not (pct > strat.config.max_cycle_loss_pct)  # never held
     store.close()
+
+
+# -- profit override of the network-fee guard --------------------------------
+
+def test_guard_ignore_network_fee_waives_only_that_limit():
+    g = SwapGuard(GuardConfig(max_network_fee=Decimal("0.5"),
+                              max_slippage=Decimal("1.0")))
+    over_fee = make_quote(net="0.9")
+    assert not g.evaluate(over_fee).ok                              # normally held
+    assert g.evaluate(over_fee, ignore_network_fee=True).ok         # waived
+    # Slippage/pool are still enforced when the fee limit is waived.
+    bad_slip = make_quote(net="0.9", slippage="5")
+    res = g.evaluate(bad_slip, ignore_network_fee=True)
+    assert not res.ok and any("slippage" in r for r in res.reasons)
+
+
+@pytest.mark.asyncio
+async def test_execute_swap_ignore_network_fee_executes(tmp_path):
+    store = Store(tmp_path / "s.db")
+    engine = SwapEngine(SwapGuard(GuardConfig(max_network_fee=Decimal("0.5"))),
+                        store, notifier(), dry_run=True)
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(return_value=make_quote(net="0.9")))
+    wallet = fake_wallet(sdk)
+    a, b = InstrumentId("d", "CBTC"), InstrumentId("d", "USDCX")
+    held = await engine.execute_swap(
+        wallet, sell=a, buy=b, sell_amount=Decimal("1"),
+        sell_symbol="CBTC", buy_symbol="USDCX", direction="sell")
+    assert held.reject_reasons and not held.ok           # fee guard holds it
+    took = await engine.execute_swap(
+        wallet, sell=a, buy=b, sell_amount=Decimal("1"),
+        sell_symbol="CBTC", buy_symbol="USDCX", direction="sell",
+        ignore_network_fee=True)
+    assert took.ok and not took.reject_reasons           # profit taken
+    store.close()

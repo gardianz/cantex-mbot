@@ -67,6 +67,12 @@ class Strategy1Config:
     # anyway (seconds). Prevents a wallet being stuck in a token forever; 0 waits
     # indefinitely (until the next UTC day).
     cycle_loss_wait_seconds: float = 1800.0
+    # Take the profit instead of waiting out the network fee: when a sell would
+    # close the round trip at least this many percent UP, waive ONLY the
+    # max_network_fee limit for that swap (slippage and pool fee still apply).
+    # The fee is a fraction of the gain, so waiting risks the gain for nothing.
+    # 0 disables the override — the fee guard then always holds.
+    min_profit_pct_override_fee: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -180,6 +186,9 @@ def load_config(
         max_daily_loss_cc=_dec(s1.get("max_daily_loss_cc"),
                                Strategy1Config.max_daily_loss_cc),
         cycle_loss_wait_seconds=float(s1.get("cycle_loss_wait_seconds", 1800.0)),
+        min_profit_pct_override_fee=_dec(
+            s1.get("min_profit_pct_override_fee"),
+            Strategy1Config.min_profit_pct_override_fee),
     )
 
     sa = raw.get("swap_all", {})

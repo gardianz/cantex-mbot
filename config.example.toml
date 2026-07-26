@@ -49,6 +49,11 @@ cycle_loss_wait_seconds = 1800
 # Stop a wallet for the rest of the UTC day once today's realised loss reaches
 # this many CC — the same unit as the dashboard's LOSS column. 0 = no budget.
 max_daily_loss_cc = 0
+# Take the profit instead of waiting out the network fee: when a sell would close
+# the round trip at least this many percent UP, waive ONLY max_network_fee for
+# that swap (slippage and pool fee still apply). The fee is a fraction of the
+# gain, so waiting risks the gain to save very little. 0 = never override.
+min_profit_pct_override_fee = 0
 
 [swap_all]
 # Amount (in the sell instrument) used by the one-shot "swap 1x all pairs" command.

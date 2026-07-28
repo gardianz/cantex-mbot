@@ -1874,3 +1874,68 @@ async def test_withdraw_streams_progress_and_builds_market_once(monkeypatch):
     assert seen == [(1, 3, "w1"), (2, 3, "w1"), (3, 3, "w1")]  # streamed 1-by-1
     assert build.await_count == 1                              # market reused
     assert len(outs) == 3
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_stays_armed_when_fee_guard_rejects(tmp_path, monkeypatch):
+    """Once the hold times out the stop must stay armed: a fee-guard reject must
+    not restart the wait (that made the stop-loss never fire), and the timer only
+    restarts once the position actually closes."""
+    import asyncio as _a
+    import time as _t
+    from cantex_bot.strategies import strategy1 as s1mod
+    from cantex_bot.markets import Pair
+    from cantex_bot.config import Strategy1Config
+
+    usdcx = InstrumentId("a", "USDCX"); cbtc = InstrumentId("a", "CBTC")
+
+    class FakeMarket:
+        def instrument(self, sym):
+            return {"USDCX": usdcx, "CC": InstrumentId("a", "CC"), "CBTC": cbtc}[sym.upper()]
+        def trade_pairs(self, base, only_symbols=None, exclude_symbols=()):
+            return [Pair(token=cbtc, token_symbol="CBTC", usdcx=usdcx, pool_contract_id="")]
+
+    monkeypatch.setattr(s1mod.MarketMap, "build", AsyncMock(return_value=FakeMarket()))
+    store = Store(tmp_path / "s.db")
+    # Sell is always rejected by the fee guard (never executes).
+    rejected = SimpleNamespace(counted=False, ok=False, error=None,
+                               reject_reasons=["network fee 0.9 > 0.6"],
+                               buy_amount=Decimal("0"), buy_symbol="USDCX",
+                               submitted_attempt=False,
+                               guard=SimpleNamespace(details={"network_fee": Decimal("0.9")}))
+    engine = SimpleNamespace(
+        dry_run=False, execute_swap=AsyncMock(return_value=rejected),
+        guard=SimpleNamespace(config=SimpleNamespace(max_network_fee=Decimal("0.6"))))
+    cfg = Strategy1Config(daily_swap_target=99, cooldown_seconds=0,
+                          poll_min_seconds=0, poll_max_seconds=0,
+                          max_cycle_loss_pct=Decimal("0.5"),
+                          cycle_loss_wait_seconds=300.0,
+                          insufficient_retries=99)
+    strat = s1mod.Strategy1(SimpleNamespace(wallets={}, names=[]), engine, cfg,
+                            notifier(), store, tokens=["CBTC"])
+    strat._web_swaps_today = AsyncMock(return_value=0)
+    strat._price_cc_in_usdcx = AsyncMock(return_value=Decimal("10"))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("110"))     # sellable
+    strat._balances = AsyncMock(return_value=(Decimal("1"), Decimal("100"), Decimal("50")))
+    strat._cycle_loss_pct = AsyncMock(return_value=Decimal("7"))       # 7% down
+    strat._wait_next_day = AsyncMock(return_value=False)
+    # Hold already timed out.
+    strat._held_since[("w1", "CBTC")] = _t.monotonic() - 301
+
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=SimpleNamespace())
+    stop = _a.Event()
+
+    async def stop_after_two_attempts():
+        while engine.execute_swap.await_count < 2:
+            await _a.sleep(0)
+        stop.set()
+
+    await _a.gather(strat._run_wallet(wallet, stop), stop_after_two_attempts())
+
+    # It kept trying (armed), and never waived the fee limit.
+    assert engine.execute_swap.await_count >= 2
+    assert all(c.kwargs.get("ignore_network_fee") is not True
+               for c in engine.execute_swap.await_args_list)
+    # Timer still expired -> the stop is still armed for the next attempt.
+    assert strat._hold_expired("w1", "CBTC")
+    store.close()

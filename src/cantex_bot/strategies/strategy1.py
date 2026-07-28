@@ -251,6 +251,7 @@ class Strategy1(Strategy):
             cap = self.config.max_cycle_loss_pct
             min_profit = self.config.min_profit_pct_override_fee
             take_profit = False
+            force_sl = False
             loss_pct = None
             if step == "sell" and (cap > 0 or min_profit > 0):
                 loss_pct = await self._cycle_loss_pct(
@@ -274,21 +275,34 @@ class Strategy1(Strategy):
                         await asyncio.sleep(self._poll_interval(
                             SimpleNamespace(guard=None)))
                         continue
-                    logger.warning("[%s] %s held too long (loss %.2f%%) — selling "
-                                   "anyway", wallet.name, tok, loss_pct)
-                self._clear_hold(wallet.name, tok)
+                    # Timed stop-loss: stop waiting for the price and sell — but
+                    # still under the fee guard. The hold timer is NOT reset here:
+                    # if the fee guard rejects the sell, the stop stays armed and
+                    # retries every poll, so it fires the moment the fee allows
+                    # (resetting it here restarted the wait and the stop could
+                    # never fire while the fee sat above the limit).
+                    force_sl = True
+                    logger.warning("[%s] %s held too long (loss %.2f%%) — stop-loss "
+                                   "armed, selling as soon as the fee allows",
+                                   wallet.name, tok, loss_pct)
+                else:
+                    # Not holding any more (price recovered / measurable again).
+                    self._clear_hold(wallet.name, tok)
 
             # Snapshot the web swap count so an ambiguous outcome (below) can be
             # reconciled against the trading history.
             pre_web = await self._web_swaps_today(wallet)
             self._st(wallet.name, status=run_status.SWAPPING, route=route,
                      plan=(f"ambil profit {-loss_pct:.2f}%" if take_profit
+                           else f"stop loss {loss_pct:.2f}%" if force_sl
                            else "proses swap"))
             if sellable:
                 out = await self.engine.execute_swap(
                     wallet, sell=pair.token, buy=usdcx, sell_amount=token_bal,
                     sell_symbol=tok, buy_symbol=usym,
                     direction="sell", quiet_reject=True,
+                    # A stop-loss does NOT waive the fee limit — only a clearly
+                    # profitable exit does.
                     ignore_network_fee=take_profit,
                 )
             else:
@@ -327,6 +341,8 @@ class Strategy1(Strategy):
                     insufficient_streak = 0
                     consecutive_fail = 0
                     session_executed += 1
+                    if step == "sell":
+                        self._clear_hold(wallet.name, tok)
                     self._web_cache.pop(wallet.name, None)
                     self._st(wallet.name, status=run_status.RUNNING,
                              route=route, plan="swap berhasil")
@@ -343,6 +359,9 @@ class Strategy1(Strategy):
             insufficient_streak = 0
             if out.counted:
                 session_executed += 1
+                if step == "sell":
+                    # Position closed — only now may the hold timer restart.
+                    self._clear_hold(wallet.name, tok)
                 self._web_cache.pop(wallet.name, None)
                 self._st(wallet.name, status=run_status.RUNNING,
                          route=route, plan="swap berhasil")
@@ -356,6 +375,10 @@ class Strategy1(Strategy):
             # Pace: adaptive poll while waiting on a guard, brief cooldown otherwise.
             if out.reject_reasons and not out.ok:
                 plan = f"wait fee {fee:.3f}" if fee is not None else "wait fee"
+                if force_sl:
+                    # Stop armed but the fee guard says no — say so, so the row
+                    # doesn't look like an ordinary wait.
+                    plan = f"SL {plan}"
                 self._st(wallet.name, status=run_status.WAITING,
                          route=route, plan=plan)
                 await asyncio.sleep(self._poll_interval(out))

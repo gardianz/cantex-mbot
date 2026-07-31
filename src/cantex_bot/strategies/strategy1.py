@@ -374,14 +374,26 @@ class Strategy1(Strategy):
 
             # Pace: adaptive poll while waiting on a guard, brief cooldown otherwise.
             if out.reject_reasons and not out.ok:
-                plan = f"wait fee {fee:.3f}" if fee is not None else "wait fee"
+                if getattr(out, "fee_rejected", False):
+                    # The quote passed the guard but the LIVE fee was over the cap
+                    # at submit, so the quoted fee would misreport the wait — and
+                    # the adaptive poll would read it as "at the limit" and retry
+                    # immediately. Back off a full poll_max instead: the live fee
+                    # was too high moments ago and every rejected submit costs a
+                    # WebSocket round trip.
+                    limit = self.engine.guard.config.max_network_fee
+                    plan = f"fee naik >{limit}"
+                    delay = self.config.poll_max_seconds
+                else:
+                    plan = f"wait fee {fee:.3f}" if fee is not None else "wait fee"
+                    delay = self._poll_interval(out)
                 if force_sl:
                     # Stop armed but the fee guard says no — say so, so the row
                     # doesn't look like an ordinary wait.
                     plan = f"SL {plan}"
                 self._st(wallet.name, status=run_status.WAITING,
                          route=route, plan=plan)
-                await asyncio.sleep(self._poll_interval(out))
+                await asyncio.sleep(delay)
             else:
                 await asyncio.sleep(self.config.cooldown_seconds)
 

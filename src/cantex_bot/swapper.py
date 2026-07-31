@@ -18,6 +18,20 @@ from .wallets import Wallet
 logger = logging.getLogger(__name__)
 
 
+def _is_max_fee_error(exc: object) -> bool:
+    """True for the API's ``maxNetworkFee reached`` rejection.
+
+    The network fee moves between the quote and the submit, so a quote that
+    passed the guard can still be over the cap by the time the intent lands. The
+    API then rejects it with HTTP 400 *before executing anything* — so nothing
+    can have settled, and the condition is exactly what the fee guard blocks:
+    a market state to wait out, not a failure.
+    """
+    # Tolerate maxNetworkFee / max_network_fee / "max network fee" spellings.
+    text = str(exc).lower().replace("_", "").replace(" ", "")
+    return "maxnetworkfee" in text
+
+
 @dataclass
 class SwapOutcome:
     wallet: str
@@ -35,6 +49,9 @@ class SwapOutcome:
     event: SwapExecutedEvent | None = None
     error: str | None = None
     reject_reasons: list[str] | None = None
+    # The API refused the intent because the live network fee was over the cap.
+    # A rejection, not an error — see _is_max_fee_error.
+    fee_rejected: bool = False
 
     @property
     def ok(self) -> bool:
@@ -152,6 +169,26 @@ class SwapEngine:
                 sell_amount, sell, buy, max_network_fee=max_fee,
             )
         except CantexError as exc:
+            if _is_max_fee_error(exc):
+                # The fee rose between the quote and the submit. The API refused
+                # the intent before executing it, so NOTHING settled: clear
+                # submitted_attempt (no history reconciliation needed) and report
+                # it as a rejection. Treating this as an error made a caller's
+                # consecutive-failure counter climb on an ordinary market
+                # condition until it gave up on the wallet entirely.
+                out.submitted_attempt = False
+                out.fee_rejected = True
+                out.reject_reasons = [
+                    f"network fee rose above {max_fee} between quote and submit"
+                ]
+                if quiet_reject:
+                    logger.info("%s waiting (%s)", tag, out.reject_reasons[0])
+                else:
+                    logger.warning("%s FEE REJECT: %s", tag, out.reject_reasons[0])
+                    await self.notifier.send(
+                        f"🛑 {tag}\nFee reject: {out.reject_reasons[0]}"
+                    )
+                return out
             out.error = f"swap failed: {exc}"
             logger.error("%s %s", tag, out.error)
             await self.notifier.send(f"❌ {tag}\nSwap failed: {exc}")

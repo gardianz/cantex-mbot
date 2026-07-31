@@ -421,6 +421,41 @@ async def test_strategy_unconfirmed_swap_is_failure(tmp_path, monkeypatch):
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_strategy_fee_rejection_never_aborts_wallet(tmp_path, monkeypatch):
+    """A 'maxNetworkFee reached' rejection is a market condition, not a failure.
+    The fee oscillates around the limit all day, so counting these toward the
+    abort cap killed every funded wallet with 'stopped: repeated errors'. The
+    wallet must keep polling indefinitely instead."""
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=99)
+    engine.dry_run = False
+    stop = _a.Event()
+    calls = {"n": 0}
+
+    async def _fee_rejected(*_a_, **_kw):
+        calls["n"] += 1
+        if calls["n"] >= 12:      # twice the abort cap of max(6, 1 pair * 2) = 6
+            stop.set()
+        return SimpleNamespace(
+            counted=False, ok=False, error=None, submitted_attempt=False,
+            fee_rejected=True, guard=None, buy_amount=Decimal("0"),
+            buy_symbol="CBTC",
+            reject_reasons=["network fee rose above 0.7 between quote and submit"],
+        )
+
+    engine.execute_swap = AsyncMock(side_effect=_fee_rejected)
+    strat.config = Strategy1Config(daily_swap_target=99, insufficient_retries=99,
+                                   cooldown_seconds=0, poll_max_seconds=0)
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))          # flat -> buy
+    strat._balances = AsyncMock(return_value=(Decimal("0"), Decimal("100"), Decimal("50")))
+    await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                                            sdk=SimpleNamespace()), stop)
+    assert calls["n"] == 12                       # kept going well past the cap
+    assert rs.view("w1").plan == "fee naik >0.7"  # waiting, not stopped
+    store.close()
+
+
 def test_seconds_until_next_midnight_is_utc():
     """Daily reset must count down to 00:00 UTC, not local midnight (WIB=UTC+7
     would be ~7h off)."""
@@ -661,6 +696,57 @@ async def test_engine_live_executes(tmp_path):
     )
     assert out.executed and out.buy_amount == Decimal("100")
     assert store.fees_since("w1", 3600) == Decimal("0.13")  # 0.01+0.02+0.10
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_max_fee_rejection_is_not_an_error(tmp_path):
+    """The API answers 'maxNetworkFee reached' when the network fee rises between
+    the quote and the submit. It refuses the intent BEFORE executing it, so this
+    must read as a rejection to wait out — error stays None and submitted_attempt
+    is cleared, or Strategy1 would reconcile a swap that cannot exist and count a
+    market condition toward its abort cap."""
+    from cantex_sdk import CantexError
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote(net="0.55")),
+        swap_and_confirm=AsyncMock(side_effect=CantexError(
+            'API error 400: {"error":"maxNetworkFee reached"}')),
+    )
+    wallet = fake_wallet(sdk)
+    engine = SwapEngine(SwapGuard(GuardConfig(max_network_fee=Decimal("0.56"))),
+                        store, notifier(), dry_run=False)
+    out = await engine.execute_swap(
+        wallet, sell=InstrumentId("DSO", "USDCX"), buy=InstrumentId("DSO", "CETH"),
+        sell_amount=Decimal("13"), sell_symbol="USDCX", buy_symbol="CETH",
+        direction="buy", quiet_reject=True,
+    )
+    assert out.fee_rejected and out.reject_reasons
+    assert out.error is None                  # a wait, not a failure
+    assert not out.submitted_attempt          # nothing settled, nothing to confirm
+    assert not out.counted and not out.executed
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_other_swap_errors_stay_errors(tmp_path):
+    """Only the max-fee rejection is reclassified — any other CantexError is still
+    a failure with submitted_attempt set, so the ambiguous-swap reconciliation
+    still runs for a genuine confirm timeout."""
+    from cantex_sdk import CantexError
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote(net="0.1")),
+        swap_and_confirm=AsyncMock(side_effect=CantexError("confirm timeout")),
+    )
+    wallet = fake_wallet(sdk)
+    engine = SwapEngine(SwapGuard(GuardConfig()), store, notifier(), dry_run=False)
+    out = await engine.execute_swap(
+        wallet, sell=InstrumentId("DSO", "USDCX"), buy=InstrumentId("DSO", "CETH"),
+        sell_amount=Decimal("13"), sell_symbol="USDCX", buy_symbol="CETH",
+        direction="buy", quiet_reject=True,
+    )
+    assert out.error and out.submitted_attempt and not out.fee_rejected
     store.close()
 
 

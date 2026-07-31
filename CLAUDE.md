@@ -2,63 +2,92 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Layout
+## What this is
 
-The SDK lives in `cantex_sdk/` (its own git repo). Run all commands from there.
-
-```bash
-cd cantex_sdk
-```
+`cantex-bot` — a multi-wallet interactive trading bot for the Cantex DEX. It trades **real funds on mainnet** by default (`config.toml` ships with `dry_run = false`, and live execution additionally requires typing `LIVE` in the CLI).
 
 ## Commands
 
+Run everything from the repo root (`/home/gardianz/canton/cantex-mbot`).
+
 ```bash
-pip install -e ".[dev]"                    # install with test deps (pytest, pytest-asyncio, aioresponses)
-python -m pytest tests/ -v                  # run all tests
-python -m pytest tests/test_cantex_sdk.py::TestOperatorKeySigner::test_from_hex -v   # single test
-python examples/example.py                  # run example (needs CANTEX_* env vars, hits live API)
+pip install -e ../cantex_sdk       # the official SDK — NOT on PyPI, install first
+pip install -e ".[dev]"            # this bot + pytest, pytest-asyncio, aioresponses
+python -m pytest -q                # all tests (no network, keys, or cookies needed)
+python -m pytest tests/test_bot.py::test_guard_rejects_high_slippage -v   # one test
+python -m cantex_bot               # run the interactive CLI (or: cantex-bot)
+tail -f cantex_bot.log             # logs never go to the console (see below)
 ```
 
-Requires Python 3.11+. No lint/type-check is configured in `pyproject.toml`; `ruff` and `mypy` caches are gitignored (used ad hoc, not enforced).
+Python 3.11+. `asyncio_mode = "auto"` is set in `pyproject.toml`, so async tests need no decorator. No lint/type-check is configured or enforced.
 
-The example talks to a real Cantex environment and executes a swap (`swap_and_confirm` is uncommented). Don't run it against mainnet without intent. Set `CANTEX_BASE_URL` to testnet (`https://api.testnet.cantex.io`) for safe runs.
+If `../cantex_sdk` isn't checked out: `pip install git+https://github.com/caviarnine/cantex_sdk.git`.
+
+`config.toml` and `.env` are gitignored and absent from a fresh clone — copy from `config.example.toml` / `.env.example`. Tests fake the SDK and web surfaces, so they run without either.
 
 ## Architecture
 
-Whole SDK is one module: `src/cantex_sdk/_sdk.py` (~1900 lines). `__init__.py` re-exports everything via `from ._sdk import *` driven by `__all__`. Add new public symbols to `__all__`.
+`src/cantex_bot/`, one flat module per concern. [cli.py](src/cantex_bot/cli.py) `App` wires everything and owns the questionary menu; each menu item is an `action_*` coroutine.
 
-### Signer hierarchy (template-method pattern)
+### Every swap goes through one path
 
-`BaseSigner` (ABC) owns all key-loading logic once: `from_hex`, `from_env`, `from_hex_file`, `from_raw_file`, `from_file`, `_clean_hex`. Subclasses implement only three hooks: `_from_key_bytes` (raw 32 bytes → signer), `from_pem_file`, `_to_pem`, plus `sign` / `get_public_key_hex`.
+[swapper.py](src/cantex_bot/swapper.py) `SwapEngine.execute_swap` is the sole swap path — strategies, `swap 1x`, and manual swap all call it. Order is fixed: `ensure_auth → quote → record_fee → guard → (dry-run stop | live swap_and_confirm) → record_swap + incr_daily → notify`. New trading features should call it rather than `wallet.sdk.swap_and_confirm` directly; the fee observation, guard, counters, and Telegram notification all live there.
 
-- **`OperatorKeySigner`** — Ed25519. Signs auth challenges AND ledger transaction hashes. `get_public_key_b64` (URL-safe, no padding) is the API auth identity.
-- **`IntentTradingKeySigner`** — secp256k1 ECDSA. Signs pre-hashed 32-byte digests → DER signatures. `get_public_key_hex_der` produces the SPKI-wrapped key sent to `create_intent_trading_account`.
+Two distinct escape hatches, don't conflate them:
+- `bypass_guards` — ignore *all* limits (manual CLI override, real-money risk).
+- `ignore_network_fee` — waive **only** `max_network_fee`, used when a round trip is already profitable enough that waiting out the fee risks more than it saves.
 
-### Two write flows — the central abstraction
+Either one also lifts the SDK-level `max_network_fee` cap passed to `swap_and_confirm`, or the SDK would reject a swap the guard just allowed.
 
-`CantexSDK._build_sign_submit(build_path, payload, *, intent=False)` unifies every mutating operation into build → sign → submit:
+### Guard units (easy to get wrong)
 
-- **Operator flow** (`intent=False`): build ledger tx → sign `context.transaction_hash` (base64) with Ed25519 → submit to `/v1/ledger/transaction/submit`. Used by `transfer`, `batch_transfer`, `create_trading_account`, `reclaim_expired_transfer`, `reclaim_expired_allocation`.
-- **Intent flow** (`intent=True`): build intent → sign `intent.digest` with secp256k1 → submit to `/v1/intent/submit`. Used by `swap`, `create_intent_trading_account`. Requires `intent_signer` or raises.
+[guards.py](src/cantex_bot/guards.py): the Cantex API returns slippage and pool fee as **fractions** (`0.001`); config limits and `GuardResult.details` are in **percent** (`0.1` = 0.10%). `quote_metrics` does the ×100 and is the single source both the guard and the dashboard's PAIR FEES panel read. `max_network_fee` is absolute, in CC. Cantex charges slippage + pool fee (%) + network fee (CC) — there is **no admin fee**, despite `SwapQuote.fees.amount_admin` existing.
 
-New mutating endpoints should route through `_build_sign_submit`, not raw `_request`.
+### Strategies — template method on `_pick`
 
-### Response models
+[strategies/strategy1.py](src/cantex_bot/strategies/strategy1.py) holds the whole per-wallet loop (~580 lines): daily target, UTC rollover, loss brakes, ambiguous-swap reconciliation, adaptive fee polling. [strategy2.py](src/cantex_bot/strategies/strategy2.py) subclasses it and overrides **only `_pick`** (round-robin → lowest network fee, and never switch tokens while holding one). A new strategy in the same family should do the same: override `_pick`, set `name`/`label`, and change nothing else.
 
-All frozen dataclasses. Each parses raw API JSON via a `_from_raw(cls, data)` classmethod — never construct from raw dicts directly, call `_from_raw`. `InstrumentId(admin, id)` is the shared value object; balances/quotes/pools all key on it. `SwapQuote` has deprecated flat properties (`trade_price`, `slippage`, ...) that warn and delegate to `prices.*` — use `prices.*`.
+Loop invariants worth preserving:
+- A wallet that hits its target, its loss budget, or repeated insufficient balance **idles until the next UTC day** rather than returning — returning would park it until *every* wallet returns, and a fee-polling wallet may never return.
+- After a live swap whose confirmation *errored*, never fire the opposite leg on a maybe. `_confirm_via_history` polls the trading history: a higher today-count proves it settled. This is the buy/sell "collision" guard.
+- The cycle-loss hold timer (`_held_since`) is cleared only when a position actually closes. When the timed stop-loss fires but the fee guard rejects the sell, the timer stays armed so the stop fires the moment the fee allows.
 
-### WebSocket layer
+### Where each number comes from — three data sources
 
-- `CantexWebSocket` — async-iterable. Auto-answers ping with pong, swallows subscribe/unsubscribe acks, reconnects with exponential backoff on unexpected drops, and replays tracked subscriptions after reconnect.
-- `_WebSocketConnect` — dual awaitable + async-context-manager returned by `connect_public_ws` / `connect_private_ws`.
-- Event parsing: `_parse_ws_event` dispatches on `channel` suffix (`.ticker` → `TickerEvent`) then on API `type` string via the `_WS_EVENT_PARSERS` registry, defaulting to base `WsEvent` for unknown types. Event subclasses compose parent fields with `**Parent._from_raw(raw).__dict__`. To add an event type: define the dataclass, its `_from_raw`, and register the API type string in `_WS_EVENT_PARSERS`.
-- `swap_and_confirm` opens the private WS *before* submitting so the confirmation event is never missed.
+The SDK has no endpoints for trading history, fees, or rebates. All three are reachable from the **operator key alone** (no cookie, no browser):
 
-### HTTP & auth
+| Data | Source | Auth |
+|---|---|---|
+| Balances, quotes, swaps, transfers | `cantex_sdk` | operator + intent keys |
+| Trading history, CC rebates | [webclient.py](src/cantex_bot/webclient.py) → `api.cantex.io/v1/history/trading`, `/v1/account/reward_activity` | the SDK's Bearer token |
+| On-chain trading fees | [ccview.py](src/cantex_bot/ccview.py) → ccview.io Canton explorer | anonymous ccview `sessionId` cookie |
 
-`_request` retries 429/502/503/504 and network errors with exponential backoff (`max_retries`, `retry_base_delay`); 401/403 raise `CantexAuthError`. `authenticate` is a challenge-response flow (`/v1/auth/api-key/begin` → sign message → `/finish`), guarded by an asyncio lock; the API key is cached to disk at `api_key_path` (default `secrets/api_key.txt`, chmod 600) and revalidated with a probe request before reuse. Endpoints mix API versions: account/auth/ledger/intent are `v1`, pools/quote are `v2`.
+The daily swap target counts from the **web history**, not the local counter — `_current_done` takes `max(web today, web-at-start + this run, local counter)` to tolerate the exchange's indexing lag.
 
-## Gotchas
+`WebClient._loss_over` computes realised loss over complete `base→token→base` cycles with a **FIFO queue per token**, so a `base→A` buy is never closed by an unrelated `B→base` sell. Incomplete cycles are ignored. Positive = loss, negative = gain.
 
-- **README drift**: `README.md` documents `transfer` / `batch_transfer` as taking separate `instrument_id` + `instrument_admin` args, but the code takes a single `instrument: InstrumentId`. The README also omits `create_trading_account`, `reclaim_expired_transfer`, and `reclaim_expired_allocation`. Trust the code over the README; update the README when changing these signatures.
-- `subscribe` / `unsubscribe` reject a bare string and require an iterable of channel names.
+### Dashboard never fetches
+
+[portfolio.py](src/cantex_bot/portfolio.py) `PortfolioService` runs a background sweep filling a per-wallet `WalletSnap` cache, bounded by `WalletManager.sem` (the global concurrency cap). [dashboard.py](src/cantex_bot/dashboard.py) paints **only** from that cache — a render fires on every keypress and tick, so an inline fetch or DB query there would be thousands of requests at scale. The heavy `pair_fee_stats` GROUP BY runs once per sweep via `asyncio.to_thread`; rows show `loading` until their first refresh lands.
+
+[runstate.py](src/cantex_bot/runstate.py) `RunState` is the shared strategy↔dashboard channel: per-wallet `status`/`route`/`plan`/`done`/`target`, plus the active base symbol and selected tokens. `ROUTE` is the trade direction; `STATUS` is the phase.
+
+### Supporting modules
+
+- [wallets.py](src/cantex_bot/wallets.py) — one `CantexSDK` per wallet. Auth is **lazy** (`ensure_auth`), so hundreds of unused wallets cost nothing. `_seed_session` deliberately reaches into `sdk._session` to install the tuned connector.
+- [nethelp.py](src/cantex_bot/nethelp.py) — shared aiohttp connector/timeout: IPv4-pinned, DNS-cached, keep-alive, short connect ceiling. Tuned for WSL2/NAT stalling a fresh SYN. Every client (SDK, web, ccview) uses it.
+- [store.py](src/cantex_bot/store.py) — SQLite (`state.db`): swaps, daily counters, fee observations, scrape snapshots. Coarse-locked, thread-safe.
+- [markets.py](src/cantex_bot/markets.py) — symbol↔`InstrumentId`. Every Cantex pool is CC↔token and the swap endpoint routes multi-hop at the same fee, so **`trade_pairs` does not require a direct base↔token pool** — any pool token is reachable from any base. (`usdcx_pairs` is the narrower legacy variant; `Pair.usdcx` is really "the base instrument".)
+- [logging_setup.py](src/cantex_bot/logging_setup.py) — logs go to `cantex_bot.log` and an in-memory ring for the dashboard LOG panel, **never to the console**: a stray log line corrupts the questionary menu and the rich Live render. User-facing output is `console.print`.
+- [telegram.py](src/cantex_bot/telegram.py) — fire-and-forget notifier (never raises) plus a `getUpdates` long-poll command bot (`/stats`, `/help`), owner chat only.
+- [wallet_import.py](src/cantex_bot/wallet_import.py) — shared by `scripts/add_wallets.py` and the menu. `assert_gitignored` refuses to write secrets to a git-tracked file.
+
+## Conventions
+
+- **UTC everywhere.** Daily counters, swap counts, loss windows, fee windows, and the strategy's day rollover all reset at 00:00 UTC — matching Cantex. A local-date boundary here is a bug (WIB = UTC+7 caused a real one). Weeks are Monday-start, matching Cantex reward periods.
+- **Dashboard `plan` strings are Indonesian** ("saldo kurang", "proses swap", "tunggu rugi", "swap berhasil"). Match that when adding phases.
+- **Word a loss, don't sign it.** The LOSS column reads negative as a *gain*, so a signed percentage in a status string means the opposite of the same sign in the table.
+- **Per-wallet isolation.** Every sweep/batch catches per wallet (`except Exception  # noqa: BLE001`) so one bad wallet never aborts the rest. Keep that.
+- New response data from the SDK is a frozen dataclass; parse via `_from_raw`, never construct from raw dicts.
+- Never commit `.env`, `config.toml`, `secrets/`, `state.db`, or `*.log`.
+- **README drift**: `README.md` says "`dry_run = true` is the default". That is the `NetworkConfig` code default, but `config.example.toml` ships `dry_run = false` — so a config copied from the example starts in live mode (still gated by the `LIVE` prompt). Trust the code and the example file.

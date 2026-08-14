@@ -126,6 +126,7 @@ class Dashboard:
         self._keybuf = b""          # trailing partial escape from the last read
         self._dirty = asyncio.Event()
         self._pairs: list = []      # per-pair fee stats for the current render
+        self.log_filter = True      # LOG panel shows only the cursor wallet ('l')
 
     def _default_target(self) -> int:
         s1 = getattr(self.config, "strategy1", None)
@@ -396,16 +397,29 @@ class Dashboard:
             t.add_row(Text(f"(+{extra} more)", _DIM), "", "", "", "", "", "")
         return t
 
+    def _cursor_wallet(self) -> str | None:
+        names = self.service.manager.names
+        if not names:
+            return None
+        return names[min(self.cursor, len(names) - 1)]
+
     def _log_panel(self) -> Table:
+        # Follow the cursor: one wallet's log at a time, so a stalled wallet's own
+        # story is readable instead of being buried under 32 others interleaved.
+        # 'l' switches back to the unfiltered stream (the only place records that
+        # belong to no wallet — scheduler, Telegram — show up).
+        wallet = self._cursor_wallet() if self.log_filter else None
+        title = f"LOG · {wallet}" if wallet else "LOG · all wallets"
         t = Table(
             box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
-            show_header=False, title="LOG", title_style=f"bold {_ACCENT}",
+            show_header=False, title=title, title_style=f"bold {_ACCENT}",
             title_justify="left",
         )
         t.add_column(no_wrap=True, overflow="ellipsis")
-        lines = recent_logs(8)
+        lines = recent_logs(8, wallet=wallet)
         if not lines:
-            t.add_row(Text("(no log yet)", _DIM))
+            empty = f"(no log for {wallet} yet — 'l' for all)" if wallet else "(no log yet)"
+            t.add_row(Text(empty, _DIM))
         for ln in lines:
             style = "red" if " ERROR " in ln or " WARNING " in ln else "grey62"
             t.add_row(Text(ln, style))
@@ -426,7 +440,8 @@ class Dashboard:
                 (f"page {cur}/{pages}  ", "white"),
                 ("▸ ", _ACCENT), (f"{sel} ({self.cursor + 1}/{n})", "bold white"),
             ),
-            Text("↑↓ move · PgUp/Dn · g/G top/end · r refresh · q back", _DIM),
+            Text(f"↑↓ move · PgUp/Dn · g/G top/end · r refresh · "
+                 f"l log:{'wallet' if self.log_filter else 'all'} · q back", _DIM),
         )
         return t
 
@@ -453,6 +468,8 @@ class Dashboard:
             self.cursor = n - 1
         elif data == b"r":
             asyncio.ensure_future(self.service.refresh_all())
+        elif data == b"l":
+            self.log_filter = not self.log_filter
         # Clamp cursor, then scroll the window just enough to keep it visible.
         self.cursor = max(0, min(self.cursor, max(0, n - 1)))
         if self.cursor < self.offset:

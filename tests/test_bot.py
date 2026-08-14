@@ -1021,6 +1021,68 @@ def test_amountspec_rejects_bad(bad):
         AmountSpec.parse(bad)
 
 
+# -- per-wallet log view -----------------------------------------------------
+
+def _ring_logger(monkeypatch):
+    """A logger wired to a fresh ring buffer, as setup() would wire it."""
+    import logging as _l
+    from cantex_bot import logging_setup as ls
+    from collections import deque
+    monkeypatch.setattr(ls, "_RING", deque(maxlen=200))
+    handler = ls._RingHandler()
+    handler.setFormatter(_l.Formatter("%(levelname)s %(name)s %(message)s"))
+    log = _l.getLogger("cantex_bot.test_ring")
+    log.handlers = [handler]
+    log.setLevel(_l.INFO)
+    log.propagate = False
+    return log, ls
+
+
+def test_recent_logs_filters_by_wallet_tag(monkeypatch):
+    """The [name] prefix every per-wallet log line already uses is what attributes
+    a record, so one wallet's log can be read without the others interleaved."""
+    log, ls = _ring_logger(monkeypatch)
+    log.info("[w1] buy 10 USDCX->CBTC")
+    log.info("[w2] sell 3 CBTC->USDCX")
+    log.info("[w1] swap berhasil")
+    assert ls.recent_logs(10, wallet="w1") == [
+        "INFO cantex_bot.test_ring [w1] buy 10 USDCX->CBTC",
+        "INFO cantex_bot.test_ring [w1] swap berhasil",
+    ]
+    assert len(ls.recent_logs(10)) == 3          # unfiltered still sees everything
+
+
+def test_wallet_logs_context_tags_sdk_records(monkeypatch):
+    """Records from below the per-wallet loop — the SDK's especially — carry no
+    wallet of their own. Without the context they would be invisible in a
+    per-wallet view, which is exactly the line needed when a wallet stalls."""
+    log, ls = _ring_logger(monkeypatch)
+    with ls.wallet_logs("grass_3"):
+        log.warning("API GET /v1/account/info returned 502 (attempt 1/4)")
+    log.warning("API GET /v1/account/info returned 502 (attempt 1/4)")  # outside
+    assert ls.recent_logs(10, wallet="grass_3") == [
+        "WARNING cantex_bot.test_ring API GET /v1/account/info returned 502 (attempt 1/4)",
+    ]
+
+
+def test_wallet_logs_context_restores_previous(monkeypatch):
+    """Nested/sequential blocks must not leak — a wallet's context ends with it."""
+    log, ls = _ring_logger(monkeypatch)
+    with ls.wallet_logs("w1"):
+        log.info("inner")
+    log.info("outer")
+    assert ls.recent_logs(10, wallet="w1") == ["INFO cantex_bot.test_ring inner"]
+
+
+def test_explicit_tag_beats_context(monkeypatch):
+    """A parent task logging about a specific wallet wins over its own context."""
+    log, ls = _ring_logger(monkeypatch)
+    with ls.wallet_logs("w1"):
+        log.error("[w2] crashed")
+    assert ls.recent_logs(10, wallet="w2") == ["ERROR cantex_bot.test_ring [w2] crashed"]
+    assert ls.recent_logs(10, wallet="w1") == []
+
+
 # -- dashboard render smoke --------------------------------------------------
 
 @pytest.mark.asyncio
@@ -1130,6 +1192,45 @@ async def test_dashboard_render_smoke():
     assert "PORTFOLIO" in out and "WALLETS" in out
     assert "Paid" in out and "812" in out
     assert "PROFIT" in out and "LOSS" in out
+
+
+@pytest.mark.asyncio
+async def test_dashboard_log_panel_follows_cursor(monkeypatch):
+    """The LOG panel shows the cursor wallet's records only, so a stalled wallet
+    can be read on its own; 'l' toggles back to the unfiltered stream."""
+    import io
+    from rich.console import Console as RichConsole
+    from cantex_bot.dashboard import Dashboard
+    from cantex_bot.portfolio import WalletSnap
+
+    log, _ls = _ring_logger(monkeypatch)
+    log.info("[w1] buy 10 USDCX->CBTC")
+    log.info("[w2] stuck waiting fee")
+
+    svc = _fake_portfolio()
+    svc.manager = SimpleNamespace(names=["w1", "w2"])
+    svc.snaps = {"w1": WalletSnap(name="w1"), "w2": WalletSnap(name="w2")}
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
+    dash = Dashboard(svc, config)
+
+    def panel() -> str:
+        buf = io.StringIO()
+        RichConsole(file=buf, width=200).print(dash._log_panel())
+        return buf.getvalue()
+
+    dash.cursor = 0
+    out = panel()
+    assert "LOG " in out and "w1" in out
+    assert "buy 10 USDCX" in out and "stuck waiting fee" not in out
+
+    dash.cursor = 1                                   # cursor moves -> log follows
+    out = panel()
+    assert "stuck waiting fee" in out and "buy 10 USDCX" not in out
+
+    assert dash._on_key(b"l", 10, 2) is False          # 'l' = show every wallet
+    out = panel()
+    assert "buy 10 USDCX" in out and "stuck waiting fee" in out
 
 
 # -- Telegram command bot (/stats) -----------------------------------------

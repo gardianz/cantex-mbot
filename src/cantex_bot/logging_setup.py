@@ -6,14 +6,67 @@ render. All logs go to a file instead; user-facing output uses ``console.print``
 Tail the file to watch logs live:  ``tail -f cantex_bot.log``.
 
 A small in-memory ring buffer also keeps the most recent records so the live
-dashboard can show a log panel. Read it with ``recent_logs()``.
+dashboard can show a log panel. Read it with ``recent_logs()``, optionally
+filtered to one wallet — see ``wallet_logs`` for how a record is attributed.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
+import re
 from collections import deque
+from contextlib import contextmanager
 
-_RING: deque[str] = deque(maxlen=200)
+# (wallet | None, formatted line). Held long enough that filtering to ONE wallet
+# still yields a useful window: with hundreds of wallets interleaved, a 200-line
+# buffer can hold only a couple of lines per wallet.
+_RING: deque[tuple[str | None, str]] = deque(maxlen=2000)
+
+# The wallet whose work the current task is doing. Set by the per-wallet loops
+# (strategy, portfolio sweep, bulk swap/withdraw) so records logged *below* them
+# — including the SDK's own, which know nothing about wallets — are attributed
+# correctly. asyncio copies the context per task, so concurrent wallets never
+# see each other's value.
+_current_wallet: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "cantex_log_wallet", default=None,
+)
+
+# Messages that name their wallet explicitly. Checked before the context var, so
+# a line logged from a parent task about one wallet is still attributed to it.
+_WALLET_PATTERNS = (
+    re.compile(r"^\[([^\]\s]+)\]"),                     # "[w1] buy 10 USDCX->CBTC"
+    re.compile(r"^portfolio refresh (\S+) failed"),     # PortfolioService
+    re.compile(r"^Wallet (\S+) (?:authenticated|auth failed)"),
+    re.compile(r"\bwallet (\S+) crashed"),              # Strategy.run
+)
+
+
+@contextmanager
+def wallet_logs(name: str):
+    """Attribute every record logged inside this block to ``name``.
+
+    Wrap a per-wallet unit of work with it. Without this, a record from the SDK
+    (``cantex_sdk._sdk API GET /v1/account/info returned 502``) carries no wallet
+    and cannot be shown in a per-wallet log view — which is exactly the record
+    you need when one wallet stalls and the others keep going.
+    """
+    token = _current_wallet.set(name)
+    try:
+        yield
+    finally:
+        _current_wallet.reset(token)
+
+
+def _wallet_of(record: logging.LogRecord) -> str | None:
+    try:
+        msg = record.getMessage()
+    except Exception:  # noqa: BLE001 - a bad format string must not lose the line
+        msg = ""
+    for pattern in _WALLET_PATTERNS:
+        m = pattern.search(msg)
+        if m:
+            return m.group(1)
+    return _current_wallet.get()
 
 
 class _RingHandler(logging.Handler):
@@ -21,16 +74,24 @@ class _RingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            _RING.append(self.format(record))
+            _RING.append((_wallet_of(record), self.format(record)))
         except Exception:  # noqa: BLE001 - logging must never raise
             pass
 
 
-def recent_logs(n: int = 8) -> list[str]:
-    """The most recent ``n`` log lines (oldest first)."""
+def recent_logs(n: int = 8, wallet: str | None = None) -> list[str]:
+    """The most recent ``n`` log lines (oldest first).
+
+    ``wallet`` restricts the result to records attributed to that wallet. Lines
+    that belong to no wallet (scheduler, Telegram, menu errors) only appear in
+    the unfiltered view.
+    """
     if n <= 0:
         return []
-    return list(_RING)[-n:]
+    if wallet is None:
+        return [line for _, line in _RING][-n:]
+    want = wallet.casefold()
+    return [line for w, line in _RING if w is not None and w.casefold() == want][-n:]
 
 
 class _RetryNoiseFilter(logging.Filter):

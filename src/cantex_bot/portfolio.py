@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .ccview import CCViewClient, fee_windows
+from .logging_setup import wallet_logs
 from .runstate import RunState
 from .store import Store
 from .wallets import WalletManager
@@ -145,6 +146,13 @@ class PortfolioService:
         return []
 
     async def refresh_wallet(self, name: str) -> None:
+        """Refresh one wallet, attributing every record below it (including the
+        SDK's own connection warnings) to that wallet for the dashboard's
+        per-wallet log view."""
+        with wallet_logs(name):
+            await self._refresh_wallet(name)
+
+    async def _refresh_wallet(self, name: str) -> None:
         snap = self.snaps[name]
         wallet = self.manager.get(name)
         async with self.manager.sem:

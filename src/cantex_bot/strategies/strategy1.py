@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from cantex_sdk import CantexError, InstrumentId
 
 from ..config import Strategy1Config
+from ..logging_setup import wallet_logs
 from ..markets import MarketMap
 from .. import runstate as run_status
 from ..runstate import RunState
@@ -120,6 +121,13 @@ class Strategy1(Strategy):
         return "too small" in e or "minimum ticket" in e or "min ticket" in e
 
     async def _run_wallet(self, wallet: Wallet, stop: asyncio.Event) -> None:
+        """Run one wallet's loop with every record below it — this module's, the
+        engine's, and the SDK's — attributed to that wallet, so the dashboard can
+        show one wallet's log in isolation when it stalls."""
+        with wallet_logs(wallet.name):
+            await self._trade_wallet(wallet, stop)
+
+    async def _trade_wallet(self, wallet: Wallet, stop: asyncio.Event) -> None:
         await wallet.ensure_auth()
         market = await MarketMap.build(wallet.sdk)
         usdcx = market.instrument(self.base_symbol)

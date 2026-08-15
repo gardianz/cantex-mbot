@@ -72,9 +72,10 @@ class CCViewClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            from .nethelp import make_connector, make_timeout
+            from .nethelp import make_timeout, shared_connector
             self._session = aiohttp.ClientSession(
-                timeout=make_timeout(), connector=make_connector(),
+                timeout=make_timeout(), connector=shared_connector(),
+                connector_owner=False,
                 headers={
                     "User-Agent": "cantex-bot/0.1",
                     "Referer": self.base + "/",

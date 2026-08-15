@@ -16,6 +16,7 @@ from .config import AppConfig, ConfigError, load_config
 from .dashboard import Dashboard
 from .guards import SwapGuard
 from .markets import MarketError, MarketMap
+from .nethelp import close_shared_connector
 from .portfolio import PortfolioService
 from .runstate import RunState
 from .scheduler import StrategyScheduler
@@ -95,6 +96,8 @@ class App:
         await self.manager.close()
         await self.notifier.close()
         await self.ccview.close()
+        # Last: every session above borrows this pool (connector_owner=False).
+        await close_shared_connector()
         self.store.close()
 
     # -- helpers -------------------------------------------------------------

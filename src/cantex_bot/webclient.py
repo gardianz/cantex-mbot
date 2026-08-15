@@ -93,9 +93,12 @@ class WebClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            from .nethelp import make_connector, make_timeout
+            from .nethelp import make_timeout, shared_connector
+            # Shared pool (connector_owner=False): one warm connection per host
+            # serves every wallet's reader instead of one cold pool each.
             self._session = aiohttp.ClientSession(
-                timeout=make_timeout(), connector=make_connector(),
+                timeout=make_timeout(), connector=shared_connector(),
+                connector_owner=False,
             )
         return self._session
 

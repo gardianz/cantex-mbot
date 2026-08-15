@@ -7,7 +7,7 @@ import logging
 from cantex_sdk import CantexSDK, IntentTradingKeySigner, OperatorKeySigner
 
 from .config import AppConfig, WalletConfig
-from .nethelp import make_connector, make_timeout
+from .nethelp import make_timeout, shared_connector
 from .webclient import WebClient
 
 logger = logging.getLogger(__name__)
@@ -35,12 +35,18 @@ class Wallet:
         self._auth_lock: asyncio.Lock | None = None
 
     def _seed_session(self) -> None:
-        """Give the SDK an IPv4, DNS-cached, keep-alive session (once)."""
+        """Give the SDK an IPv4, DNS-cached, keep-alive session (once).
+
+        The pool is shared process-wide, so a warm connection opened for one
+        wallet serves the next — a pool per wallet reuses nothing and pays a
+        cold connect (and the WSL2 SYN stall) on every sweep.
+        """
         import aiohttp
         if self.sdk._session is None or self.sdk._session.closed:
             self.sdk._session = aiohttp.ClientSession(
                 timeout=self.sdk._timeout,
-                connector=make_connector(),
+                connector=shared_connector(),
+                connector_owner=False,   # the pool outlives this session
                 headers={"User-Agent": "CantexSDK/1.0"},
             )
 

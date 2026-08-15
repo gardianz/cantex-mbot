@@ -1021,6 +1021,62 @@ def test_amountspec_rejects_bad(bad):
         AmountSpec.parse(bad)
 
 
+# -- connection pooling ------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_shared_connector_is_reused_across_clients():
+    """Every Cantex client must borrow ONE pool, or a warm connection opened for
+    one wallet cannot serve the next and each sweep pays a cold connect."""
+    from cantex_bot import nethelp
+    await nethelp.close_shared_connector()
+    try:
+        a = nethelp.shared_connector()
+        b = nethelp.shared_connector()
+        assert a is b
+    finally:
+        await nethelp.close_shared_connector()
+
+
+@pytest.mark.asyncio
+async def test_shared_connector_survives_a_borrowing_session_closing():
+    """Sessions pass connector_owner=False, so closing one must not take the
+    shared pool (and every other wallet's connections) down with it."""
+    import aiohttp
+    from cantex_bot import nethelp
+    await nethelp.close_shared_connector()
+    try:
+        pool = nethelp.shared_connector()
+        session = aiohttp.ClientSession(connector=pool, connector_owner=False)
+        await session.close()
+        assert not pool.closed
+        assert nethelp.shared_connector() is pool
+    finally:
+        await nethelp.close_shared_connector()
+
+
+@pytest.mark.asyncio
+async def test_shared_connector_rebuilt_after_close():
+    from cantex_bot import nethelp
+    await nethelp.close_shared_connector()
+    first = nethelp.shared_connector()
+    await nethelp.close_shared_connector()
+    assert first.closed
+    second = nethelp.shared_connector()
+    try:
+        assert second is not first and not second.closed
+    finally:
+        await nethelp.close_shared_connector()
+
+
+def test_keepalive_outlives_a_refresh_sweep():
+    """Regression: keepalive_timeout == refresh_interval expired every pooled
+    connection just as the next sweep needed it, so a stable host still logged
+    'GET /v1/account/info timed out after 4 attempts'."""
+    from cantex_bot.config import PerformanceConfig
+    from cantex_bot.nethelp import _KEEPALIVE
+    assert _KEEPALIVE > PerformanceConfig.refresh_interval
+
+
 # -- per-wallet log view -----------------------------------------------------
 
 def _ring_logger(monkeypatch):

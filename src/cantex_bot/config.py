@@ -22,6 +22,14 @@ class ConfigError(Exception):
 class NetworkConfig:
     base_url: str = "https://api.cantex.io"
     dry_run: bool = True
+    # Route every outbound request through ONE proxy. "http://host:port" (also
+    # exported as HTTP(S)_PROXY) or "socks5://host:port" (needs the "socks"
+    # extra). Empty = direct. Useful when the host's own egress is captured by
+    # something like a WARP full tunnel.
+    proxy: str = ""
+    # A file of proxies, one per line, giving each wallet its own egress IP.
+    # Takes precedence over `proxy`. See proxies.example.txt.
+    proxy_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,11 @@ def load_config(
     network = NetworkConfig(
         base_url=net.get("base_url", NetworkConfig.base_url),
         dry_run=bool(net.get("dry_run", True)),
+        # Env wins over the file, so a VPS can set CANTEX_PROXY without editing
+        # a config that is shared with other machines.
+        proxy=os.getenv("CANTEX_PROXY") or net.get("proxy", NetworkConfig.proxy),
+        proxy_file=(os.getenv("CANTEX_PROXY_FILE")
+                    or net.get("proxy_file", NetworkConfig.proxy_file)),
     )
 
     g = raw.get("guards", {})

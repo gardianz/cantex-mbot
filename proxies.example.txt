@@ -1,0 +1,28 @@
+# Per-wallet proxies. Copy to proxies.txt (gitignored — it holds credentials).
+#
+# Line N serves wallet N, in the order the [[wallets]] blocks appear in
+# config.toml. Fewer proxies than wallets is fine: the list wraps, and the
+# mapping is index-based so a wallet keeps the same egress IP across restarts.
+#
+# Enable it with, in config.toml:
+#     [network]
+#     proxy_file = "proxies.txt"
+# or the CANTEX_PROXY_FILE env var. Needs: pip install -e ".[socks]"
+#
+# Blank lines and # comments are ignored. Any of these forms works:
+
+# full URL
+http://user:pass@203.0.113.10:8080
+socks5://user:pass@203.0.113.11:1080
+
+# bare host:port (assumes http)
+203.0.113.12:8080
+
+# host:port:user:pass  (the usual export format from proxy providers)
+203.0.113.13:8080:myuser:mypass
+
+# credentials first
+myuser:mypass@203.0.113.14:8080
+
+# WARP's own local proxy mode, if the VPS tunnel cannot be turned off:
+# socks5://127.0.0.1:40000

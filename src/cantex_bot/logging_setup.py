@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os
 import re
 from collections import deque
 from contextlib import contextmanager
@@ -102,9 +103,22 @@ class _RetryNoiseFilter(logging.Filter):
     final give-up as ERROR — plus PortfolioService logs its own WARNING if a
     whole refresh fails. So the intermediate attempt chatter is pure noise that
     otherwise floods the dashboard LOG panel after a burst of swaps.
+
+    Except when diagnosing timeouts: the dropped line is the ONLY place the
+    underlying exception is recorded. ``CantexTimeoutError: ... timed out after
+    4 attempts`` cannot tell a connect stall from a slow read from a queued
+    connection — the attempt lines can. Set ``CANTEX_LOG_RETRIES=1`` to keep
+    them; they are attributed per wallet, so the dashboard's LOG panel shows
+    them under the stalling wallet.
     """
 
+    def __init__(self, keep_retries: bool = False) -> None:
+        super().__init__()
+        self.keep_retries = keep_retries
+
     def filter(self, record: logging.LogRecord) -> bool:
+        if self.keep_retries:
+            return True
         if (record.levelno == logging.WARNING
                 and record.name == "cantex_sdk._sdk"
                 and "failed (attempt" in record.getMessage()):
@@ -112,8 +126,14 @@ class _RetryNoiseFilter(logging.Filter):
         return True
 
 
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def setup(level: int = logging.INFO, logfile: str = "cantex_bot.log") -> None:
-    noise = _RetryNoiseFilter()
+    # CANTEX_LOG_RETRIES=1 keeps the SDK's per-attempt lines — the only record of
+    # what a "timed out after 4 attempts" actually was.
+    noise = _RetryNoiseFilter(keep_retries=_truthy(os.getenv("CANTEX_LOG_RETRIES")))
     handlers: list[logging.Handler] = []
     try:
         fh = logging.FileHandler(logfile)

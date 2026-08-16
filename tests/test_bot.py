@@ -1021,6 +1021,92 @@ def test_amountspec_rejects_bad(bad):
         AmountSpec.parse(bad)
 
 
+# -- transfer pre-approvals --------------------------------------------------
+
+def _preapproval_wallet(*, active: set[str] = frozenset(), submit=None):
+    """A wallet whose raw /v1/account/admin lists three tokens, some pre-approved."""
+    def tok(sym: str) -> dict:
+        contracts = ({"transfer_preapproval": {"contract_id": f"cid::{sym}"}}
+                     if sym in active else
+                     {"transfer_preapproval": {"contract_id": None}})
+        return {"instrument_id": sym, "instrument_admin": "DSO",
+                "instrument_symbol": sym, "contracts": contracts}
+
+    raw = {"tokens": [tok("CC"), tok("CBTC"), tok("HECTO")]}
+    sdk = SimpleNamespace(
+        _request=AsyncMock(return_value=raw),
+        _build_sign_submit=submit or AsyncMock(return_value={"id": "x"}),
+    )
+    return SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_approvals_reads_raw_contracts():
+    """AccountAdmin drops the per-token contracts block, so status must come from
+    the raw response: a transfer_preapproval contract_id means ACTIVE."""
+    from cantex_bot.preapproval import ADMIN_PATH, fetch_token_approvals
+    wallet = _preapproval_wallet(active={"CC"})
+    toks = await fetch_token_approvals(wallet)
+    assert {t.symbol: t.active for t in toks} == {
+        "CC": True, "CBTC": False, "HECTO": False}
+    wallet.sdk._request.assert_awaited_once_with("GET", ADMIN_PATH)
+
+
+@pytest.mark.asyncio
+async def test_approve_wallet_skips_already_active():
+    """Re-creating a live pre-approval would pay a second network fee for nothing."""
+    from cantex_bot.preapproval import BUILD_PATH, approve_wallet
+    submit = AsyncMock(return_value={"id": "x"})
+    wallet = _preapproval_wallet(active={"CC"}, submit=submit)
+    out = await approve_wallet(wallet, dry_run=False, cooldown=0)
+    assert out.already == ["CC"]
+    assert sorted(out.approved) == ["CBTC", "HECTO"] and out.ok
+    assert submit.await_count == 2
+    paths = {c.args[0] for c in submit.await_args_list}
+    payloads = {c.args[1]["instrumentId"] for c in submit.await_args_list}
+    assert paths == {BUILD_PATH} and payloads == {"CBTC", "HECTO"}
+    assert submit.await_args_list[0].args[1]["instrumentAdmin"] == "DSO"
+
+
+@pytest.mark.asyncio
+async def test_approve_wallet_dry_run_submits_nothing():
+    from cantex_bot.preapproval import approve_wallet
+    submit = AsyncMock()
+    wallet = _preapproval_wallet(submit=submit)
+    out = await approve_wallet(wallet, dry_run=True, cooldown=0)
+    assert sorted(out.approved) == ["CBTC", "CC", "HECTO"]
+    submit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approve_wallet_one_bad_token_does_not_stop_the_rest():
+    from cantex_bot.preapproval import approve_wallet
+    calls = {"n": 0}
+
+    async def _submit(_path, payload):
+        calls["n"] += 1
+        if payload["instrumentId"] == "CBTC":
+            raise RuntimeError("insufficient CC for fee")
+        return {"id": "x"}
+
+    wallet = _preapproval_wallet(submit=AsyncMock(side_effect=_submit))
+    out = await approve_wallet(wallet, dry_run=False, cooldown=0)
+    assert calls["n"] == 3                       # all three attempted
+    assert out.failed == {"CBTC": "insufficient CC for fee"}
+    assert sorted(out.approved) == ["CC", "HECTO"] and not out.ok
+
+
+@pytest.mark.asyncio
+async def test_approve_wallet_reports_status_failure_per_wallet():
+    """A wallet whose admin read fails is reported, not raised — one bad wallet
+    must never abort a batch."""
+    from cantex_bot.preapproval import approve_wallet
+    wallet = _preapproval_wallet()
+    wallet.sdk._request = AsyncMock(side_effect=RuntimeError("timed out"))
+    out = await approve_wallet(wallet, dry_run=False, cooldown=0)
+    assert out.error == "timed out" and not out.ok and out.approved == []
+
+
 # -- connection pooling ------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -1075,6 +1161,209 @@ def test_keepalive_outlives_a_refresh_sweep():
     from cantex_bot.config import PerformanceConfig
     from cantex_bot.nethelp import _KEEPALIVE
     assert _KEEPALIVE > PerformanceConfig.refresh_interval
+
+
+# -- proxy support -----------------------------------------------------------
+
+@pytest.fixture
+def _no_proxy(monkeypatch):
+    """Isolate the module-level proxy + the env vars configure_proxy exports."""
+    from cantex_bot import nethelp
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setattr(nethelp, "_proxy", None)
+    yield nethelp
+    monkeypatch.setattr(nethelp, "_proxy", None)
+
+
+def test_configure_proxy_exports_http_env(_no_proxy):
+    """An http proxy must reach the SDK, which builds its own requests and never
+    passes proxy= — the env var plus trust_env=True is the only route in."""
+    import os
+    _no_proxy.configure_proxy("http://10.0.0.1:8080")
+    assert os.environ["HTTPS_PROXY"] == "http://10.0.0.1:8080"
+    assert os.environ["HTTP_PROXY"] == "http://10.0.0.1:8080"
+    assert _no_proxy.proxy_url() == "http://10.0.0.1:8080"
+
+
+def test_configure_proxy_empty_is_direct(_no_proxy):
+    import os
+    _no_proxy.configure_proxy("   ")
+    assert _no_proxy.proxy_url() is None
+    assert "HTTPS_PROXY" not in os.environ
+
+
+def test_configure_proxy_rejects_unknown_scheme(_no_proxy):
+    from cantex_bot.nethelp import ProxyError
+    with pytest.raises(ProxyError, match="expected http"):
+        _no_proxy.configure_proxy("ftp://10.0.0.1:21")
+    with pytest.raises(ProxyError):
+        _no_proxy.configure_proxy("10.0.0.1:8080")      # no scheme
+    assert _no_proxy.proxy_url() is None                # nothing half-applied
+
+
+def test_socks_proxy_reports_missing_extra(monkeypatch, _no_proxy):
+    """socks5 without aiohttp-socks must fail loudly at startup, not silently
+    fall back to a direct connection that the VPS cannot make."""
+    import builtins
+    from cantex_bot.nethelp import ProxyError
+    real_import = builtins.__import__
+
+    def _no_socks(name, *a, **kw):
+        if name == "aiohttp_socks":
+            raise ImportError("no module")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_socks)
+    with pytest.raises(ProxyError, match="socks"):
+        _no_proxy.configure_proxy("socks5://127.0.0.1:40000")
+
+
+def test_socks_proxy_does_not_export_http_env(monkeypatch, _no_proxy):
+    """SOCKS is applied at the connector; exporting HTTPS_PROXY as well would
+    make aiohttp try to CONNECT to a SOCKS port over HTTP."""
+    import os
+    import sys
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", SimpleNamespace(
+        ProxyConnector=SimpleNamespace(from_url=lambda url, **kw: None)))
+    _no_proxy.configure_proxy("socks5://127.0.0.1:40000")
+    assert _no_proxy.proxy_url() == "socks5://127.0.0.1:40000"
+    assert "HTTPS_PROXY" not in os.environ
+
+
+def test_make_connector_tunnels_through_proxy(monkeypatch, _no_proxy):
+    import sys
+    seen = {}
+
+    def _from_url(url, **kw):
+        seen["url"], seen["kw"] = url, kw
+        return "socks-connector"
+
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", SimpleNamespace(
+        ProxyConnector=SimpleNamespace(from_url=_from_url)))
+    got = _no_proxy.make_connector(limit=7, proxy="socks5://127.0.0.1:40000")
+    assert got == "socks-connector"
+    assert seen["url"] == "socks5://127.0.0.1:40000"
+    assert seen["kw"]["limit"] == 7
+    assert seen["kw"]["keepalive_timeout"] == _no_proxy._KEEPALIVE
+
+
+@pytest.mark.asyncio
+async def test_single_socks_proxy_applies_without_a_proxy_map(monkeypatch, _no_proxy):
+    """A lone socks5:// proxy has no env-var route in (that is http-only), so the
+    default pool must pick it up — otherwise it would silently go direct."""
+    import sys
+    seen = []
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", SimpleNamespace(
+        ProxyConnector=SimpleNamespace(
+            from_url=lambda url, **kw: seen.append(url) or SimpleNamespace(closed=False))))
+    from cantex_bot import nethelp
+    nethelp._pools.clear()
+    try:
+        nethelp.configure_proxy("socks5://127.0.0.1:40000")
+        nethelp.connector_for(None)
+        assert seen == ["socks5://127.0.0.1:40000"]
+    finally:
+        nethelp._pools.clear()
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("http://u:p@h:8080", "http://u:p@h:8080"),
+    ("socks5://127.0.0.1:40000", "socks5://127.0.0.1:40000"),
+    ("203.0.113.12:8080", "http://203.0.113.12:8080"),
+    ("203.0.113.13:8080:me:secret", "http://me:secret@203.0.113.13:8080"),
+    ("me:secret@203.0.113.14:8080", "http://me:secret@203.0.113.14:8080"),
+])
+def test_proxy_line_formats(line, expected):
+    """Proxy providers export several shapes; all normalise to one URL."""
+    from cantex_bot.proxies import normalise
+    assert normalise(line) == expected
+
+
+@pytest.mark.parametrize("bad", ["h:8080:only:three:many", "ftp://h:21", "", "justhost"])
+def test_proxy_line_rejected(bad):
+    from cantex_bot.proxies import ProxyFileError, normalise
+    with pytest.raises(ProxyFileError):
+        normalise(bad)
+
+
+def test_parse_proxies_skips_blanks_and_comments():
+    from cantex_bot.proxies import parse_proxies
+    text = "# header\n\nh1:1\n   \n# note\nsocks5://h2:2\n"
+    assert parse_proxies(text) == ["http://h1:1", "socks5://h2:2"]
+
+
+def test_assign_is_index_based_and_wraps():
+    """Index-based, not round-robin: a wallet must keep the same egress IP
+    across restarts, and fewer proxies than wallets is a normal setup."""
+    from cantex_bot.proxies import assign
+    m = assign(["w1", "w2", "w3", "w4", "w5"], ["pA", "pB"])
+    assert m == {"w1": "pA", "w2": "pB", "w3": "pA", "w4": "pB", "w5": "pA"}
+    assert assign(["w1"], []) == {}
+
+
+def test_load_proxies_rejects_missing_and_empty(tmp_path):
+    """Silently running direct would defeat the point of configuring proxies."""
+    from cantex_bot.proxies import ProxyFileError, load_proxies
+    with pytest.raises(ProxyFileError, match="not found"):
+        load_proxies(tmp_path / "nope.txt")
+    empty = tmp_path / "p.txt"
+    empty.write_text("# only a comment\n\n")
+    with pytest.raises(ProxyFileError, match="no proxy entries"):
+        load_proxies(empty)
+
+
+def test_redact_hides_credentials():
+    from cantex_bot.proxies import redact
+    assert redact("http://me:secret@h:8080") == "http://***@h:8080"
+    assert redact("socks5://h:1080") == "socks5://h:1080"
+
+
+@pytest.mark.asyncio
+async def test_connector_pooled_per_proxy(monkeypatch, _no_proxy):
+    """One pool per egress, not per wallet: wallets sharing a proxy must share
+    warm connections, but must not share a pool with a different egress."""
+    import sys
+    made = []
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", SimpleNamespace(
+        ProxyConnector=SimpleNamespace(
+            from_url=lambda url, **kw: made.append(url) or SimpleNamespace(closed=False))))
+    from cantex_bot import nethelp
+    await nethelp.close_shared_connector()
+    try:
+        a1 = nethelp.connector_for("socks5://a:1")
+        a2 = nethelp.connector_for("socks5://a:1")
+        b = nethelp.connector_for("socks5://b:2")
+        direct = nethelp.connector_for(None)
+        assert a1 is a2 and a1 is not b
+        assert direct is nethelp.shared_connector()   # None == the direct pool
+        assert made == ["socks5://a:1", "socks5://b:2"]
+    finally:
+        nethelp._pools.clear()
+        await nethelp.close_shared_connector()
+
+
+def test_config_proxy_file_env_override(tmp_path, monkeypatch):
+    from cantex_bot.config import load_config
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[network]\nproxy_file = "a.txt"\n\n[[wallets]]\nname = "w1"\n')
+    monkeypatch.setenv("CANTEX_W1_OPERATOR_KEY", "aa" * 32)
+    assert load_config(cfg, env_path=None).network.proxy_file == "a.txt"
+    monkeypatch.setenv("CANTEX_PROXY_FILE", "b.txt")
+    assert load_config(cfg, env_path=None).network.proxy_file == "b.txt"
+
+
+def test_config_proxy_env_overrides_file(tmp_path, monkeypatch):
+    """A VPS sets CANTEX_PROXY without editing a config shared with other hosts."""
+    from cantex_bot.config import load_config
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[network]\nproxy = "http://from-file:1"\n\n[[wallets]]\nname = "w1"\n')
+    monkeypatch.setenv("CANTEX_W1_OPERATOR_KEY", "aa" * 32)
+    monkeypatch.setenv("CANTEX_PROXY", "socks5://from-env:2")
+    assert load_config(cfg, env_path=None).network.proxy == "socks5://from-env:2"
+    monkeypatch.delenv("CANTEX_PROXY")
+    assert load_config(cfg, env_path=None).network.proxy == "http://from-file:1"
 
 
 # -- per-wallet log view -----------------------------------------------------
@@ -1228,6 +1517,29 @@ def test_retry_noise_filter_drops_sdk_retry_warnings():
     assert flt.filter(rec("cantex_sdk._sdk", logging.INFO, "Swap confirmed: x"))
     assert flt.filter(rec("cantex_sdk._sdk", logging.ERROR, "gave up after 4 attempts"))
     assert flt.filter(rec("cantex_bot.portfolio", logging.WARNING, "refresh w1 failed"))
+
+
+def test_retry_noise_filter_can_keep_attempts_for_diagnosis():
+    """CANTEX_LOG_RETRIES=1 keeps the attempt lines: the dropped WARNING is the
+    only place the real exception behind 'timed out after 4 attempts' appears."""
+    import logging
+    from cantex_bot.logging_setup import _RetryNoiseFilter
+    rec = logging.LogRecord(
+        "cantex_sdk._sdk", logging.WARNING, __file__, 1,
+        "API GET /v1/account/info failed (attempt 1/4): "
+        "Connection timeout to host, retrying in 1.0s", None, None)
+    assert not _RetryNoiseFilter().filter(rec)
+    assert _RetryNoiseFilter(keep_retries=True).filter(rec)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("1", True), ("true", True), ("YES", True), ("on", True),
+     (None, False), ("", False), ("0", False), ("false", False), ("off", False)],
+)
+def test_truthy_env_parsing(value, expected):
+    from cantex_bot.logging_setup import _truthy
+    assert _truthy(value) is expected
 
 
 @pytest.mark.asyncio

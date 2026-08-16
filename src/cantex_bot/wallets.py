@@ -7,7 +7,8 @@ import logging
 from cantex_sdk import CantexSDK, IntentTradingKeySigner, OperatorKeySigner
 
 from .config import AppConfig, WalletConfig
-from .nethelp import make_timeout, shared_connector
+from .nethelp import connector_for, make_timeout
+from .proxies import redact
 from .webclient import WebClient
 
 logger = logging.getLogger(__name__)
@@ -26,27 +27,32 @@ class Wallet:
     authenticates on first use, so hundreds of unused wallets cost nothing.
     """
 
-    def __init__(self, cfg: WalletConfig, sdk: CantexSDK, web: WebClient) -> None:
+    def __init__(
+        self, cfg: WalletConfig, sdk: CantexSDK, web: WebClient,
+        proxy: str | None = None,
+    ) -> None:
         self.name = cfg.name
         self.cfg = cfg
         self.sdk = sdk
         self.web = web  # history + rebates, both via the operator-key Bearer
+        self.proxy = proxy  # this wallet's egress; None = direct
         self.authed = False
         self._auth_lock: asyncio.Lock | None = None
 
     def _seed_session(self) -> None:
         """Give the SDK an IPv4, DNS-cached, keep-alive session (once).
 
-        The pool is shared process-wide, so a warm connection opened for one
-        wallet serves the next — a pool per wallet reuses nothing and pays a
-        cold connect (and the WSL2 SYN stall) on every sweep.
+        The pool is shared by every wallet on the same egress, so a warm
+        connection opened for one serves the next — a pool per wallet reuses
+        nothing and pays a cold connect (and the WSL2 SYN stall) every sweep.
         """
         import aiohttp
         if self.sdk._session is None or self.sdk._session.closed:
             self.sdk._session = aiohttp.ClientSession(
                 timeout=self.sdk._timeout,
-                connector=shared_connector(),
+                connector=connector_for(self.proxy),
                 connector_owner=False,   # the pool outlives this session
+                trust_env=True,          # honour HTTP(S)_PROXY / NO_PROXY
                 headers={"User-Agent": "CantexSDK/1.0"},
             )
 
@@ -70,12 +76,14 @@ class Wallet:
 class WalletManager:
     """Owns one CantexSDK per configured wallet."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, proxy_map: dict[str, str] | None = None) -> None:
         self._config = config
         self.wallets: dict[str, Wallet] = {}
+        self.proxy_map = proxy_map or {}
         # Global cap on simultaneous outbound requests across all wallets.
         self.sem = asyncio.Semaphore(config.performance.max_concurrency)
         for wcfg in config.wallets:
+            proxy = self.proxy_map.get(wcfg.name)
             operator = OperatorKeySigner.from_hex(wcfg.operator_key)
             intent = (
                 IntentTradingKeySigner.from_hex(wcfg.trading_key)
@@ -96,8 +104,11 @@ class WalletManager:
             web = WebClient(
                 token_provider=sdk.authenticate,
                 api_base=config.dashboard.api_base_url,
+                proxy=proxy,   # same egress as this wallet's SDK session
             )
-            self.wallets[wcfg.name] = Wallet(wcfg, sdk, web)
+            self.wallets[wcfg.name] = Wallet(wcfg, sdk, web, proxy=proxy)
+            if proxy:
+                logger.info("Wallet %s egress: %s", wcfg.name, redact(proxy))
 
     def get(self, name: str) -> Wallet:
         try:

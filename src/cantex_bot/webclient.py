@@ -86,19 +86,21 @@ class WebClient:
         *,
         token_provider: TokenProvider,
         api_base: str = DEFAULT_API_BASE,
+        proxy: str | None = None,
     ) -> None:
         self.api_base = api_base.rstrip("/")
         self._token_provider = token_provider
+        self.proxy = proxy   # must match the wallet's SDK egress
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            from .nethelp import make_timeout, shared_connector
+            from .nethelp import connector_for, make_timeout
             # Shared pool (connector_owner=False): one warm connection per host
-            # serves every wallet's reader instead of one cold pool each.
+            # serves every wallet on the same egress, not one cold pool each.
             self._session = aiohttp.ClientSession(
-                timeout=make_timeout(), connector=shared_connector(),
-                connector_owner=False,
+                timeout=make_timeout(), connector=connector_for(self.proxy),
+                connector_owner=False, trust_env=True,
             )
         return self._session
 

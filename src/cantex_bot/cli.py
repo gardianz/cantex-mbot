@@ -16,7 +16,8 @@ from .config import AppConfig, ConfigError, load_config
 from .dashboard import Dashboard
 from .guards import SwapGuard
 from .markets import MarketError, MarketMap
-from .nethelp import close_shared_connector
+from .nethelp import ProxyError, close_shared_connector, configure_proxy, proxy_url
+from .proxies import ProxyFileError, assign, load_proxies, redact
 from .portfolio import PortfolioService
 from .runstate import RunState
 from .scheduler import StrategyScheduler
@@ -41,16 +42,22 @@ def _sig(v: Decimal) -> str:
 
 
 class App:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, proxy_map: dict[str, str] | None = None) -> None:
         self.config = config
+        self.proxy_map = proxy_map or {}
         self.store = Store()
-        self.manager = WalletManager(config)
+        self.manager = WalletManager(config, proxy_map=self.proxy_map)
         self.guard = SwapGuard(config.guards)
         self.notifier = TelegramNotifier(config.telegram)
         self.engine = SwapEngine(
             self.guard, self.store, self.notifier, dry_run=config.network.dry_run
         )
-        self.ccview = CCViewClient(base=config.dashboard.ccview_base_url)
+        # ccview is one shared reader, so it cannot follow a per-wallet egress —
+        # give it the first proxy in the list.
+        self.ccview = CCViewClient(
+            base=config.dashboard.ccview_base_url,
+            proxy=next(iter(self.proxy_map.values()), None) or proxy_url(),
+        )
         self.run_state = RunState()
         self.service = PortfolioService(
             self.manager, self.store, self.ccview,
@@ -81,6 +88,14 @@ class App:
             f"wallets: {len(self.manager.names)}  |  "
             f"max concurrency: {self.config.performance.max_concurrency}"
         )
+        if self.proxy_map:
+            egress = {redact(p) for p in self.proxy_map.values()}
+            console.print(
+                f"Proxies: [bold]{len(egress)}[/bold] egress IP(s) across "
+                f"{len(self.proxy_map)} wallet(s)"
+            )
+        elif proxy_url():
+            console.print(f"Proxy: [bold]{redact(proxy_url())}[/bold]")
         if not net.dry_run:
             console.print("[bold red]LIVE mode configured — real funds at risk.[/bold red]")
         # If Telegram is configured, run the /stats command bot and keep the
@@ -446,6 +461,83 @@ class App:
         console.print(f"[bold]{ok}/{len(results)} wallets, {total} {symbol} "
                       f"{'sent' if not self.engine.dry_run else '(dry-run)'}[/bold]")
 
+    async def action_preapprovals(self) -> None:
+        """Activate the Canton transfer pre-approval for every token that is
+        missing one, so incoming tokens are credited without a manual accept."""
+        from .preapproval import (
+            PreapprovalOutcome, approve_selected, fetch_token_approvals,
+        )
+
+        wallet_names = await questionary.checkbox(
+            "Wallets to pre-approve (space to toggle, enter to confirm):",
+            choices=[questionary.Choice(n, checked=False) for n in self.manager.names],
+        ).ask_async()
+        if not wallet_names:
+            console.print("[yellow]No wallet selected.[/yellow]")
+            return
+
+        # Survey first: creating a pre-approval is a ledger transaction that pays
+        # a network fee per token per wallet, so show the real count before arming.
+        console.print("[dim]Reading current pre-approval status…[/dim]")
+        missing: dict[str, list[str]] = {}
+        surveyed = 0
+        for name in wallet_names:
+            try:
+                wallet = self.manager.get(name)
+                await wallet.ensure_auth()
+                tokens = await fetch_token_approvals(wallet)
+            except Exception as exc:  # noqa: BLE001 - per-wallet isolation
+                console.print(f"[{name}] [red]status failed: {exc}[/red]")
+                continue
+            surveyed += 1
+            todo = [t.symbol for t in tokens if not t.active]
+            if todo:
+                missing[name] = todo
+                console.print(
+                    f"[{name}] {len(todo)}/{len(tokens)} missing: {', '.join(todo)}")
+            else:
+                console.print(f"[{name}] [green]all {len(tokens)} active[/green]")
+        if not surveyed:
+            console.print("[red]No wallet could be read.[/red]")
+            return
+        if not missing:
+            console.print("[green]Nothing to do — every token is pre-approved.[/green]")
+            return
+
+        total_tx = sum(len(v) for v in missing.values())
+        console.print(
+            f"[bold]{total_tx} pre-approval(s)[/bold] across {len(missing)} wallet(s). "
+            "[yellow]Each is a ledger transaction and pays a network fee in CC.[/yellow]"
+        )
+        await self._choose_execution_mode()
+
+        def _line(o: PreapprovalOutcome, i: int, n: int) -> None:
+            head = f"[dim]{i}/{n}[/dim] [{o.wallet}]"
+            if o.error:
+                console.print(f"{head} [red]{o.error}[/red]")
+                return
+            tag = "[cyan]dry-run[/cyan]" if o.dry_run else "[green]done[/green]"
+            parts = [f"{tag} {len(o.approved)} approved"]
+            if o.already:
+                parts.append(f"{len(o.already)} already active")
+            if o.failed:
+                parts.append(f"[red]{len(o.failed)} failed[/red]")
+            console.print(f"{head} " + ", ".join(parts))
+            for sym, err in o.failed.items():
+                console.print(f"    [red]{sym}: {err}[/red]")
+
+        results = await approve_selected(
+            self.manager, wallet_names=list(missing), dry_run=self.engine.dry_run,
+            run_state=self.run_state, notifier=self.notifier, on_result=_line,
+        )
+        done = sum(len(o.approved) for o in results)
+        bad = sum(len(o.failed) for o in results) + sum(1 for o in results if o.error)
+        console.print(
+            f"[bold]{done} token(s) pre-approved"
+            f"{' (dry-run)' if self.engine.dry_run else ''}[/bold]"
+            + (f", [red]{bad} failed[/red]" if bad else "")
+        )
+
     async def action_manual_swap(self) -> None:
         name = await questionary.select("Wallet?", choices=self.manager.names).ask_async()
         if not name:
@@ -646,6 +738,7 @@ class App:
             "Swap 1x all pairs": self.action_swap_all,
             "Manual swap": self.action_manual_swap,
             "Withdraw (bulk)": self.action_withdraw,
+            "Transfer pre-approvals (activate all)": self.action_preapprovals,
             "Web check (history + rebates)": self.action_web_check,
             "Wallet status": self.action_wallet_status,
             "Add wallets (bulk import)": self.action_add_wallets,
@@ -672,7 +765,23 @@ async def amain() -> None:
     except ConfigError as exc:
         console.print(f"[red]Config error:[/red] {exc}")
         return
-    app = App(config)
+    # Before any session is built — a session already holding a pool keeps it.
+    # A proxy file wins over the single `proxy`: it is the more specific answer.
+    proxy_map: dict[str, str] = {}
+    try:
+        if config.network.proxy_file:
+            proxies = load_proxies(config.network.proxy_file)
+            proxy_map = assign([w.name for w in config.wallets], proxies)
+            console.print(
+                f"Loaded [bold]{len(proxies)}[/bold] prox(ies) from "
+                f"{config.network.proxy_file}"
+            )
+        else:
+            configure_proxy(config.network.proxy)
+    except (ProxyError, ProxyFileError) as exc:
+        console.print(f"[red]Proxy error:[/red] {exc}")
+        return
+    app = App(config, proxy_map=proxy_map)
     try:
         await app.startup()
         await app.menu()

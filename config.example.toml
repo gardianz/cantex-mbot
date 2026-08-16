@@ -7,6 +7,19 @@ base_url = "https://api.cantex.io"
 # dry_run = true means NO real swaps are submitted (quote + guard only).
 # Set to false only after you have verified everything.
 dry_run = false
+# Route ALL outbound requests (SDK, history, ccview, Telegram) through a proxy.
+# Empty = direct. Overridden by the CANTEX_PROXY env var, so a VPS can set it
+# without editing this file.
+#   http://user:pass@host:8080   native aiohttp, no extra dependency
+#   socks5://127.0.0.1:40000     needs: pip install -e ".[socks]"
+# The socks5 example is WARP's own local proxy mode — use it when the host's
+# egress is captured by a WARP full tunnel that you cannot turn off.
+proxy = ""
+# ...or give EACH WALLET its own egress IP from a list (one proxy per line,
+# line N -> wallet N, wrapping if short). Takes precedence over `proxy`.
+# Copy proxies.example.txt to proxies.txt (gitignored) and set the path here.
+# Needs: pip install -e ".[socks]"   Env override: CANTEX_PROXY_FILE
+proxy_file = ""
 
 [guards]
 # Every swap is rejected if any of these limits is exceeded.

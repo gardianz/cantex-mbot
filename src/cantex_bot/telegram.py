@@ -38,7 +38,7 @@ class TelegramNotifier:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10), trust_env=True,
             )
         return self._session
 
@@ -142,7 +142,8 @@ class TelegramCommandBot:
         if self._session is None or self._session.closed:
             # Total timeout must outlast the server-side long-poll window.
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.poll_timeout + 15)
+                timeout=aiohttp.ClientTimeout(total=self.poll_timeout + 15),
+                trust_env=True,
             )
         return self._session
 

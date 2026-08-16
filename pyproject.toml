@@ -18,6 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only needed for a socks5:// / socks4:// proxy; http:// proxies work natively.
+socks = ["aiohttp-socks>=0.8"]
 dev = [
     "pytest",
     "pytest-asyncio",

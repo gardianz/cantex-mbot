@@ -62,8 +62,14 @@ def _day(value: date | datetime | str) -> str:
 class CCViewClient:
     """Shared, anonymous ccview reader (one session, many parties)."""
 
-    def __init__(self, *, base: str = DEFAULT_CCVIEW_BASE, max_concurrency: int = 3) -> None:
+    def __init__(
+        self, *, base: str = DEFAULT_CCVIEW_BASE, max_concurrency: int = 3,
+        proxy: str | None = None,
+    ) -> None:
         self.base = base.rstrip("/")
+        # One shared reader for all wallets, so it cannot follow a per-wallet
+        # egress: it takes the first proxy in the list (or the single one).
+        self.proxy = proxy
         self._session: aiohttp.ClientSession | None = None
         self._authed = False
         # ccview rate-limits aggressively (HTTP 429). Cap our own concurrency so
@@ -72,10 +78,10 @@ class CCViewClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            from .nethelp import make_timeout, shared_connector
+            from .nethelp import connector_for, make_timeout
             self._session = aiohttp.ClientSession(
-                timeout=make_timeout(), connector=shared_connector(),
-                connector_owner=False,
+                timeout=make_timeout(), connector=connector_for(self.proxy),
+                connector_owner=False, trust_env=True,
                 headers={
                     "User-Agent": "cantex-bot/0.1",
                     "Referer": self.base + "/",

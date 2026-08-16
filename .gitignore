@@ -13,3 +13,6 @@ profiles/
 state.db
 *.db
 *.log
+
+# Proxy list — holds credentials
+proxies.txt

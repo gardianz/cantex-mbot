@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from .ccview import CCViewClient, fee_windows
@@ -57,6 +57,13 @@ class WalletSnap:
     fee_yesterday: Decimal = Decimal(0)
     fee_this_week: Decimal = Decimal(0)
     fee_updated: float = 0.0          # monotonic time of last ccview fee refresh
+    # Fee/loss over the periods the REWARDS actually cover — see _reward_windows.
+    # These, not the plain today/yesterday/week values, are what profit uses.
+    fee_reward_day: Decimal = Decimal(0)
+    fee_reward_week: Decimal = Decimal(0)
+    loss_reward_day: Decimal = Decimal(0)
+    loss_reward_week: Decimal = Decimal(0)
+    reward_day: date | None = None  # the day reb_yesterday actually covers
     reb_yesterday: Decimal = Decimal(0)
     reb_this_week: Decimal = Decimal(0)
     reb_last_week: Decimal = Decimal(0)
@@ -165,6 +172,7 @@ class PortfolioService:
                 snap.base_bal = self._balance(info, base)
                 snap.cc = self._balance(info, self.cc_symbol)
                 snap.tokens = [(sym, self._balance(info, sym)) for sym in self._focus_tokens()]
+                reward_windows = None
                 if wallet.web is not None:
                     trades = await wallet.web.fetch_trading_history()
                     snap.swaps_today = WebClient.count_today(trades)
@@ -186,6 +194,16 @@ class PortfolioService:
                     snap.reb_this_week = reb.this_week
                     snap.reb_last_week = reb.last_week
                     snap.reb_status = reb.last_week_status
+                    snap.reward_day = reb.yesterday_date
+                    # Loss over the exact periods the rewards cover.
+                    day_w, week_w = self._reward_windows(reb)
+                    snap.loss_reward_day = self._to_cc(WebClient.loss_between(
+                        trades, usdcx_symbol=base,
+                        start=day_w[0], end=day_w[1]), cc_price)
+                    snap.loss_reward_week = self._to_cc(WebClient.loss_between(
+                        trades, usdcx_symbol=base,
+                        start=week_w[0], end=week_w[1]), cc_price)
+                    reward_windows = (day_w, week_w)
                 # ccview fees: throttled — reuse the last values until fee_ttl.
                 now_m = time.monotonic()
                 # fee_updated == 0 means "never fetched" — always fetch then, else
@@ -193,15 +211,39 @@ class PortfolioService:
                 # soon after boot) would show no fees for the first ttl seconds.
                 if snap.fee_updated == 0 or now_m - snap.fee_updated >= self.fee_ttl:
                     fw = fee_windows()
-                    snap.fee_today = (await self.ccview.party_fee(info.address, *fw["today"])).fee
-                    snap.fee_yesterday = (await self.ccview.party_fee(info.address, *fw["yesterday"])).fee
-                    snap.fee_this_week = (await self.ccview.party_fee(info.address, *fw["this_week"])).fee
+                    wanted = {
+                        "today": fw["today"],
+                        "yesterday": fw["yesterday"],
+                        "this_week": fw["this_week"],
+                    }
+                    if reward_windows is not None:
+                        wanted["reward_day"], wanted["reward_week"] = reward_windows
+                    # One ccview call per DISTINCT window: when the reward lag is
+                    # one day the reward window equals "yesterday" and costs nothing.
+                    seen: dict[tuple, Decimal] = {}
+                    fees: dict[str, Decimal] = {}
+                    for key, win in wanted.items():
+                        if win not in seen:
+                            seen[win] = (await self.ccview.party_fee(
+                                info.address, *win)).fee
+                        fees[key] = seen[win]
+                    snap.fee_today = fees["today"]
+                    snap.fee_yesterday = fees["yesterday"]
+                    snap.fee_this_week = fees["this_week"]
+                    snap.fee_reward_day = fees.get("reward_day", fees["yesterday"])
+                    snap.fee_reward_week = fees.get("reward_week", fees["this_week"])
                     snap.fee_updated = now_m
                 snap.fee_now = self.store.latest_fee(name)
                 snap.fee_min_today, snap.fee_avg_today, _ = self.store.fee_stats_today(name)
-                # Profit = rebates - (fee + loss), in CC, per window.
-                snap.profit_yesterday = snap.reb_yesterday - (snap.fee_yesterday + snap.loss_yesterday)
-                snap.profit_week = snap.reb_this_week - (snap.fee_this_week + snap.loss_week)
+                # Profit = rebates - (fee + loss), in CC, over the period the
+                # REWARD covers — not today/yesterday/this-week as we would
+                # compute them. Rewards run ~2 days behind, so pairing them with
+                # a self-computed window charges costs against a reward that was
+                # never for them and drags profit negative.
+                snap.profit_yesterday = snap.reb_yesterday - (
+                    snap.fee_reward_day + snap.loss_reward_day)
+                snap.profit_week = snap.reb_this_week - (
+                    snap.fee_reward_week + snap.loss_reward_week)
                 snap.status = "ok"
                 snap.error = None
                 snap.updated = time.monotonic()
@@ -209,6 +251,32 @@ class PortfolioService:
                 snap.status = "error"
                 snap.error = str(exc)
                 logger.warning("portfolio refresh %s failed: %s", name, exc)
+
+    @staticmethod
+    def _reward_windows(reb) -> tuple[tuple[date, date], tuple[date, date]]:
+        """(day_window, week_window) that the two reward figures actually cover.
+
+        Taking the API's dates rather than computing our own keeps this correct
+        whatever the reward lag turns out to be — and the lag is easy to misjudge,
+        since every date here is UTC while a local clock can already be on the
+        next day.
+
+        The day window is the API's own ``date``. The week window runs from the
+        API's ``start_datetime`` to that same day, because the week's reward has
+        only accrued as far as the last computed day: charging it for costs
+        incurred since is what made PROFIT w read negative while the account was
+        in fact ahead. Both fall back to the self-computed windows when the API
+        omits the dates.
+        """
+        fw = fee_windows()
+        day = reb.yesterday_date
+        if day is None:
+            return fw["yesterday"], fw["this_week"]
+        week_start = reb.this_week_start or fw["this_week"][0]
+        # A reward day before the week started (early Monday, or a stale lag)
+        # would invert the range; clamp so the week never runs backwards.
+        week_end = max(day, week_start)
+        return (day, day), (week_start, week_end)
 
     @staticmethod
     def _balance(info, symbol: str) -> Decimal:

@@ -62,6 +62,8 @@ The SDK has no endpoints for trading history, fees, or rebates. All three are re
 | Trading history, CC rebates | [webclient.py](src/cantex_bot/webclient.py) → `api.cantex.io/v1/history/trading`, `/v1/account/reward_activity` | the SDK's Bearer token |
 | On-chain trading fees | [ccview.py](src/cantex_bot/ccview.py) → ccview.io Canton explorer | anonymous ccview `sessionId` cookie |
 
+`reward_activity` also carries the **period each reward covers** (`yesterday.date`, `this_week.start_datetime`) — take the fee/loss windows from those rather than computing them, so they stay right whatever the reward lag is. `this_week` is the trap: it reports the whole Mon–Sun period but has only accrued as far as `yesterday.date`, so charging it for costs incurred since drags PROFIT w negative. `PortfolioService._reward_windows` derives both windows and `profit_*` uses `fee_reward_day`/`loss_reward_week`, never the plain today/yesterday/week values.
+
 The daily swap target counts from the **web history**, not the local counter — `_current_done` takes `max(web today, web-at-start + this run, local counter)` to tolerate the exchange's indexing lag.
 
 `WebClient._loss_over` computes realised loss over complete `base→token→base` cycles with a **FIFO queue per token**, so a `base→A` buy is never closed by an unrelated `B→base` sell. Incomplete cycles are ignored. Positive = loss, negative = gain.
@@ -86,7 +88,7 @@ The daily swap target counts from the **web history**, not the local counter —
 
 ## Conventions
 
-- **UTC everywhere.** Daily counters, swap counts, loss windows, fee windows, and the strategy's day rollover all reset at 00:00 UTC — matching Cantex. A local-date boundary here is a bug (WIB = UTC+7 caused a real one). Weeks are Monday-start, matching Cantex reward periods.
+- **UTC everywhere** — including the dashboard clock, which is labelled `UTC` for a reason: a local clock next to UTC data reads as a different *date* (at WIB it showed the 20th while the rewards were on the 19th, making a normal one-day reward lag look like two). Daily counters, swap counts, loss windows, fee windows, and the strategy's day rollover all reset at 00:00 UTC — matching Cantex. A local-date boundary here is a bug (WIB = UTC+7 caused a real one). Weeks are Monday-start, matching Cantex reward periods.
 - **Dashboard `plan` strings are Indonesian** ("saldo kurang", "proses swap", "tunggu rugi", "swap berhasil"). Match that when adding phases.
 - **Word a loss, don't sign it.** The LOSS column reads negative as a *gain*, so a signed percentage in a status string means the opposite of the same sign in the table.
 - **Per-wallet isolation.** Every sweep/batch catches per wallet (`except Exception  # noqa: BLE001`) so one bad wallet never aborts the rest. Keep that.

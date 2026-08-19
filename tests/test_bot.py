@@ -1428,6 +1428,145 @@ def test_explicit_tag_beats_context(monkeypatch):
     assert ls.recent_logs(10, wallet="w1") == []
 
 
+# -- dashboard clock ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_dashboard_clock_is_utc(monkeypatch):
+    """Every window in this bot is UTC. A local clock in the header reads as a
+    different DATE from the reward/fee data beside it — at UTC+7 the header
+    showed the 20th while the rewards were still on the 19th, which is exactly
+    how a normal one-day reward lag gets misread as two."""
+    import io
+    import time as _t
+    from rich.console import Console as RichConsole
+    from cantex_bot.dashboard import Dashboard
+
+    # 2026-08-19 23:37:50 UTC == 2026-08-20 06:37:50 in WIB.
+    monkeypatch.setattr(_t, "gmtime", lambda *a: _t.struct_time(
+        (2026, 8, 19, 23, 37, 50, 2, 231, 0)))
+    svc = _fake_portfolio()
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
+    buf = io.StringIO()
+    RichConsole(file=buf, width=200).print(Dashboard(svc, config)._header())
+    out = buf.getvalue()
+    assert "2026-08-19 23:37:50 UTC" in out
+    assert "2026-08-20" not in out
+
+
+# -- reward-aligned profit ---------------------------------------------------
+
+def _rebates(**kw):
+    from cantex_bot.webclient import Rebates
+    base = dict(yesterday=Decimal("4.68"), this_week=Decimal("28.08"),
+                last_week=Decimal("3.74"))
+    base.update(kw)
+    return Rebates(**base)
+
+
+@pytest.mark.asyncio
+async def test_rebates_parse_period_dates():
+    """The periods come from the API rather than being computed, so the windows
+    stay right whatever the reward lag is. (The dates are UTC: read from UTC+7 in
+    the local morning, a one-day lag looks like two.)"""
+    from datetime import date
+    from cantex_bot.webclient import WebClient
+    raw = {"rebates": {
+        "yesterday": {"cc_amount": "4.68", "date": "2026-08-18", "status": ""},
+        "this_week": {"cc_amount": "28.08", "status": "Pending - Pays Monday",
+                      "start_datetime": "2026-08-17T00:00:00+00:00",
+                      "end_datetime": "2026-08-23T23:59:59+00:00"},
+        "last_week": {"cc_amount": "3.744", "status": "Paid: 1220",
+                      "start_datetime": "2026-08-10T00:00:00+00:00",
+                      "end_datetime": "2026-08-16T23:59:59+00:00"},
+    }}
+    wc = WebClient(token_provider=AsyncMock(return_value="t"))
+    wc._get_json = AsyncMock(return_value=raw)
+    reb = await wc.fetch_rebates()
+    assert reb.yesterday_date == date(2026, 8, 18)
+    assert reb.this_week_start == date(2026, 8, 17)
+    assert reb.this_week_end == date(2026, 8, 23)
+    assert reb.last_week_start == date(2026, 8, 10)
+
+
+def test_reward_windows_follow_the_api_dates():
+    """Day window = the API's own date; week window ends there too, because the
+    week's reward has only accrued as far as the last computed day."""
+    from datetime import date
+    from cantex_bot.portfolio import PortfolioService
+    day, week = PortfolioService._reward_windows(_rebates(
+        yesterday_date=date(2026, 8, 18), this_week_start=date(2026, 8, 17)))
+    assert day == (date(2026, 8, 18), date(2026, 8, 18))
+    assert week == (date(2026, 8, 17), date(2026, 8, 18))
+
+
+def test_reward_windows_fall_back_without_dates():
+    """Older payloads without dates must keep the previous behaviour."""
+    from cantex_bot.ccview import fee_windows
+    from cantex_bot.portfolio import PortfolioService
+    fw = fee_windows()
+    day, week = PortfolioService._reward_windows(_rebates())
+    assert day == fw["yesterday"] and week == fw["this_week"]
+
+
+def test_reward_week_never_runs_backwards():
+    """A reward day earlier than the week start would invert the range."""
+    from datetime import date
+    from cantex_bot.portfolio import PortfolioService
+    _day, week = PortfolioService._reward_windows(_rebates(
+        yesterday_date=date(2026, 8, 16), this_week_start=date(2026, 8, 17)))
+    assert week[0] <= week[1]
+
+
+def test_loss_between_is_inclusive_on_both_ends():
+    from datetime import date, datetime, timezone
+    from cantex_bot.webclient import WebClient
+
+    def cycle(day, spent, got):
+        base = datetime(2026, 8, day, 12, tzinfo=timezone.utc)
+        return _cycle(base, "CBTC", spent, got)
+
+    trades = cycle(17, "100", "98") + cycle(18, "100", "95") + cycle(19, "100", "90")
+    got = WebClient.loss_between(trades, usdcx_symbol="USDCX",
+                                 start=date(2026, 8, 17), end=date(2026, 8, 18))
+    assert got == Decimal("7")          # 2 + 5, the 19th excluded
+
+
+@pytest.mark.asyncio
+async def test_profit_uses_reward_windows_not_calendar_windows(monkeypatch):
+    """Regression for the negative PROFIT w: the week's reward has only accrued
+    to the last computed day, so fees incurred since must not be charged to it."""
+    from datetime import date
+    from cantex_bot.ccview import PartyFee
+    from cantex_bot.portfolio import PortfolioService
+    from cantex_bot.webclient import Rebates
+
+    svc = _fake_portfolio()
+    # ccview answers per window so we can prove which one profit used.
+    per_window = {
+        (date(2026, 8, 18), date(2026, 8, 18)): Decimal("2"),    # reward day
+        (date(2026, 8, 17), date(2026, 8, 18)): Decimal("5"),    # reward week
+    }
+
+    async def _fee(addr, start, end):
+        return PartyFee(per_window.get((start, end), Decimal("999")), start, end)
+
+    svc.ccview = SimpleNamespace(party_fee=_fee)
+    wallet = svc.manager.get("w1")
+    wallet.web.fetch_rebates = AsyncMock(return_value=Rebates(
+        yesterday=Decimal("10"), this_week=Decimal("40"), last_week=Decimal("1"),
+        yesterday_date=date(2026, 8, 18), this_week_start=date(2026, 8, 17),
+        this_week_end=date(2026, 8, 23)))
+    monkeypatch.setattr(PortfolioService, "_to_cc", staticmethod(lambda amt, price: amt))
+
+    await svc.refresh_all()
+    s = svc.snaps["w1"]
+    assert s.reward_day == date(2026, 8, 18)
+    assert s.fee_reward_day == Decimal("2") and s.fee_reward_week == Decimal("5")
+    assert s.profit_yesterday == Decimal("8")    # 10 - (2 + 0), NOT 10 - 999
+    assert s.profit_week == Decimal("35")        # 40 - (5 + 0)
+
+
 # -- dashboard render smoke --------------------------------------------------
 
 @pytest.mark.asyncio

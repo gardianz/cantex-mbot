@@ -18,7 +18,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import aiohttp
@@ -49,11 +49,28 @@ class Trade:
 
 @dataclass(frozen=True)
 class Rebates:
+    """CC rewards, with the periods the API says each amount covers.
+
+    The dates matter. ``yesterday`` is the last day whose reward has been
+    computed, in **UTC** — reading it from UTC+7 in the local morning, it looks
+    two days behind when it is really one. ``this_week`` is trickier: it reports
+    the whole Mon–Sun period, but the amount has only accrued as far as
+    ``yesterday``'s date, so it must not be compared against costs incurred
+    since. Callers should take the windows from these dates rather than
+    computing their own.
+    """
+
     yesterday: Decimal
     this_week: Decimal
     last_week: Decimal
     this_week_status: str = ""
     last_week_status: str = ""
+    # Period each amount covers, straight from the API (None if absent).
+    yesterday_date: date | None = None
+    this_week_start: date | None = None
+    this_week_end: date | None = None
+    last_week_start: date | None = None
+    last_week_end: date | None = None
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -76,6 +93,23 @@ def _dec(v: object) -> Decimal:
         return Decimal(str(v))
     except (InvalidOperation, ValueError):
         return Decimal(0)
+
+
+def _as_date(raw: object) -> date | None:
+    """'2026-08-18' or '2026-08-17T00:00:00+00:00' -> a UTC date. None if absent
+    or unparseable — callers fall back to their own windows."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    try:
+        if "T" in s:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).date()
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
 
 
 class WebClient:
@@ -270,6 +304,16 @@ class WebClient:
             trades, usdcx_symbol, lambda t: t.timestamp.date() == target)
 
     @staticmethod
+    def loss_between(
+        trades: list[Trade], *, usdcx_symbol: str, start: date, end: date,
+    ) -> Decimal:
+        """Loss over complete cycles closed between ``start`` and ``end`` (UTC
+        dates, both inclusive). Used to line a fee/loss window up with the exact
+        period a reward covers, rather than a window we computed ourselves."""
+        return WebClient._loss_over(
+            trades, usdcx_symbol, lambda t: start <= t.timestamp.date() <= end)
+
+    @staticmethod
     def weekly_loss(
         trades: list[Trade], *, usdcx_symbol: str = "USDCX",
         now: datetime | None = None,
@@ -298,10 +342,18 @@ class WebClient:
         def status(k: str) -> str:
             return str(reb.get(k, {}).get("status", ""))
 
+        def day(k: str, field: str) -> date | None:
+            return _as_date(reb.get(k, {}).get(field))
+
         return Rebates(
             yesterday=amt("yesterday"),
             this_week=amt("this_week"),
             last_week=amt("last_week"),
             this_week_status=status("this_week"),
             last_week_status=status("last_week"),
+            yesterday_date=day("yesterday", "date"),
+            this_week_start=day("this_week", "start_datetime"),
+            this_week_end=day("this_week", "end_datetime"),
+            last_week_start=day("last_week", "start_datetime"),
+            last_week_end=day("last_week", "end_datetime"),
         )

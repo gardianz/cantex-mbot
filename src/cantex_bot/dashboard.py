@@ -175,7 +175,11 @@ class Dashboard:
     def _header(self) -> Table:
         net = self.config.network
         mode, mstyle = ("DRY-RUN", "bold green") if net.dry_run else ("● LIVE", "bold red")
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        # UTC, like every window in this bot (daily counters, reward periods,
+        # fee windows). A local clock here reads as a different DATE from the
+        # data beside it — at WIB (UTC+7) the header says the 20th while the
+        # rewards are still on the 19th.
+        now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         grid = Table.grid(expand=True, padding=(0, 1))
         grid.add_column(justify="left", ratio=1)
         grid.add_column(justify="right")

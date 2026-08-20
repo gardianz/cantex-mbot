@@ -66,6 +66,8 @@ The SDK has no endpoints for trading history, fees, or rebates. All three are re
 
 The daily swap target counts from the **web history**, not the local counter — `_current_done` takes `max(web today, web-at-start + this run, local counter)` to tolerate the exchange's indexing lag.
 
+`fetch_trading_history` pages by `offset`, and two rules keep the window whole: **advance by the rows returned, not `page_limit`** (the endpoint caps a page well below what you ask for), and **a short page is not the last page**. Getting either wrong truncates history to roughly one page — which only shows up once a wallet has done a full day of swaps, as the week's loss collapsing onto today's. `PortfolioService` caches the pages (`history_ttl`) and asks for only `_cover_days()`, back to this week's Monday.
+
 `WebClient._loss_over` computes realised loss over complete `base→token→base` cycles with a **FIFO queue per token**, so a `base→A` buy is never closed by an unrelated `B→base` sell. Incomplete cycles are ignored. Positive = loss, negative = gain.
 
 ### Dashboard never fetches

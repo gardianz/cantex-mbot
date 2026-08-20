@@ -141,6 +141,13 @@ class PortfolioService:
         # panel lists ALL pairs, not just the ones actually swapped.
         self.fee_probe_interval = 90.0
         self._last_fee_probe = 0.0
+        # Covering the whole week costs several history pages per wallet (the
+        # endpoint caps a page well below the limit we ask for). Refetching that
+        # every sweep, for every wallet, is what turns a working setup into
+        # connect timeouts — so hold the pages briefly. Slightly stale swap
+        # counts are worth far more than a sweep that cannot finish.
+        self.history_ttl = 60.0
+        self._history: dict[str, tuple[float, list]] = {}
 
     # -- one wallet ----------------------------------------------------------
 
@@ -159,6 +166,29 @@ class PortfolioService:
         with wallet_logs(name):
             await self._refresh_wallet(name)
 
+    @staticmethod
+    def _cover_days(now: datetime | None = None) -> int:
+        """Days of history the loss windows actually need.
+
+        The furthest any window reaches is this week's Monday (the weekly loss
+        and the reward week both start there); yesterday and a day of margin
+        cover the reward lag. Asking for a fixed 8 days would page back through
+        days nothing reads.
+        """
+        today = (now or datetime.now(timezone.utc)).date()
+        return max(3, today.weekday() + 2)
+
+    async def _trades_for(self, name: str, wallet) -> list:
+        """This wallet's trading history, cached for ``history_ttl`` seconds."""
+        now = time.monotonic()
+        hit = self._history.get(name)
+        if hit is not None and now - hit[0] < self.history_ttl:
+            return hit[1]
+        trades = await wallet.web.fetch_trading_history(
+            cover_days=self._cover_days())
+        self._history[name] = (now, trades)
+        return trades
+
     async def _refresh_wallet(self, name: str) -> None:
         snap = self.snaps[name]
         wallet = self.manager.get(name)
@@ -174,7 +204,7 @@ class PortfolioService:
                 snap.tokens = [(sym, self._balance(info, sym)) for sym in self._focus_tokens()]
                 reward_windows = None
                 if wallet.web is not None:
-                    trades = await wallet.web.fetch_trading_history()
+                    trades = await self._trades_for(name, wallet)
                     snap.swaps_today = WebClient.count_today(trades)
                     snap.swaps_24h = WebClient.count_since(trades, _DAY)
                     snap.swaps_7d = WebClient.count_since(trades, _WEEK)

@@ -1454,6 +1454,149 @@ async def test_dashboard_clock_is_utc(monkeypatch):
     assert "2026-08-20" not in out
 
 
+# -- trading-history paging --------------------------------------------------
+
+def _hist_row(dt, inp="USDCx", out="CBTC", ain="100", aout="1", cid="p"):
+    return {"timestamp_utc": dt.strftime("%Y-%m-%d %H:%M:%S.%f+00"),
+            "token_input_instrument_id": inp, "token_input_instrument_admin": "a",
+            "token_output_instrument_id": out, "token_output_instrument_admin": "b",
+            "amount_input": ain, "amount_output": aout, "pool_cid": cid}
+
+
+def _paging_client(rows, *, server_cap=50, honour_offset=True):
+    """A WebClient whose endpoint caps the page BELOW the requested limit — the
+    real behaviour that truncated the history window."""
+    from urllib.parse import parse_qs, urlparse
+    from cantex_bot.webclient import WebClient
+    calls = []
+
+    async def _get_json(path, **kw):
+        q = parse_qs(urlparse(path).query)
+        offset = int(q["offset"][0])
+        limit = int(q["limit"][0])
+        calls.append((offset, limit))
+        if not honour_offset:
+            offset = 0                       # endpoint ignores paging
+        page = rows[offset:offset + min(limit, server_cap)]
+        return {"history_trading": page}
+
+    wc = WebClient(token_provider=AsyncMock(return_value="t"))
+    wc._get_json = _get_json
+    return wc, calls
+
+
+@pytest.mark.asyncio
+async def test_history_pages_past_a_server_capped_page():
+    """Regression: the endpoint caps the page below page_limit, and treating a
+    short page as the last page stopped the walk after ~50 rows. Once a wallet
+    had done a full day of swaps that one page WAS today, so the week's loss
+    collapsed onto today's."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(hour=12)
+    # 4 days x 50 swaps, newest first.
+    rows = [_hist_row(now - timedelta(days=d, seconds=i))
+            for d in range(4) for i in range(50)]
+    wc, calls = _paging_client(rows, server_cap=50)
+    trades = await wc.fetch_trading_history(page_limit=200, cover_days=8)
+    assert len(trades) == 200                     # not truncated to one page
+    assert {t.timestamp.date() for t in trades} == {
+        (now - timedelta(days=d)).date() for d in range(4)}
+    # Offsets advance by rows RECEIVED (50), never by page_limit (200).
+    assert [o for o, _ in calls][:4] == [0, 50, 100, 150]
+
+
+@pytest.mark.asyncio
+async def test_history_offset_advances_by_rows_received():
+    """Stepping by page_limit while the server returns fewer would skip the rows
+    in between — a silent hole in the middle of the window."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(hour=12)
+    rows = [_hist_row(now - timedelta(minutes=i), cid=f"p{i}") for i in range(120)]
+    wc, _calls = _paging_client(rows, server_cap=50)
+    trades = await wc.fetch_trading_history(page_limit=200, cover_days=8)
+    assert len(trades) == 120                     # every row, no gap
+    assert len({t.pool_cid for t in trades}) == 120
+
+
+@pytest.mark.asyncio
+async def test_history_stops_when_endpoint_ignores_offset():
+    """An endpoint that repeats page one must not loop max_pages times."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(hour=12)
+    rows = [_hist_row(now - timedelta(minutes=i), cid=f"p{i}") for i in range(120)]
+    wc, calls = _paging_client(rows, server_cap=50, honour_offset=False)
+    trades = await wc.fetch_trading_history(page_limit=200, max_pages=12)
+    assert len(trades) == 50 and len(calls) == 2   # second page adds nothing
+
+
+@pytest.mark.asyncio
+async def test_history_stops_at_cover_days_and_on_empty():
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(hour=12)
+    rows = [_hist_row(now - timedelta(days=d, seconds=i))
+            for d in range(30) for i in range(50)]
+    wc, calls = _paging_client(rows, server_cap=50)
+    trades = await wc.fetch_trading_history(page_limit=200, cover_days=3, max_pages=12)
+    oldest = min(t.timestamp for t in trades)
+    assert oldest < now - timedelta(days=3)        # walked just past the cutoff
+    assert len(calls) <= 6                          # and stopped there
+
+    wc2, calls2 = _paging_client([], server_cap=50)
+    assert await wc2.fetch_trading_history() == [] and len(calls2) == 1
+
+
+@pytest.mark.asyncio
+async def test_weekly_loss_exceeds_daily_once_history_is_complete():
+    """End-to-end shape of the bug: with the full window the week's loss covers
+    more than today's, instead of collapsing onto it."""
+    from datetime import datetime, timedelta, timezone
+    from cantex_bot.webclient import WebClient
+    now = datetime.now(timezone.utc).replace(hour=12)
+    # One losing cycle today and one yesterday, both inside this week.
+    if now.weekday() == 0:          # Monday: yesterday is last week, shift a day
+        now = now + timedelta(days=1)
+    trades = _cycle(now, "CBTC", "100", "98") + _cycle(now - timedelta(days=1),
+                                                       "CBTC", "100", "95")
+    day = WebClient.daily_loss(trades, usdcx_symbol="USDCx", day=now)
+    week = WebClient.weekly_loss(trades, usdcx_symbol="USDCx", now=now)
+    assert day == Decimal("2")
+    assert week == Decimal("7") and week > day
+
+
+@pytest.mark.parametrize("weekday,expected", [
+    (0, 3),   # Monday: today + yesterday + margin
+    (3, 5),   # Thursday: back to Monday + margin
+    (6, 8),   # Sunday: the whole week + margin
+])
+def test_cover_days_reaches_this_weeks_monday(weekday, expected):
+    """Paging further back than any window reads is pure load."""
+    from datetime import datetime, timedelta, timezone
+    from cantex_bot.portfolio import PortfolioService
+    monday = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)   # a Monday
+    day = monday + timedelta(days=weekday)
+    assert day.weekday() == weekday
+    assert PortfolioService._cover_days(day) == expected
+
+
+@pytest.mark.asyncio
+async def test_history_is_cached_between_sweeps():
+    """Covering the week costs several pages per wallet; refetching that every
+    sweep is what pushed the load into connect timeouts."""
+    svc = _fake_portfolio()
+    wallet = svc.manager.get("w1")
+    wallet.web.fetch_trading_history = AsyncMock(return_value=[])
+    await svc.refresh_all()
+    await svc.refresh_all()
+    assert wallet.web.fetch_trading_history.await_count == 1   # second sweep cached
+    svc.history_ttl = 0                                        # expire it
+    await svc.refresh_all()
+    assert wallet.web.fetch_trading_history.await_count == 2
+    # And it asks only for the days the windows actually need.
+    from cantex_bot.portfolio import PortfolioService
+    kwargs = wallet.web.fetch_trading_history.await_args.kwargs
+    assert kwargs["cover_days"] == PortfolioService._cover_days()
+
+
 # -- reward-aligned profit ---------------------------------------------------
 
 def _rebates(**kw):
@@ -1821,16 +1964,21 @@ def _hrow(i: int) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_fetch_history_pages_until_short():
+async def test_fetch_history_pages_until_empty():
+    """A SHORT page does not end the walk — the server caps pages below the
+    requested limit, so only an empty page (or one adding nothing) ends it. The
+    next offset is the rows received so far, not a multiple of page_limit."""
     from cantex_bot.webclient import WebClient
     wc = WebClient(token_provider=AsyncMock(return_value="t"))
     page1 = {"history_trading": [_hrow(i) for i in range(200)]}
     page2 = {"history_trading": [_hrow(i) for i in range(200, 205)]}
-    wc._get_json = AsyncMock(side_effect=[page1, page2])  # type: ignore[method-assign]
+    page3 = {"history_trading": []}
+    wc._get_json = AsyncMock(side_effect=[page1, page2, page3])  # type: ignore[method-assign]
     trades = await wc.fetch_trading_history()
     assert len(trades) == 205
-    assert wc._get_json.await_count == 2  # full page -> page 2; short page -> stop
+    assert wc._get_json.await_count == 3
     wc._get_json.assert_any_await("/v1/history/trading?limit=200&offset=200")
+    wc._get_json.assert_any_await("/v1/history/trading?limit=200&offset=205")
 
 
 @pytest.mark.asyncio

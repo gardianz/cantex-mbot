@@ -141,13 +141,7 @@ class PortfolioService:
         # panel lists ALL pairs, not just the ones actually swapped.
         self.fee_probe_interval = 90.0
         self._last_fee_probe = 0.0
-        # Covering the whole week costs several history pages per wallet (the
-        # endpoint caps a page well below the limit we ask for). Refetching that
-        # every sweep, for every wallet, is what turns a working setup into
-        # connect timeouts — so hold the pages briefly. Slightly stale swap
-        # counts are worth far more than a sweep that cannot finish.
-        self.history_ttl = 60.0
-        self._history: dict[str, tuple[float, list]] = {}
+
 
     # -- one wallet ----------------------------------------------------------
 
@@ -166,29 +160,6 @@ class PortfolioService:
         with wallet_logs(name):
             await self._refresh_wallet(name)
 
-    @staticmethod
-    def _cover_days(now: datetime | None = None) -> int:
-        """Days of history the loss windows actually need.
-
-        The furthest any window reaches is this week's Monday (the weekly loss
-        and the reward week both start there); yesterday and a day of margin
-        cover the reward lag. Asking for a fixed 8 days would page back through
-        days nothing reads.
-        """
-        today = (now or datetime.now(timezone.utc)).date()
-        return max(3, today.weekday() + 2)
-
-    async def _trades_for(self, name: str, wallet) -> list:
-        """This wallet's trading history, cached for ``history_ttl`` seconds."""
-        now = time.monotonic()
-        hit = self._history.get(name)
-        if hit is not None and now - hit[0] < self.history_ttl:
-            return hit[1]
-        trades = await wallet.web.fetch_trading_history(
-            cover_days=self._cover_days())
-        self._history[name] = (now, trades)
-        return trades
-
     async def _refresh_wallet(self, name: str) -> None:
         snap = self.snaps[name]
         wallet = self.manager.get(name)
@@ -204,21 +175,30 @@ class PortfolioService:
                 snap.tokens = [(sym, self._balance(info, sym)) for sym in self._focus_tokens()]
                 reward_windows = None
                 if wallet.web is not None:
-                    trades = await self._trades_for(name, wallet)
-                    snap.swaps_today = WebClient.count_today(trades)
-                    snap.swaps_24h = WebClient.count_since(trades, _DAY)
-                    snap.swaps_7d = WebClient.count_since(trades, _WEEK)
-                    # Loss over each window in the active base currency, then
-                    # converted to CC (base = USDCX unless a strategy set another).
+                    # The endpoint only ever returns the 50 newest rows, so a
+                    # poll is a SAMPLE, not the history. Mirror it and read every
+                    # window back from the mirror, which accumulates across
+                    # sweeps into the days the endpoint will not serve.
+                    poll = await wallet.web.fetch_trading_history()
+                    self.store.record_trades(name, poll)
+                    today = datetime.now(timezone.utc).date()
+                    yesterday = today - timedelta(days=1)
+                    week_start = today - timedelta(days=today.weekday())
                     base = self._active_base()
                     cc_price = await self._ensure_cc_price(wallet, base)
-                    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-                    snap.loss_today = self._to_cc(WebClient.daily_loss(
-                        trades, usdcx_symbol=base), cc_price)
-                    snap.loss_yesterday = self._to_cc(WebClient.daily_loss(
-                        trades, usdcx_symbol=base, day=yesterday), cc_price)
-                    snap.loss_week = self._to_cc(WebClient.weekly_loss(
-                        trades, usdcx_symbol=base), cc_price)
+                    snap.swaps_today = self.store.count_trades(name, today, today)
+                    snap.swaps_24h = snap.swaps_today
+                    snap.swaps_7d = self.store.count_trades(
+                        name, today - timedelta(days=6), today)
+                    snap.loss_today = self._to_cc(WebClient.loss_between(
+                        self.store.trades_between(name, today, today),
+                        usdcx_symbol=base, start=today, end=today), cc_price)
+                    snap.loss_yesterday = self._to_cc(WebClient.loss_between(
+                        self.store.trades_between(name, yesterday, yesterday),
+                        usdcx_symbol=base, start=yesterday, end=yesterday), cc_price)
+                    snap.loss_week = self._to_cc(WebClient.loss_between(
+                        self.store.trades_between(name, week_start, today),
+                        usdcx_symbol=base, start=week_start, end=today), cc_price)
                     reb = await wallet.web.fetch_rebates()
                     snap.reb_yesterday = reb.yesterday
                     snap.reb_this_week = reb.this_week
@@ -228,11 +208,11 @@ class PortfolioService:
                     # Loss over the exact periods the rewards cover.
                     day_w, week_w = self._reward_windows(reb)
                     snap.loss_reward_day = self._to_cc(WebClient.loss_between(
-                        trades, usdcx_symbol=base,
-                        start=day_w[0], end=day_w[1]), cc_price)
+                        self.store.trades_between(name, *day_w),
+                        usdcx_symbol=base, start=day_w[0], end=day_w[1]), cc_price)
                     snap.loss_reward_week = self._to_cc(WebClient.loss_between(
-                        trades, usdcx_symbol=base,
-                        start=week_w[0], end=week_w[1]), cc_price)
+                        self.store.trades_between(name, *week_w),
+                        usdcx_symbol=base, start=week_w[0], end=week_w[1]), cc_price)
                     reward_windows = (day_w, week_w)
                 # ccview fees: throttled — reuse the last values until fee_ttl.
                 now_m = time.monotonic()

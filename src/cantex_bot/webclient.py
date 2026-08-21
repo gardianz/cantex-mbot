@@ -192,58 +192,21 @@ class WebClient:
             pool_cid=row.get("pool_cid", ""),
         )
 
-    async def fetch_trading_history(
-        self, *, page_limit: int = 200, max_pages: int = 12, cover_days: int = 8,
-    ) -> list[Trade]:
-        """Recent trades (newest first), paged back until ``cover_days`` is covered.
+    async def fetch_trading_history(self) -> list[Trade]:
+        """The newest slice of this wallet's trading history.
 
-        The weekly loss needs more than one page, so this pages by ``offset``.
-        Two rules matter, and getting either wrong silently truncates the window
-        to roughly the last page — which shows up as the week's loss collapsing
-        onto today's once a wallet has done a full day of swaps:
-
-        * **Advance by the rows actually returned, not by ``page_limit``.** The
-          endpoint caps the page below what we ask for, so stepping by
-          ``page_limit`` would skip everything between the cap and the limit.
-        * **A short page is not the last page.** It just means the server capped
-          it. Only an empty page, or one that adds no new rows, ends the walk.
-
-        Stops on: an empty page, a page that adds nothing new (an endpoint
-        ignoring ``offset`` repeats page one — dedup catches that), the oldest
-        row seen predating ``cover_days``, or ``max_pages``.
+        The endpoint hard-caps at 50 rows and ignores both ``limit`` and
+        ``offset`` (measured 2026-08-21: every combination returned the same 50
+        rows, all from the current day), and the response carries no total or
+        cursor. So there is no paging to do and no way to reach older days —
+        anything wider than the last 50 trades has to come from the local mirror
+        that ``Store.record_trades`` builds up, sweep by sweep.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(days=cover_days)
-        trades: list[Trade] = []
-        seen: set[tuple] = set()
-        offset = 0
-        for _ in range(max_pages):
-            path = (f"/v1/history/trading?limit={page_limit}"
-                    f"&offset={offset}")
-            data = await self._get_json(path)
-            if not isinstance(data, dict):
-                raise WebClientError("history: unexpected payload")
-            rows = data.get("history_trading", [])
-            if not rows:
-                break
-            offset += len(rows)      # what the server gave, not what we asked
-            new_in_page = 0
-            oldest: datetime | None = None
-            for row in rows:
-                t = self._row_to_trade(row)
-                key = (row.get("timestamp_utc", ""), t.pool_cid,
-                       str(t.amount_input), str(t.amount_output),
-                       t.input_id, t.output_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                trades.append(t)
-                new_in_page += 1
-                oldest = t.timestamp if oldest is None else min(oldest, t.timestamp)
-            if new_in_page == 0:
-                break                # paging ignored, or history exhausted
-            if oldest is not None and oldest < cutoff:
-                break
-        return trades
+        data = await self._get_json("/v1/history/trading")
+        if not isinstance(data, dict):
+            raise WebClientError("history: unexpected payload")
+        return [self._row_to_trade(row)
+                for row in data.get("history_trading", [])]
 
     @staticmethod
     def count_today(trades: list[Trade], *, day: datetime | None = None) -> int:
@@ -251,10 +214,6 @@ class WebClient:
         target = (day or datetime.now(timezone.utc)).date()
         return sum(1 for t in trades if t.timestamp.date() == target)
 
-    @staticmethod
-    def count_since(trades: list[Trade], seconds: float) -> int:
-        cutoff = datetime.now(timezone.utc).timestamp() - seconds
-        return sum(1 for t in trades if t.timestamp.timestamp() >= cutoff)
 
     @staticmethod
     def _loss_over(
@@ -322,20 +281,6 @@ class WebClient:
         return WebClient._loss_over(
             trades, usdcx_symbol, lambda t: start <= t.timestamp.date() <= end)
 
-    @staticmethod
-    def weekly_loss(
-        trades: list[Trade], *, usdcx_symbol: str = "USDCX",
-        now: datetime | None = None,
-    ) -> Decimal:
-        """USDCX lost over THIS week's (UTC) complete cycles.
-
-        The week is Monday-00:00 UTC through now — the same Monday-start period
-        Cantex uses for rewards. See ``_loss_over`` for the cycle rule.
-        """
-        today = (now or datetime.now(timezone.utc)).date()
-        week_start = today - timedelta(days=today.weekday())   # Monday (UTC)
-        return WebClient._loss_over(
-            trades, usdcx_symbol, lambda t: t.timestamp.date() >= week_start)
 
     # -- CC rebates (weekly reward) ------------------------------------------
 

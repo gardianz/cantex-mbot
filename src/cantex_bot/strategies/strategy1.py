@@ -430,8 +430,13 @@ class Strategy1(Strategy):
         if cached and now - cached[0] < ttl:
             return cached[1]
         try:
+            # The endpoint returns only the 50 newest rows, so at a target of 50
+            # or more it can no longer see the whole day. Mirror each poll and
+            # count from the mirror, which keeps the rows that fell off.
             trades = await wallet.web.fetch_trading_history()
-            val = WebClient.count_today(trades)
+            self.store.record_trades(wallet.name, trades)
+            today = datetime.now(timezone.utc).date()
+            val = self.store.count_trades(wallet.name, today, today)
         except WebClientError as exc:
             logger.warning("[%s] web history fetch failed: %s", wallet.name, exc)
             val = cached[1] if cached else 0
@@ -449,7 +454,11 @@ class Strategy1(Strategy):
             return cached[1]
         try:
             trades = await wallet.web.fetch_trading_history()
-            val = WebClient.daily_loss(trades, usdcx_symbol=self.base_symbol)
+            self.store.record_trades(wallet.name, trades)
+            today = datetime.now(timezone.utc).date()
+            val = WebClient.loss_between(
+                self.store.trades_between(wallet.name, today, today),
+                usdcx_symbol=self.base_symbol, start=today, end=today)
         except WebClientError as exc:
             logger.debug("[%s] loss fetch failed: %s", wallet.name, exc)
             val = cached[1] if cached else Decimal(0)

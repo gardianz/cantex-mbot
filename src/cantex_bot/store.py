@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS scrape_snapshots (
     data    TEXT NOT NULL                -- JSON blob
 );
 CREATE INDEX IF NOT EXISTS idx_snap_wallet_kind_ts ON scrape_snapshots (wallet, kind, ts);
+
+-- Mirror of the exchange's trading history.
+--
+-- GET /v1/history/trading hard-caps at the 50 newest rows and ignores both
+-- limit and offset (measured 2026-08-21), so the week's loss cannot be read
+-- from it at all, and at 50 swaps/day even today's rows start falling off.
+-- The sweep runs every 30-60s and a wallet trades far slower than 50 rows per
+-- sweep, so mirroring what each poll returns rebuilds the full history locally.
+-- The primary key makes re-inserting the same row a no-op.
+CREATE TABLE IF NOT EXISTS trades (
+    wallet        TEXT NOT NULL,
+    ts            REAL NOT NULL,           -- UTC epoch seconds
+    day           TEXT NOT NULL,           -- YYYY-MM-DD (UTC)
+    input_id      TEXT NOT NULL,
+    output_id     TEXT NOT NULL,
+    amount_input  TEXT NOT NULL,
+    amount_output TEXT NOT NULL,
+    pool_cid      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (wallet, ts, pool_cid, input_id, output_id,
+                 amount_input, amount_output)
+);
+CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades (wallet, ts);
+CREATE INDEX IF NOT EXISTS idx_trades_wallet_day ON trades (wallet, day);
 
 CREATE TABLE IF NOT EXISTS fee_obs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +127,11 @@ class Store:
                 "UPDATE fee_obs SET pair = UPPER(pair) WHERE pair <> UPPER(pair)")
             cutoff = (datetime.now(timezone.utc).date() - timedelta(days=2)).isoformat()
             self._conn.execute("DELETE FROM fee_obs WHERE day < ?", (cutoff,))
+            # The mirror only ever needs back to this week's Monday; keep a
+            # generous margin and drop the rest so it cannot grow without bound.
+            old_trades = (datetime.now(timezone.utc).date()
+                          - timedelta(days=60)).isoformat()
+            self._conn.execute("DELETE FROM trades WHERE day < ?", (old_trades,))
             self._conn.commit()
 
     def close(self) -> None:
@@ -221,6 +249,70 @@ class Store:
         out = json.loads(row["data"])
         out["_scraped_at"] = datetime.fromtimestamp(row["ts"], tz=timezone.utc).isoformat()
         return out
+
+    # -- mirrored trading history --------------------------------------------
+
+    def record_trades(self, wallet: str, trades) -> int:
+        """Mirror the rows a history poll returned. Returns how many were NEW.
+
+        Idempotent: the same row seen by the next poll is ignored, so this can
+        be called on every sweep.
+        """
+        rows = [
+            (wallet, t.timestamp.timestamp(),
+             t.timestamp.astimezone(timezone.utc).date().isoformat(),
+             t.input_id, t.output_id,
+             str(t.amount_input), str(t.amount_output), t.pool_cid or "")
+            for t in trades
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            before = self._conn.total_changes
+            self._conn.executemany(
+                """INSERT OR IGNORE INTO trades
+                   (wallet, ts, day, input_id, output_id, amount_input,
+                    amount_output, pool_cid)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+            self._conn.commit()
+            return self._conn.total_changes - before
+
+    def trades_between(self, wallet: str, start: "date", end: "date") -> list:
+        """Mirrored trades for a wallet between two UTC dates, both inclusive,
+        oldest first — as ``webclient.Trade`` objects so the loss helpers can
+        consume them unchanged."""
+        from .webclient import Trade
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT ts, input_id, output_id, amount_input, amount_output,
+                          pool_cid
+                   FROM trades WHERE wallet = ? AND day BETWEEN ? AND ?
+                   ORDER BY ts""",
+                (wallet, start.isoformat(), end.isoformat()),
+            ).fetchall()
+        return [
+            Trade(
+                timestamp=datetime.fromtimestamp(r["ts"], tz=timezone.utc),
+                input_id=r["input_id"], input_admin="",
+                output_id=r["output_id"], output_admin="",
+                amount_input=Decimal(r["amount_input"]),
+                amount_output=Decimal(r["amount_output"]),
+                pool_cid=r["pool_cid"],
+            )
+            for r in rows
+        ]
+
+    def count_trades(self, wallet: str, start: "date", end: "date") -> int:
+        """Mirrored trade count between two UTC dates, both inclusive."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM trades "
+                "WHERE wallet = ? AND day BETWEEN ? AND ?",
+                (wallet, start.isoformat(), end.isoformat()),
+            ).fetchone()
+        return int(row["c"]) if row else 0
 
     # -- network-fee observations --------------------------------------------
 

@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 _SDK_TIMEOUT = make_timeout()
 
+# Ceiling on one authenticate(). The SDK retries each of its three auth requests
+# four times, so a bad network path can keep it busy for minutes — and it holds
+# an asyncio lock throughout, which parks every other caller for that wallet.
+# Better to fail the attempt and let the caller retry than to hang for ever.
+_AUTH_TIMEOUT = 90.0
+
 
 class Wallet:
     """A single wallet: config + trading SDK + web reader.
@@ -66,7 +72,13 @@ class Wallet:
             if self.authed:
                 return
             self._seed_session()
-            await self.sdk.authenticate()
+            try:
+                await asyncio.wait_for(self.sdk.authenticate(),
+                                       timeout=_AUTH_TIMEOUT)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"authenticate timed out after {_AUTH_TIMEOUT:.0f}s"
+                ) from exc
             self.authed = True
 
     def __repr__(self) -> str:

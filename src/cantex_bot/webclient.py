@@ -126,6 +126,8 @@ class WebClient:
         self._token_provider = token_provider
         self.proxy = proxy   # must match the wallet's SDK egress
         self._session: aiohttp.ClientSession | None = None
+        self._token: str | None = None
+        self._token_lock = asyncio.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -142,29 +144,54 @@ class WebClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _bearer(self, *, force: bool = False) -> str:
+        """The Bearer token, cached.
+
+        ``token_provider`` is the SDK's ``authenticate``, which makes a network
+        probe (``GET /v1/account/info``) on every call and holds an asyncio lock
+        across it. Calling it per request therefore doubled the request count
+        AND serialised every caller — including the trading loop, which shares
+        that lock — behind one slow probe. A wallet could sit on
+        "Authenticating with Cantex API..." for the best part of an hour.
+
+        So authenticate once and reuse the token; only go back for a new one
+        when the API actually rejects it.
+        """
+        async with self._token_lock:
+            if force or self._token is None:
+                self._token = await self._token_provider()
+            return self._token
+
     async def _get_json(self, path: str, *, retries: int = 2) -> object:
         """GET a JSON endpoint with the Bearer token, retrying transient
         connection timeouts (WSL2/NAT can stall a fresh connection)."""
-        token = await self._token_provider()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "cantex-bot/0.1",
-        }
         url = f"{self.api_base}{path}"
         session = await self._get_session()
         last_exc: Exception | None = None
+        refreshed = False
         for attempt in range(retries + 1):
+            token = await self._bearer()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "cantex-bot/0.1",
+            }
             try:
                 async with session.get(url, headers=headers) as resp:
                     body = await resp.text()
-                    if resp.status in (401, 403):
-                        raise WebClientError(
-                            f"unauthorised ({resp.status}) — api key expired? {url}"
-                        )
-                    if resp.status >= 400:
-                        raise WebClientError(
-                            f"HTTP {resp.status} from {url}: {body[:200]}"
-                        )
+                    status = resp.status
+                if status in (401, 403):
+                    if not refreshed:
+                        # Cached token expired — re-authenticate once, then retry.
+                        refreshed = True
+                        await self._bearer(force=True)
+                        continue
+                    raise WebClientError(
+                        f"unauthorised ({status}) — api key expired? {url}"
+                    )
+                if status >= 400:
+                    raise WebClientError(
+                        f"HTTP {status} from {url}: {body[:200]}"
+                    )
                 try:
                     return json.loads(body)
                 except json.JSONDecodeError as exc:
@@ -175,7 +202,8 @@ class WebClient:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
                 raise WebClientError(f"connection failed for {url}: {exc}") from exc
-        raise WebClientError(f"connection failed for {url}: {last_exc}")
+        raise WebClientError(
+            f"request failed for {url}: {last_exc or 'unauthorised after refresh'}")
 
     # -- trading history -----------------------------------------------------
 

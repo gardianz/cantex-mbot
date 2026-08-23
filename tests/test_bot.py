@@ -1,6 +1,7 @@
 """Unit tests for the Cantex bot. No network: the SDK surface is faked."""
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1491,6 +1492,103 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     sent = engine.execute_swap.await_args_list[0].kwargs["sell_amount"]
     assert sent == Decimal("13.13")        # re-priced, not the 11.23 seed
     store.close()
+
+
+# -- bearer token caching ----------------------------------------------------
+
+class _FakeResp:
+    """Minimal stand-in for aiohttp's `async with session.get(...) as resp`."""
+
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    async def text(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _fake_session(statuses, body="{}", seen=None):
+    it = iter(statuses)
+
+    def get(url, headers=None):            # NOT async: returns the ctx manager
+        if seen is not None:
+            seen.append(headers["Authorization"])
+        code = next(it)
+        return _FakeResp(code, body if code == 200 else "denied")
+
+    return SimpleNamespace(get=get)
+
+
+@pytest.mark.asyncio
+async def test_bearer_token_is_authenticated_once():
+    """The SDK's authenticate() makes a network probe and holds a lock across it,
+    and the trading loop shares that lock. Calling it per request doubled the
+    request count and parked the wallet behind every slow probe."""
+    from cantex_bot.webclient import WebClient
+    provider = AsyncMock(return_value="key-1")
+    wc = WebClient(token_provider=provider)
+    seen = []
+    wc._get_session = AsyncMock(return_value=_fake_session(
+        [200, 200, 200], body='{"history_trading": []}', seen=seen))
+    for _ in range(3):
+        await wc.fetch_trading_history()
+    assert provider.await_count == 1               # not once per request
+    assert seen == ["Bearer key-1"] * 3
+
+
+@pytest.mark.asyncio
+async def test_bearer_token_refreshed_once_on_401():
+    """An expired token must be replaced and the request retried."""
+    from cantex_bot.webclient import WebClient
+    provider = AsyncMock(side_effect=["stale", "fresh"])
+    wc = WebClient(token_provider=provider)
+    seen = []
+    wc._get_session = AsyncMock(
+        return_value=_fake_session([401, 200], seen=seen))
+    assert await wc._get_json("/x") == {}
+    assert seen == ["Bearer stale", "Bearer fresh"]
+    assert provider.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bearer_refresh_is_not_retried_for_ever():
+    """A genuinely rejected key must raise, not spin re-authenticating."""
+    from cantex_bot.webclient import WebClient, WebClientError
+    provider = AsyncMock(return_value="k")
+    wc = WebClient(token_provider=provider)
+    wc._get_session = AsyncMock(return_value=_fake_session([401, 401, 401]))
+    with pytest.raises(WebClientError, match="unauthorised"):
+        await wc._get_json("/x")
+    assert provider.await_count == 2               # initial + one refresh
+
+
+@pytest.mark.asyncio
+async def test_ensure_auth_times_out_instead_of_hanging():
+    """authenticate() holds a per-wallet lock; without a ceiling one stalled
+    call parks that wallet for ever (observed: ~50 minutes on one log line)."""
+    import asyncio as _a
+    from cantex_bot import wallets as wmod
+
+    async def _never():
+        await _a.sleep(60)
+
+    sdk = SimpleNamespace(_session=None, _timeout=None, authenticate=_never)
+    w = wmod.Wallet(WalletConfig(name="w1", operator_key="00", trading_key=None),
+                    sdk, None)
+    w._seed_session = lambda: None                 # type: ignore[method-assign]
+    original = wmod._AUTH_TIMEOUT
+    wmod._AUTH_TIMEOUT = 0.05
+    try:
+        with pytest.raises(TimeoutError, match="authenticate timed out"):
+            await w.ensure_auth()
+    finally:
+        wmod._AUTH_TIMEOUT = original
+    assert not w.authed                            # retryable, not wedged
 
 
 # -- local history mirror ----------------------------------------------------

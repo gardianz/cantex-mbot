@@ -60,6 +60,11 @@ class Strategy1Config:
     poll_min_seconds: float = 0.5          # interval when fee is at/near threshold
     poll_max_seconds: float = 5.0          # interval when fee is far above
     poll_far_ratio: float = 0.3            # fee this fraction above threshold => poll_max
+    # How often to re-quote what cc_units CC is worth in the base currency.
+    # The buy is denominated in the base, so a move in CC/base changes what every
+    # buy is actually worth; priced once at start-up it goes stale within hours,
+    # and a wallet idles through the UTC rollover and keeps trading for days.
+    notional_ttl_seconds: float = 60.0
     # -- loss brakes --------------------------------------------------------
     # The per-leg guards (slippage / pool fee / network fee) cannot see a whole
     # round trip, so a sell-back at a bad price still executes. These two cap the
@@ -194,6 +199,7 @@ def load_config(
         poll_min_seconds=float(s1.get("poll_min_seconds", 0.5)),
         poll_max_seconds=float(s1.get("poll_max_seconds", 5.0)),
         poll_far_ratio=float(s1.get("poll_far_ratio", 0.3)),
+        notional_ttl_seconds=float(s1.get("notional_ttl_seconds", 60.0)),
         max_cycle_loss_pct=_dec(s1.get("max_cycle_loss_pct"),
                                 Strategy1Config.max_cycle_loss_pct),
         max_daily_loss_cc=_dec(s1.get("max_daily_loss_cc"),

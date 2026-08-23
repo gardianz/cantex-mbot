@@ -50,6 +50,7 @@ Either one also lifts the SDK-level `max_network_fee` cap passed to `swap_and_co
 Loop invariants worth preserving:
 - A wallet that hits its target, its loss budget, or repeated insufficient balance **idles until the next UTC day** rather than returning — returning would park it until *every* wallet returns, and a fee-polling wallet may never return.
 - After a live swap whose confirmation *errored*, never fire the opposite leg on a maybe. `_confirm_via_history` polls the trading history: a higher today-count proves it settled. This is the buy/sell "collision" guard.
+- `cc_units` is a **CC** amount but the buy is sent in the *base* currency, so the size must be re-quoted (`_buy_notional`, `notional_ttl_seconds`). Priced once before the loop it drifts: a wallet idles through the UTC rollover and keeps trading for days, and a 17% CC move made a 110 CC buy land as 94 CC on the exchange. A failed quote keeps the last value rather than shrinking the buy to zero.
 - The cycle-loss hold timer (`_held_since`) is cleared only when a position actually closes. When the timed stop-loss fires but the fee guard rejects the sell, the timer stays armed so the stop fires the moment the fee allows.
 
 ### Where each number comes from — three data sources

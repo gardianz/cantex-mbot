@@ -65,6 +65,8 @@ class Strategy1(Strategy):
         self._loss_cache: dict[str, tuple[float, Decimal]] = {}
         # When a sell was first held back by the cycle-loss brake: (wallet, token).
         self._held_since: dict[tuple[str, str], float] = {}
+        # Per-wallet cache of (monotonic_ts, base value of cc_units CC).
+        self._notional_cache: dict[str, tuple[float, Decimal]] = {}
 
     def _pairs_for(self, market: MarketMap):
         """base<->token pairs to trade, honouring the chosen token subset."""
@@ -148,6 +150,7 @@ class Strategy1(Strategy):
         if buy_notional <= 0:
             logger.error("[%s] could not price CC, aborting wallet", wallet.name)
             return
+        self._notional_cache[wallet.name] = (time.monotonic(), buy_notional)
         logger.info(
             "[%s] buy notional = %s USDCX (= %s CC), %d pairs",
             wallet.name, buy_notional, self.config.cc_units, len(pairs),
@@ -186,6 +189,14 @@ class Strategy1(Strategy):
                 logger.info("[%s] new UTC day — daily target reset", wallet.name)
                 await self.notifier.send(
                     f"🔄 {self.label} [{wallet.name}] new UTC day — target reset")
+
+            # Re-price the buy: cc_units is a CC amount but the swap is
+            # denominated in the base, so a move in CC/base changes what every
+            # buy is worth. Priced once before the loop it goes stale — and since
+            # a wallet idles through the UTC rollover and keeps going, "once" can
+            # mean days (a 17% CC move turned a 110 CC buy into 94 CC).
+            buy_notional = await self._buy_notional(wallet, cc, usdcx, buy_notional)
+            state["notional"] = buy_notional
 
             done = await self._current_done(wallet, prior_web, session_executed)
             self._st(wallet.name, done=done)
@@ -555,6 +566,33 @@ class Strategy1(Strategy):
         far = Decimal(str(c.poll_far_ratio))
         frac = min(gap / far, Decimal(1)) if far > 0 else Decimal(1)
         return float(Decimal(str(lo)) + frac * (Decimal(str(hi)) - Decimal(str(lo))))
+
+    async def _buy_notional(
+        self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,
+        current: Decimal,
+    ) -> Decimal:
+        """Base-currency value of ``cc_units`` CC, re-quoted every
+        ``notional_ttl_seconds``.
+
+        Falls back to ``current`` when the quote fails, so a transient error can
+        never shrink the buy size (or drop it to zero and stall the wallet).
+        """
+        now = time.monotonic()
+        hit = self._notional_cache.get(wallet.name)
+        if hit is not None and now - hit[0] < self.config.notional_ttl_seconds:
+            return hit[1]
+        priced = await self._price_cc_in_usdcx(wallet, cc, usdcx)
+        if priced <= 0:
+            return current
+        if current > 0:
+            drift = abs(priced - current) / current
+            if drift >= Decimal("0.01"):      # only worth a line when it matters
+                logger.info("[%s] buy size re-priced %s -> %s %s (= %s CC, %+.1f%%)",
+                            wallet.name, current, priced, self.base_symbol,
+                            self.config.cc_units,
+                            float((priced - current) / current * 100))
+        self._notional_cache[wallet.name] = (now, priced)
+        return priced
 
     async def _price_cc_in_usdcx(
         self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,

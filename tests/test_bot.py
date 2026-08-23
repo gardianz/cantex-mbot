@@ -1429,6 +1429,70 @@ async def test_dashboard_clock_is_utc(monkeypatch):
 
 
 
+# -- buy sizing --------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_buy_notional_is_requoted_when_stale(tmp_path, monkeypatch):
+    """cc_units is a CC amount but the swap is denominated in the base, so a
+    CC/base move changes what every buy is worth. Priced once before the loop it
+    goes stale — a 17% CC move turned a 110 CC buy into 94 CC on the exchange."""
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat.config = Strategy1Config(cc_units=Decimal("110"), notional_ttl_seconds=60)
+    prices = iter([Decimal("13.13"), Decimal("11.23")])
+    strat._price_cc_in_usdcx = AsyncMock(side_effect=lambda *a: next(prices))
+    wallet = SimpleNamespace(name="w1")
+    cc = InstrumentId("a", "CC"); base = InstrumentId("a", "FRXUSD.B")
+
+    first = await strat._buy_notional(wallet, cc, base, Decimal("0"))
+    assert first == Decimal("13.13")
+    # Within the TTL the cached value is reused — no extra quote per iteration.
+    assert await strat._buy_notional(wallet, cc, base, first) == Decimal("13.13")
+    assert strat._price_cc_in_usdcx.await_count == 1
+
+    strat._notional_cache["w1"] = (0.0, first)          # expire it
+    assert await strat._buy_notional(wallet, cc, base, first) == Decimal("11.23")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_buy_notional_keeps_last_value_when_quote_fails(tmp_path, monkeypatch):
+    """A transient quote failure must not shrink the buy size, or zero it and
+    stall the wallet on 'saldo kurang'."""
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat._price_cc_in_usdcx = AsyncMock(return_value=Decimal("0"))   # quote failed
+    wallet = SimpleNamespace(name="w1")
+    cc = InstrumentId("a", "CC"); base = InstrumentId("a", "FRXUSD.B")
+    assert await strat._buy_notional(
+        wallet, cc, base, Decimal("13.13")) == Decimal("13.13")
+    assert "w1" not in strat._notional_cache      # a failure is not cached
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
+    """End-to-end: the amount handed to execute_swap follows the fresh quote,
+    not the one taken before the loop started."""
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat.config = Strategy1Config(cc_units=Decimal("110"), daily_swap_target=1,
+                                   cooldown_seconds=0, notional_ttl_seconds=0)
+    # Seed price, then the live one every later re-quote returns.
+    prices = iter([Decimal("11.23")])
+    strat._price_cc_in_usdcx = AsyncMock(
+        side_effect=lambda *a: next(prices, Decimal("13.13")))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))        # flat -> buy
+    strat._balances = AsyncMock(return_value=(Decimal("0"), Decimal("100"), Decimal("50")))
+    engine.execute_swap = AsyncMock(return_value=SimpleNamespace(
+        counted=True, ok=True, error=None, reject_reasons=None, guard=None,
+        submitted_attempt=False, fee_rejected=False,
+        buy_amount=Decimal("1"), buy_symbol="CBTC"))
+    await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                                            sdk=SimpleNamespace()), _a.Event())
+    sent = engine.execute_swap.await_args_list[0].kwargs["sell_amount"]
+    assert sent == Decimal("13.13")        # re-priced, not the 11.23 seed
+    store.close()
+
+
 # -- local history mirror ----------------------------------------------------
 
 def _mtrade(dt, inp="USDCx", out="CBTC", ain="100", aout="1", cid="p"):

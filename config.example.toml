@@ -49,6 +49,10 @@ confirm_interval = 2.0
 poll_min_seconds = 0.5     # interval when fee is at/near the threshold
 poll_max_seconds = 5.0     # interval when fee is far above the threshold
 poll_far_ratio = 0.3       # fee >= 30% above threshold -> use poll_max
+# How often to re-quote what cc_units CC is worth in the base currency. The buy
+# is sent in the base, so a CC/base move changes what each buy is really worth;
+# priced only once it drifts (a 17% CC move made a 110 CC buy land as 94 CC).
+notional_ttl_seconds = 60
 
 # Loss brakes. The [guards] limits are per-leg and cannot see a whole round
 # trip, so a sell-back at a bad price still executes. These cap the damage;

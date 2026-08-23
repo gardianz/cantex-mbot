@@ -152,8 +152,9 @@ class Strategy1(Strategy):
             return
         self._notional_cache[wallet.name] = (time.monotonic(), buy_notional)
         logger.info(
-            "[%s] buy notional = %s USDCX (= %s CC), %d pairs",
-            wallet.name, buy_notional, self.config.cc_units, len(pairs),
+            "[%s] buy notional = %s %s (= %s CC), %d pairs",
+            wallet.name, buy_notional, self.base_symbol,
+            self.config.cc_units, len(pairs),
         )
 
         target = self.config.daily_swap_target
@@ -257,8 +258,9 @@ class Strategy1(Strategy):
                 insufficient_streak += 1
                 self._st(wallet.name, status=run_status.WAITING,
                          route=route, plan="saldo kurang")
-                logger.info("[%s] insufficient USDCX (%s < %s), skip %s",
-                            wallet.name, usdcx_bal, buy_notional, tok)
+                logger.info("[%s] insufficient %s (%s < %s), skip %s",
+                            wallet.name, self.base_symbol, usdcx_bal,
+                            buy_notional, tok)
                 await asyncio.sleep(self.config.cooldown_seconds)
                 continue
 
@@ -597,7 +599,11 @@ class Strategy1(Strategy):
     async def _price_cc_in_usdcx(
         self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,
     ) -> Decimal:
-        """USDCX value of N CC tokens, via a pricing quote (no swap)."""
+        """Base-currency value of ``cc_units`` CC, via a pricing quote (no swap).
+
+        The parameter is still named ``usdcx`` for history; it is whatever base
+        the run was started with, which is often not USDCX.
+        """
         try:
             quote = await wallet.sdk.get_swap_quote(self.config.cc_units, cc, usdcx)
             return quote.returned_amount

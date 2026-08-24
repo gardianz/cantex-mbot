@@ -20,6 +20,7 @@ from .nethelp import ProxyError, close_shared_connector, configure_proxy, proxy_
 from .proxies import ProxyFileError, assign, load_proxies, redact
 from .portfolio import PortfolioService
 from .runstate import RunState
+from .singleton import AlreadyRunning, SingletonLock
 from .scheduler import StrategyScheduler
 from .store import Store
 from .strategies.strategy1 import Strategy1
@@ -781,12 +782,19 @@ async def amain() -> None:
     except (ProxyError, ProxyFileError) as exc:
         console.print(f"[red]Proxy error:[/red] {exc}")
         return
+    # Refuse to be the second bot on these wallets — see singleton.py.
+    try:
+        lock = SingletonLock().acquire()
+    except AlreadyRunning as exc:
+        console.print(f"[red]Refusing to start:[/red] {exc}")
+        return
     app = App(config, proxy_map=proxy_map)
     try:
         await app.startup()
         await app.menu()
     finally:
         await app.shutdown()
+        lock.release()
         console.print("Bye.")
 
 

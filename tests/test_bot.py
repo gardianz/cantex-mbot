@@ -1494,6 +1494,43 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     store.close()
 
 
+# -- singleton lock ----------------------------------------------------------
+
+def test_second_bot_is_refused(tmp_path):
+    """Two bots on the same wallets both read the balance, both decide to buy,
+    and both submit. The collision guard reconciles one process against the
+    exchange and cannot see a second at all."""
+    from cantex_bot.singleton import AlreadyRunning, SingletonLock
+    lock = tmp_path / "state.db.lock"
+    first = SingletonLock(lock).acquire()
+    try:
+        with pytest.raises(AlreadyRunning, match="already running"):
+            SingletonLock(lock).acquire()
+    finally:
+        first.release()
+
+
+def test_lock_is_reusable_after_release(tmp_path):
+    """A clean shutdown must not leave the directory wedged."""
+    from cantex_bot.singleton import SingletonLock
+    lock = tmp_path / "state.db.lock"
+    SingletonLock(lock).acquire().release()
+    second = SingletonLock(lock).acquire()      # must not raise
+    second.release()
+
+
+def test_lock_records_the_holding_pid(tmp_path):
+    """The refusal names the pid so the stale bot can actually be found."""
+    import os
+    from cantex_bot.singleton import SingletonLock
+    lock = tmp_path / "state.db.lock"
+    held = SingletonLock(lock).acquire()
+    try:
+        assert lock.read_text().strip() == str(os.getpid())
+    finally:
+        held.release()
+
+
 # -- bearer token caching ----------------------------------------------------
 
 class _FakeResp:
@@ -1663,10 +1700,7 @@ async def test_refresh_reads_windows_from_the_mirror_not_the_poll(monkeypatch):
     from cantex_bot.portfolio import PortfolioService
     svc = _fake_portfolio()
     wallet = svc.manager.get("w1")
-    now = datetime.now(timezone.utc)
-    today = now.replace(hour=12)
-    if today.weekday() == 0:            # on Monday, "earlier this week" is today
-        today = today + timedelta(days=1)
+    today = datetime.now(timezone.utc).replace(hour=12)
     earlier = today - timedelta(days=1)
     # A day already mirrored from an earlier sweep, which the endpoint no longer
     # returns; the poll carries only today's cycle.
@@ -1678,9 +1712,13 @@ async def test_refresh_reads_windows_from_the_mirror_not_the_poll(monkeypatch):
     await svc.refresh_all()
     s = svc.snaps["w1"]
     assert s.loss_today == Decimal("2")
-    assert s.loss_yesterday == Decimal("5")
-    assert s.loss_week == Decimal("7")      # both days, not just the poll
-    assert s.loss_week > s.loss_today
+    assert s.loss_yesterday == Decimal("5")   # from the mirror, not the poll
+    if today.weekday() == 0:
+        # Monday: "yesterday" belongs to last week, so the week holds today only.
+        assert s.loss_week == Decimal("2")
+    else:
+        assert s.loss_week == Decimal("7")    # both days, not just the poll
+        assert s.loss_week > s.loss_today
 
 
 @pytest.mark.asyncio

@@ -386,15 +386,15 @@ class Dashboard:
         t.add_column("slip%", justify="right", no_wrap=True)
         t.add_column("pool%", justify="right", no_wrap=True)
         t.add_column("n", justify="right", no_wrap=True)
-        for pair, latest, mn, av, slip, pool, n in self._pairs[:_MAX_PAIR_ROWS]:
+        for st in self._pairs[:_MAX_PAIR_ROWS]:
             t.add_row(
-                Text(pair, "white"),
-                Text(_money(latest, 4), "yellow"),
-                Text(_money(mn, 4), "green3"),
-                Text(_money(av, 4), _DIM),
-                Text(_money(slip, 3), "cyan"),
-                Text(_money(pool, 3), "magenta"),
-                Text(str(n), _DIM),
+                Text(st.pair, "white"),
+                Text(_money(st.fee_now, 4), "yellow"),
+                Text(_money(st.fee_min, 4), "green3"),
+                Text(_money(st.fee_avg, 4), _DIM),
+                Text(_money(st.slippage, 3), "cyan"),
+                Text(_money(st.pool_fee, 3), "magenta"),
+                Text(str(st.samples), _DIM),
             )
         extra = len(self._pairs) - _MAX_PAIR_ROWS
         if extra > 0:
@@ -539,3 +539,247 @@ class Dashboard:
     async def print_once(self) -> None:
         await self.service.refresh_once()
         self.console.print(self.render())
+
+
+def _compact(v: Decimal) -> str:
+    """Pool depth at a glance: 1.23M rather than 1,234,567.8901."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    for cut, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= cut:
+            return f"{n / cut:,.2f}{suffix}"
+    return f"{n:,.2f}"
+
+
+class MonitorDashboard:
+    """Read-only view of every pair's quoted fee, slippage, pool fee and depth.
+
+    Paints from ``FeeMonitor.pair_stats``, which the sweep recomputes off the
+    event loop — render runs on every keypress and must never query the DB.
+    Separate from ``Dashboard`` on purpose: no wallets, no balances, nothing that
+    could submit anything.
+    """
+
+    def __init__(self, monitor, config: AppConfig) -> None:
+        self.monitor = monitor
+        self.config = config
+        self.console = Console()
+        self.offset = 0
+        self._keybuf = b""
+        self._dirty = asyncio.Event()
+        self._rows: list = []
+        self.sort_key = "pair"      # pair | now | min | max | avg | slip | pool | size
+
+    # -- rendering -----------------------------------------------------------
+
+    _SORTS = {
+        "pair": lambda s: s.pair,
+        "now": lambda s: -s.fee_now,
+        "min": lambda s: -s.fee_min,
+        "max": lambda s: -s.fee_max,
+        "avg": lambda s: -s.fee_avg,
+        "slip": lambda s: -s.slippage,
+        "pool": lambda s: -s.pool_fee,
+        "size": lambda s: -s.pool_size,
+    }
+
+    def _page_size(self) -> int:
+        # header(2) + summary(3) + table head(2) + errors(≤4) + footer(2)
+        errs = min(len(self.monitor.state.errors), 3)
+        return max(4, self.console.size.height - 13 - errs)
+
+    def _sorted_rows(self) -> list:
+        rows = list(self.monitor.pair_stats or [])
+        return sorted(rows, key=self._SORTS.get(self.sort_key, self._SORTS["pair"]))
+
+    def render(self) -> Group:
+        self._rows = self._sorted_rows()
+        page = self._page_size()
+        self.offset = max(0, min(self.offset, max(0, len(self._rows) - page)))
+        visible = self._rows[self.offset:self.offset + page]
+        parts = [self._header(), Text(""), self._summary(), Text(""),
+                 self._table(visible), Text("")]
+        if self.monitor.state.errors:
+            parts += [self._error_panel(), Text("")]
+        parts.append(self._footer(len(self._rows), page))
+        return Group(*parts)
+
+    def _header(self) -> Table:
+        now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(justify="left", ratio=1)
+        grid.add_column(justify="right")
+        grid.add_row(
+            Text.assemble(
+                ("CANTEX FEE MONITOR", f"bold {_ACCENT}"), ("   ", ""),
+                (self.config.network.base_url, "grey62"),
+            ),
+            Text.assemble((now + "  ", "grey62"),
+                          ("READ-ONLY · no swaps", "bold green")),
+        )
+        return grid
+
+    def _summary(self) -> Text:
+        """One flowing line, not a grid: fixed columns wrap into three lines at
+        100 characters, which is a normal terminal width."""
+        st = self.monitor.state
+        style = {"running": "green3", "error": "red"}.get(st.status, "yellow")
+        age = (f"{time.monotonic() - st.last_sweep:.0f}s ago"
+               if st.last_sweep else "first sweep")
+        sep = (" · ", _DIM)
+        return Text.assemble(
+            (st.base_symbol or "—", "white"),
+            (f" {st.pairs} pairs", _DIM), sep,
+            ("size ", _DIM), (_money(st.notional, 4), "white"),
+            (f" (={self.monitor.cc_units} CC)", _DIM), sep,
+            ("sweep ", _DIM), (str(st.sweeps), "white"),
+            (f" {st.last_duration:.1f}s {age}", _DIM), sep,
+            (str(st.quoted), "cyan"), (" ok", _DIM),
+            ("/", _DIM), (str(st.failed), "red" if st.failed else _DIM),
+            (" err", _DIM), sep,
+            (st.status, style),
+        )
+
+    def _table(self, rows: list) -> Table:
+        t = Table(
+            box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
+            title="PAIRS  (net fee CC · slippage/pool % · pool depth)",
+            title_style=f"bold {_ACCENT}", title_justify="left",
+        )
+        t.add_column("PAIR", no_wrap=True, overflow="ellipsis", ratio=1)
+        for name in ("FEE now", "min", "max", "avg"):
+            t.add_column(name, justify="right", no_wrap=True)
+        t.add_column("slip%", justify="right", no_wrap=True)
+        t.add_column("pool%", justify="right", no_wrap=True)
+        t.add_column("POOL SIZE", justify="right", no_wrap=True)
+        t.add_column("n", justify="right", no_wrap=True)
+        if not rows:
+            t.add_row(Text("(no quotes yet — first sweep running)", _DIM),
+                      "", "", "", "", "", "", "", "")
+            return t
+        for st in rows:
+            # Colour the live fee against today's own range: at the bottom it is
+            # a good moment to trade, at the top it is not.
+            span = st.fee_max - st.fee_min
+            if span > 0:
+                frac = (st.fee_now - st.fee_min) / span
+                now_style = ("green3" if frac <= Decimal("0.34")
+                             else "red" if frac >= Decimal("0.67") else "yellow")
+            else:
+                now_style = "yellow"
+            t.add_row(
+                Text(st.pair, "white"),
+                Text(_money(st.fee_now, 4), now_style),
+                Text(_money(st.fee_min, 4), "green3"),
+                Text(_money(st.fee_max, 4), "red"),
+                Text(_money(st.fee_avg, 4), _DIM),
+                Text(_money(st.slippage, 3), "cyan"),
+                Text(_money(st.pool_fee, 3), "magenta"),
+                Text(_compact(st.pool_size), "white" if st.pool_size else _DIM),
+                Text(str(st.samples), _DIM),
+            )
+        return t
+
+    def _error_panel(self) -> Table:
+        t = Table(
+            box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
+            show_header=False, title="RECENT QUOTE ERRORS",
+            title_style="bold red", title_justify="left",
+        )
+        t.add_column(no_wrap=True, overflow="ellipsis")
+        for line in self.monitor.state.errors[:3]:
+            t.add_row(Text(line, "red"))
+        return t
+
+    def _footer(self, n: int, page: int) -> Table:
+        start = self.offset + 1 if n else 0
+        end = min(self.offset + page, n)
+        t = Table.grid(expand=True, padding=(0, 1))
+        t.add_column(justify="left", ratio=1)
+        t.add_column(justify="right")
+        t.add_row(
+            Text.assemble((f"rows {start}-{end}/{n}  ", "grey62"),
+                          ("sort ", _DIM), (self.sort_key, "bold white")),
+            Text("↑↓/PgUp/PgDn scroll · s sort · r sweep now · q back", _DIM),
+        )
+        return t
+
+    # -- key handling --------------------------------------------------------
+
+    def _on_key(self, data: bytes, page: int, n: int) -> bool:
+        """True when the caller should quit."""
+        if data in (b"q", b"\x1b"):
+            return True
+        if data in (b"\x1b[A", b"k"):
+            self.offset -= 1
+        elif data in (b"\x1b[B", b"j"):
+            self.offset += 1
+        elif data in (b"\x1b[5~", b"\x02"):
+            self.offset -= page
+        elif data in (b"\x1b[6~", b"\x06"):
+            self.offset += page
+        elif data in (b"g", b"\x1b[H"):
+            self.offset = 0
+        elif data in (b"G", b"\x1b[F"):
+            self.offset = max(0, n - page)
+        elif data == b"s":
+            order = list(self._SORTS)
+            self.sort_key = order[(order.index(self.sort_key) + 1) % len(order)]
+            self.offset = 0
+        elif data == b"r":
+            asyncio.ensure_future(self.monitor.sweep_once())
+        self.offset = max(0, min(self.offset, max(0, n - page)))
+        self._dirty.set()
+        return False
+
+    # -- run -----------------------------------------------------------------
+
+    async def run(self, stop: asyncio.Event) -> None:
+        self.monitor.start()
+        loop = asyncio.get_running_loop()
+        quit_flag = {"v": False}
+        fd = None
+        old_term = None
+        istty = sys.stdin.isatty()
+        if istty:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_term = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+
+            def _readable() -> None:
+                try:
+                    data = os.read(fd, 256)
+                except OSError:
+                    return
+                keys, self._keybuf = _split_keys(self._keybuf + data)
+                page = self._page_size()
+                n = len(self._rows)
+                for key in keys:
+                    if self._on_key(key, page, n):
+                        quit_flag["v"] = True
+                        stop.set()
+                        break
+            loop.add_reader(fd, _readable)
+        try:
+            with Live(self.render(), console=self.console, screen=True,
+                      auto_refresh=False, transient=True) as live:
+                live.refresh()
+                while not stop.is_set() and not quit_flag["v"]:
+                    try:
+                        await asyncio.wait_for(self._dirty.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    self._dirty.clear()
+                    live.update(self.render(), refresh=True)
+        finally:
+            if istty and fd is not None:
+                with contextlib.suppress(Exception):
+                    loop.remove_reader(fd)
+                import termios
+                with contextlib.suppress(Exception):
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            await self.monitor.stop()

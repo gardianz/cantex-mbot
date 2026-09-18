@@ -13,9 +13,10 @@ from rich.console import Console
 from . import logging_setup
 from .ccview import CCViewClient
 from .config import AppConfig, ConfigError, load_config
-from .dashboard import Dashboard
+from .dashboard import Dashboard, MonitorDashboard
 from .guards import SwapGuard
 from .markets import MarketError, MarketMap
+from .monitor import FeeMonitor
 from .nethelp import ProxyError, close_shared_connector, configure_proxy, proxy_url
 from .proxies import ProxyFileError, assign, load_proxies, redact
 from .portfolio import PortfolioService
@@ -539,6 +540,61 @@ class App:
             + (f", [red]{bad} failed[/red]" if bad else "")
         )
 
+    async def action_monitor(self) -> None:
+        """Watch every pair's fee, slippage, pool fee and depth. Never swaps."""
+        market = await self._first_market()
+        if market is None:
+            return
+        usdcx = self.config.strategy1.usdcx_symbol
+        cc = self.config.strategy1.cc_symbol
+
+        bases = [usdcx] + [b for b in market.pool_token_symbols()
+                           if b.upper() != usdcx.upper()]
+        base_sym = await questionary.select(
+            "Base token to quote against:", choices=bases, default=usdcx,
+        ).ask_async()
+        if not base_sym:
+            return
+
+        syms = [p.token_symbol
+                for p in market.trade_pairs(base_sym, exclude_symbols=(cc,))]
+        if not syms:
+            console.print(f"[red]No tradeable tokens for base {base_sym}.[/red]")
+            return
+        tokens = await questionary.checkbox(
+            f"Pairs to watch ({base_sym} <-> token; all by default):",
+            choices=[questionary.Choice(s, checked=True) for s in syms],
+        ).ask_async()
+        if not tokens:
+            console.print("[yellow]No pair selected.[/yellow]")
+            return
+
+        every = await questionary.text(
+            "Seconds between sweeps:", default="30",
+        ).ask_async()
+        try:
+            interval = float((every or "30").strip())
+        except ValueError:
+            console.print("[red]Bad interval.[/red]")
+            return
+        if interval < 5:
+            console.print("[yellow]Minimum 5s — quoting faster just rate-limits "
+                          "you.[/yellow]")
+            interval = 5.0
+
+        # Both directions per pair, so the request count is 2x the token count.
+        console.print(
+            f"[dim]Watching {len(tokens)} pair(s) both ways against {base_sym} "
+            f"every {interval:.0f}s — quotes only, nothing is submitted.[/dim]"
+        )
+        monitor = FeeMonitor(
+            self.manager, self.store, base_symbol=base_sym, cc_symbol=cc,
+            cc_units=self.config.strategy1.cc_units, tokens=tokens,
+            interval=interval,
+        )
+        dash = MonitorDashboard(monitor, self.config)
+        await self._run_cancellable(dash.run)
+
     async def action_manual_swap(self) -> None:
         name = await questionary.select("Wallet?", choices=self.manager.names).ask_async()
         if not name:
@@ -740,6 +796,7 @@ class App:
             "Manual swap": self.action_manual_swap,
             "Withdraw (bulk)": self.action_withdraw,
             "Transfer pre-approvals (activate all)": self.action_preapprovals,
+            "Fee monitor (all pairs, read-only)": self.action_monitor,
             "Web check (history + rebates)": self.action_web_check,
             "Wallet status": self.action_wallet_status,
             "Add wallets (bulk import)": self.action_add_wallets,

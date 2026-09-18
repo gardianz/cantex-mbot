@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS fee_obs (
     pair        TEXT NOT NULL,
     network_fee REAL NOT NULL,           -- CC, absolute
     slippage    REAL NOT NULL DEFAULT 0, -- percent
-    pool_fee    REAL NOT NULL DEFAULT 0  -- percent
+    pool_fee    REAL NOT NULL DEFAULT 0, -- percent
+    pool_size   REAL NOT NULL DEFAULT 0  -- pool depth quoted for this pair
 );
 CREATE INDEX IF NOT EXISTS idx_fee_wallet_day ON fee_obs (wallet, day);
 CREATE INDEX IF NOT EXISTS idx_fee_pair_day_ts ON fee_obs (pair, day, ts);
@@ -96,6 +97,28 @@ class SwapRecord:
     network_fee: Decimal = Decimal(0)
     price: Decimal = Decimal(0)
     dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class PairStats:
+    """One pair's quoted metrics for a day, across every wallet that saw it.
+
+    A tuple was unreadable at this width; every field is named so a caller
+    cannot silently swap ``fee_min`` for ``fee_avg``. ``fee_*`` are CC,
+    ``slippage``/``pool_fee`` are percent, ``pool_size`` is the depth the quote
+    reported. ``slippage``, ``pool_fee`` and ``pool_size`` are the LATEST
+    observation, not an average — they describe the pool as it stands now.
+    """
+
+    pair: str
+    fee_now: Decimal
+    fee_min: Decimal
+    fee_max: Decimal
+    fee_avg: Decimal
+    slippage: Decimal
+    pool_fee: Decimal
+    pool_size: Decimal
+    samples: int
 
 
 def _today() -> str:
@@ -120,6 +143,8 @@ class Store:
                 self._conn.execute("ALTER TABLE fee_obs ADD COLUMN slippage REAL NOT NULL DEFAULT 0")
             if "pool_fee" not in cols:
                 self._conn.execute("ALTER TABLE fee_obs ADD COLUMN pool_fee REAL NOT NULL DEFAULT 0")
+            if "pool_size" not in cols:
+                self._conn.execute("ALTER TABLE fee_obs ADD COLUMN pool_size REAL NOT NULL DEFAULT 0")
             # Normalise legacy pair case once (so queries need no UPPER()), and
             # drop fee rows older than 2 days to keep the table (and its stats
             # query) fast — only today's rows are ever read.
@@ -319,9 +344,10 @@ class Store:
     def record_fee(
         self, wallet: str, pair: str, network_fee: Decimal,
         slippage: Decimal = Decimal(0), pool_fee: Decimal = Decimal(0),
+        pool_size: Decimal = Decimal(0),
     ) -> None:
-        """Log an observed network fee (CC) plus slippage and pool fee (percent)
-        from a quote, for today's per-pair stats."""
+        """Log an observed network fee (CC) plus slippage, pool fee (percent)
+        and pool depth from a quote, for today's per-pair stats."""
         day = datetime.now(timezone.utc).date().isoformat()
         # Normalise case so a pair is one row: base is upper-cased but token
         # symbols keep their source case (USDCx, cETH), which would otherwise
@@ -330,9 +356,9 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO fee_obs (ts, day, wallet, pair, network_fee, slippage, "
-                "pool_fee) VALUES (?,?,?,?,?,?,?)",
+                "pool_fee, pool_size) VALUES (?,?,?,?,?,?,?,?)",
                 (time.time(), day, wallet, pair, float(network_fee),
-                 float(slippage), float(pool_fee)),
+                 float(slippage), float(pool_fee), float(pool_size)),
             )
             self._conn.commit()
 
@@ -345,20 +371,18 @@ class Store:
             ).fetchone()
         return Decimal(str(row["network_fee"])) if row else None
 
-    def pair_fee_stats(
-        self, day: str | None = None
-    ) -> list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]]:
-        """Per-pair fee stats for today (UTC), across all wallets:
-        ``(pair, latest_net, min_net, avg_net, latest_slippage, latest_pool_fee,
-        count)`` sorted by pair. Network fee is in CC; slippage/pool fee are the
-        latest observed values in percent. Pairs differ per pool, so a single
-        'FEE now' cannot represent them."""
+    def pair_fee_stats(self, day: str | None = None) -> list[PairStats]:
+        """Per-pair quoted metrics for today (UTC), across all wallets.
+
+        Fees differ per pool, so a single "FEE now" cannot represent them —
+        every pair is reported on its own row, sorted by name.
+        """
         day = day or _today()
         with self._lock:
             # Pairs are stored upper-cased (record_fee + a one-time migration),
             # so plain equality here is index-friendly (idx_fee_pair_day_ts).
             rows = self._conn.execute(
-                """SELECT pair, MIN(network_fee) AS mn,
+                """SELECT pair, MIN(network_fee) AS mn, MAX(network_fee) AS mx,
                           AVG(network_fee) AS av, COUNT(*) AS n,
                           (SELECT network_fee FROM fee_obs f2
                              WHERE f2.pair = f.pair AND f2.day = f.day
@@ -368,19 +392,28 @@ class Store:
                              ORDER BY ts DESC LIMIT 1) AS slip,
                           (SELECT pool_fee FROM fee_obs f2
                              WHERE f2.pair = f.pair AND f2.day = f.day
-                             ORDER BY ts DESC LIMIT 1) AS pool
+                             ORDER BY ts DESC LIMIT 1) AS pool,
+                          (SELECT pool_size FROM fee_obs f2
+                             WHERE f2.pair = f.pair AND f2.day = f.day
+                             ORDER BY ts DESC LIMIT 1) AS psize
                    FROM fee_obs f WHERE day = ?
                    GROUP BY pair ORDER BY pair""",
                 (day,),
             ).fetchall()
-        out: list[tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, int]] = []
-        for r in rows:
-            out.append((
-                r["pair"], Decimal(str(r["latest"])), Decimal(str(r["mn"])),
-                Decimal(str(r["av"])), Decimal(str(r["slip"])),
-                Decimal(str(r["pool"])), int(r["n"]),
-            ))
-        return out
+        return [
+            PairStats(
+                pair=r["pair"],
+                fee_now=Decimal(str(r["latest"])),
+                fee_min=Decimal(str(r["mn"])),
+                fee_max=Decimal(str(r["mx"])),
+                fee_avg=Decimal(str(r["av"])),
+                slippage=Decimal(str(r["slip"])),
+                pool_fee=Decimal(str(r["pool"])),
+                pool_size=Decimal(str(r["psize"] or 0)),
+                samples=int(r["n"]),
+            )
+            for r in rows
+        ]
 
     def fee_stats_today(
         self, wallet: str, day: str | None = None

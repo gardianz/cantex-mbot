@@ -22,12 +22,14 @@ from cantex_bot.config import WalletConfig
 # -- fakes -------------------------------------------------------------------
 
 # slippage/pool_fee are API fractions (0.001 = 0.10%); the guard x100s them.
-def make_quote(admin="0.001", slippage="0.002", pool_fee="0.001", net="0.1", returned="100"):
+def make_quote(admin="0.001", slippage="0.002", pool_fee="0.001", net="0.1",
+               returned="100", pool_size="5000"):
     leg = SimpleNamespace(amount=Decimal(net))
     pool = SimpleNamespace(fees=SimpleNamespace(fee_percentage=Decimal(pool_fee)))
     return SimpleNamespace(
         returned=SimpleNamespace(amount=Decimal(returned)),
         returned_amount=Decimal(returned),
+        pool_size=SimpleNamespace(amount=Decimal(pool_size)),
         prices=SimpleNamespace(slippage=Decimal(slippage), trade=Decimal("1.5")),
         fees=SimpleNamespace(
             fee_percentage=Decimal(admin),
@@ -1494,6 +1496,173 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     store.close()
 
 
+# -- fee monitor (read-only) -------------------------------------------------
+
+def _monitor_market(monkeypatch):
+    from cantex_bot import monitor as mmod
+    from cantex_bot.markets import Pair
+    base = InstrumentId("a", "FRXUSD.B")
+    cbtc = InstrumentId("a", "CBTC")
+    ceth = InstrumentId("a", "CETH")
+    cc = InstrumentId("a", "CC")
+
+    class FakeMarket:
+        def instrument(self, sym):
+            return {"FRXUSD.B": base, "CC": cc, "CBTC": cbtc, "CETH": ceth}[sym.upper()]
+
+        def trade_pairs(self, b, only_symbols=None, exclude_symbols=()):
+            return [Pair(token=cbtc, token_symbol="CBTC", usdcx=base, pool_contract_id=""),
+                    Pair(token=ceth, token_symbol="CETH", usdcx=base, pool_contract_id="")]
+
+    monkeypatch.setattr(mmod.MarketMap, "build", AsyncMock(return_value=FakeMarket()))
+    return base, cc, cbtc, ceth
+
+
+def _monitor(store, sdk):
+    import asyncio as _a
+    from cantex_bot.monitor import FeeMonitor
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+    manager = SimpleNamespace(names=["w1"], get=lambda n: wallet,
+                              sem=_a.Semaphore(10))
+    return FeeMonitor(manager, store, base_symbol="FRXUSD.B",
+                      cc_units=Decimal("110"), interval=30)
+
+
+@pytest.mark.asyncio
+async def test_monitor_quotes_both_directions_and_never_swaps(tmp_path, monkeypatch):
+    """The whole point is a read-only view: quotes cost nothing and move nothing,
+    so the monitor may watch continuously — but it must never reach a swap."""
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote(net="0.55", returned="13")),
+        swap_and_confirm=AsyncMock(),
+        transfer=AsyncMock(),
+    )
+    mon = _monitor(store, sdk)
+    await mon.sweep_once()
+
+    pairs = {st.pair for st in store.pair_fee_stats()}
+    assert pairs == {"FRXUSD.B->CBTC", "CBTC->FRXUSD.B",
+                     "FRXUSD.B->CETH", "CETH->FRXUSD.B"}
+    assert mon.state.quoted == 4 and mon.state.failed == 0
+    sdk.swap_and_confirm.assert_not_awaited()
+    sdk.transfer.assert_not_awaited()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_records_pool_size_and_max(tmp_path, monkeypatch):
+    """min/avg alone cannot show how wide a fee swings in a day — max and the
+    pool depth are what the user asked to watch."""
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    fees = iter(["0.50", "0.90", "0.70", "0.60"] * 4)
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(
+        side_effect=lambda *a: make_quote(net=next(fees), returned="13")))
+    mon = _monitor(store, sdk)
+    await mon.sweep_once()
+    await mon.sweep_once()
+
+    buy = next(st for st in store.pair_fee_stats() if st.pair == "FRXUSD.B->CBTC")
+    assert buy.fee_min < buy.fee_max                 # a real range, not one point
+    assert buy.fee_min <= buy.fee_avg <= buy.fee_max
+    assert buy.pool_size == Decimal("5000")          # from quote.pool_size
+    assert buy.samples == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_survives_one_bad_pair(tmp_path, monkeypatch):
+    """One unquotable pair must not cost the whole sweep."""
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+
+    async def _quote(amount, sell, buy):
+        if buy.id == "CETH" or sell.id == "CETH":
+            raise RuntimeError("no pool")
+        return make_quote(net="0.55", returned="13")
+
+    mon = _monitor(store, SimpleNamespace(get_swap_quote=AsyncMock(side_effect=_quote)))
+    await mon.sweep_once()
+    pairs = {st.pair for st in store.pair_fee_stats()}
+    assert pairs == {"FRXUSD.B->CBTC", "CBTC->FRXUSD.B"}
+    assert mon.state.quoted == 2 and mon.state.failed == 1
+    assert any("CETH" in e for e in mon.state.errors)
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_stats_are_cached_for_render(tmp_path, monkeypatch):
+    """The dashboard paints from this; render must never hit the DB."""
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(
+        return_value=make_quote(net="0.55", returned="13")))
+    mon = _monitor(store, sdk)
+    assert mon.pair_stats == []
+    await mon.sweep_once()
+    assert {st.pair for st in mon.pair_stats} == {
+        st.pair for st in store.pair_fee_stats()}
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_dashboard_renders_every_column(tmp_path, monkeypatch):
+    import io
+    from rich.console import Console as RichConsole
+    from cantex_bot.dashboard import MonitorDashboard
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(
+        return_value=make_quote(net="0.55", returned="13")))
+    mon = _monitor(store, sdk)
+    await mon.sweep_once()
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
+    buf = io.StringIO()
+    RichConsole(file=buf, width=200).print(MonitorDashboard(mon, config).render())
+    out = buf.getvalue()
+    assert "CANTEX FEE MONITOR" in out and "READ-ONLY" in out
+    for header in ("FEE now", "min", "max", "avg", "slip%", "pool%", "POOL SIZE"):
+        assert header in out
+    assert "FRXUSD.B->CBTC" in out
+    store.close()
+
+
+def test_monitor_dashboard_sort_cycles_and_quits(tmp_path):
+    from cantex_bot.dashboard import MonitorDashboard
+    from cantex_bot.monitor import MonitorState
+    mon = SimpleNamespace(pair_stats=[], state=MonitorState(), cc_units=Decimal("110"))
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"))
+    d = MonitorDashboard(mon, config)
+    assert d.sort_key == "pair"
+    assert d._on_key(b"s", 10, 0) is False
+    assert d.sort_key == "now"
+    assert d._on_key(b"q", 10, 0) is True
+
+
+def test_monitor_dashboard_sorts_by_fee(tmp_path):
+    from cantex_bot.dashboard import MonitorDashboard
+    from cantex_bot.monitor import MonitorState
+    from cantex_bot.store import PairStats
+
+    def st(pair, now):
+        return PairStats(pair=pair, fee_now=Decimal(now), fee_min=Decimal("0.1"),
+                         fee_max=Decimal("1"), fee_avg=Decimal("0.5"),
+                         slippage=Decimal("0"), pool_fee=Decimal("0"),
+                         pool_size=Decimal("0"), samples=1)
+
+    mon = SimpleNamespace(pair_stats=[st("A->B", "0.2"), st("C->D", "0.9")],
+                          state=MonitorState(), cc_units=Decimal("110"))
+    d = MonitorDashboard(mon, SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x")))
+    assert [r.pair for r in d._sorted_rows()] == ["A->B", "C->D"]   # by name
+    d.sort_key = "now"
+    assert [r.pair for r in d._sorted_rows()] == ["C->D", "A->B"]   # highest first
+
+
 # -- singleton lock ----------------------------------------------------------
 
 def test_second_bot_is_refused(tmp_path):
@@ -2320,13 +2489,14 @@ def test_pair_fee_stats(tmp_path):
     store.record_fee("w1", "A->B", Decimal("0.70"), Decimal("0.05"), Decimal("0.10"))
     store.record_fee("w2", "A->B", Decimal("0.72"), Decimal("0.06"), Decimal("0.11"))
     store.record_fee("w1", "C->D", Decimal("0.90"))
-    stats = {p: (lat, mn, av, slip, pool, n)
-             for p, lat, mn, av, slip, pool, n in store.pair_fee_stats()}
+    stats = {st.pair: st for st in store.pair_fee_stats()}
     assert set(stats) == {"A->B", "C->D"}
-    lat, mn, av, slip, pool, n = stats["A->B"]
-    assert n == 2 and mn == Decimal("0.7") and lat == Decimal("0.72")  # latest row
-    assert slip == Decimal("0.06") and pool == Decimal("0.11")         # latest slip/pool
-    assert stats["C->D"][5] == 1                                       # count
+    ab = stats["A->B"]
+    assert ab.samples == 2
+    assert ab.fee_min == Decimal("0.7") and ab.fee_max == Decimal("0.72")
+    assert ab.fee_now == Decimal("0.72")                       # latest row
+    assert ab.slippage == Decimal("0.06") and ab.pool_fee == Decimal("0.11")
+    assert stats["C->D"].samples == 1
     store.close()
 
 
@@ -2409,7 +2579,7 @@ async def test_strategy2_lowest_fee_pair_picks_min_and_records(tmp_path):
     strat = _s2(store)
     best = await strat._lowest_fee_pair(wallet, pairs, usdcx, Decimal("10"))
     assert best.token_symbol == "CETH"                             # lowest fee
-    recorded = {p for p, *_ in store.pair_fee_stats()}
+    recorded = {st.pair for st in store.pair_fee_stats()}
     assert recorded == {"USDCX->CBTC", "USDCX->CETH"}              # all probed fees logged
     store.close()
 
@@ -2470,7 +2640,7 @@ async def test_maybe_probe_fees_records_all_pairs(tmp_path):
 
     wallet.sdk.get_swap_quote = AsyncMock(side_effect=quote)
     await svc._maybe_probe_fees()
-    recorded = {p for p, *_ in store.pair_fee_stats()}
+    recorded = {st.pair for st in store.pair_fee_stats()}
     assert recorded == {"USDCX->CBTC", "USDCX->CETH"}   # every pair probed
     store.close()
 
@@ -2537,8 +2707,8 @@ def test_pair_fee_stats_merges_case(tmp_path):
     store = Store(p)
     store.record_fee("w1", "USDCX->FRXUSD.B", Decimal("0.70"))
     rows = store.pair_fee_stats()
-    assert [r[0] for r in rows] == ["USDCX->FRXUSD.B"]   # single merged pair
-    assert rows[0][6] == 2                               # both observations
+    assert [r.pair for r in rows] == ["USDCX->FRXUSD.B"]   # single merged pair
+    assert rows[0].samples == 2                            # both observations
     store.close()
 
 

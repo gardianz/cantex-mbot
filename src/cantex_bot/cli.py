@@ -569,6 +569,10 @@ class App:
             console.print("[yellow]No pair selected.[/yellow]")
             return
 
+        both = await questionary.confirm(
+            "Quote both directions? (base->token AND token->base — doubles the "
+            "requests per sweep)", default=True,
+        ).ask_async()
         every = await questionary.text(
             "Seconds between sweeps:", default="30",
         ).ask_async()
@@ -582,15 +586,19 @@ class App:
                           "you.[/yellow]")
             interval = 5.0
 
-        # Both directions per pair, so the request count is 2x the token count.
+        # Be explicit about the load: one request per pair per direction, plus
+        # one to price CC. Quotes are cheap but they are not free.
+        per_sweep = len(tokens) * (2 if both else 1) + 1
         console.print(
-            f"[dim]Watching {len(tokens)} pair(s) both ways against {base_sym} "
-            f"every {interval:.0f}s — quotes only, nothing is submitted.[/dim]"
+            f"[dim]Watching {len(tokens)} pair(s) "
+            f"{'both ways' if both else 'buy side only'} against {base_sym} "
+            f"every {interval:.0f}s — [bold]{per_sweep} quotes per sweep[/bold], "
+            f"nothing is submitted.[/dim]"
         )
         monitor = FeeMonitor(
             self.manager, self.store, base_symbol=base_sym, cc_symbol=cc,
             cc_units=self.config.strategy1.cc_units, tokens=tokens,
-            interval=interval,
+            interval=interval, both_ways=bool(both),
         )
         dash = MonitorDashboard(monitor, self.config)
         await self._run_cancellable(dash.run)

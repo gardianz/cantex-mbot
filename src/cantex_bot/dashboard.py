@@ -570,19 +570,23 @@ class MonitorDashboard:
         self._keybuf = b""
         self._dirty = asyncio.Event()
         self._rows: list = []
-        self.sort_key = "pair"      # pair | now | min | max | avg | slip | pool | size
+        # Cheapest live fee first: the row you would trade is the top one.
+        self.sort_key = "now"
 
     # -- rendering -----------------------------------------------------------
 
+    # Every sort puts the most attractive row on top, so the direction differs by
+    # column: cheaper is better for a fee or slippage, deeper is better for a
+    # pool. The arrow in the footer says which way the column is going.
     _SORTS = {
-        "pair": lambda s: s.pair,
-        "now": lambda s: -s.fee_now,
-        "min": lambda s: -s.fee_min,
-        "max": lambda s: -s.fee_max,
-        "avg": lambda s: -s.fee_avg,
-        "slip": lambda s: -s.slippage,
-        "pool": lambda s: -s.pool_fee,
-        "size": lambda s: -s.pool_size,
+        "now": (lambda s: s.fee_now, "↑ cheapest"),
+        "min": (lambda s: s.fee_min, "↑ cheapest"),
+        "max": (lambda s: s.fee_max, "↑ cheapest"),
+        "avg": (lambda s: s.fee_avg, "↑ cheapest"),
+        "slip": (lambda s: s.slippage, "↑ least"),
+        "pool": (lambda s: s.pool_fee, "↑ least"),
+        "size": (lambda s: -s.pool_size, "↓ deepest"),
+        "pair": (lambda s: s.pair, "↑ a-z"),
     }
 
     def _page_size(self) -> int:
@@ -592,7 +596,8 @@ class MonitorDashboard:
 
     def _sorted_rows(self) -> list:
         rows = list(self.monitor.pair_stats or [])
-        return sorted(rows, key=self._SORTS.get(self.sort_key, self._SORTS["pair"]))
+        key, _label = self._SORTS.get(self.sort_key, self._SORTS["pair"])
+        return sorted(rows, key=key)
 
     def render(self) -> Group:
         self._rows = self._sorted_rows()
@@ -640,6 +645,10 @@ class MonitorDashboard:
             ("/", _DIM), (str(st.failed), "red" if st.failed else _DIM),
             (" err", _DIM), sep,
             (st.status, style),
+            # A sweep longer than the gap means there is no idle time at all:
+            # the real cycle is sweep+interval, not interval.
+            *((sep, (f"sweep > {st.interval:.0f}s gap — no idle time", "yellow"))
+              if st.interval and st.last_duration > st.interval else ()),
         )
 
     def _table(self, rows: list) -> Table:
@@ -701,7 +710,8 @@ class MonitorDashboard:
         t.add_column(justify="right")
         t.add_row(
             Text.assemble((f"rows {start}-{end}/{n}  ", "grey62"),
-                          ("sort ", _DIM), (self.sort_key, "bold white")),
+                          ("sort ", _DIM), (self.sort_key, "bold white"),
+                          (f" {self._SORTS[self.sort_key][1]}", _DIM)),
             Text("↑↓/PgUp/PgDn scroll · s sort · r sweep now · q back", _DIM),
         )
         return t

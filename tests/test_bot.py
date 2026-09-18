@@ -1573,6 +1573,24 @@ async def test_monitor_records_pool_size_and_max(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_monitor_one_way_halves_the_requests(tmp_path, monkeypatch):
+    """Each pair costs a request per direction; at 20 pairs both ways a sweep
+    outlasts its own interval, so the sell side has to be optional."""
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(
+        return_value=make_quote(net="0.55", returned="13")))
+    mon = _monitor(store, sdk)
+    mon.both_ways = False
+    await mon.sweep_once()
+    assert {st.pair for st in store.pair_fee_stats()} == {
+        "FRXUSD.B->CBTC", "FRXUSD.B->CETH"}          # no sell side
+    assert mon.state.quoted == 2                     # 2 pairs, one way
+    assert sdk.get_swap_quote.await_count == 3       # + the CC pricing quote
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_monitor_survives_one_bad_pair(tmp_path, monkeypatch):
     """One unquotable pair must not cost the whole sweep."""
     _monitor_market(monkeypatch)
@@ -1637,9 +1655,9 @@ def test_monitor_dashboard_sort_cycles_and_quits(tmp_path):
     config = SimpleNamespace(
         network=SimpleNamespace(dry_run=True, base_url="x"))
     d = MonitorDashboard(mon, config)
-    assert d.sort_key == "pair"
+    assert d.sort_key == "now"                      # cheapest live fee first
     assert d._on_key(b"s", 10, 0) is False
-    assert d.sort_key == "now"
+    assert d.sort_key == "min"
     assert d._on_key(b"q", 10, 0) is True
 
 
@@ -1648,19 +1666,23 @@ def test_monitor_dashboard_sorts_by_fee(tmp_path):
     from cantex_bot.monitor import MonitorState
     from cantex_bot.store import PairStats
 
-    def st(pair, now):
+    def st(pair, now, size="0"):
         return PairStats(pair=pair, fee_now=Decimal(now), fee_min=Decimal("0.1"),
                          fee_max=Decimal("1"), fee_avg=Decimal("0.5"),
                          slippage=Decimal("0"), pool_fee=Decimal("0"),
-                         pool_size=Decimal("0"), samples=1)
+                         pool_size=Decimal(size), samples=1)
 
-    mon = SimpleNamespace(pair_stats=[st("A->B", "0.2"), st("C->D", "0.9")],
+    mon = SimpleNamespace(pair_stats=[st("A->B", "0.2", "100"),
+                                      st("C->D", "0.9", "900")],
                           state=MonitorState(), cc_units=Decimal("110"))
     d = MonitorDashboard(mon, SimpleNamespace(
         network=SimpleNamespace(dry_run=True, base_url="x")))
+    # Default: cheapest live fee on top — the row you would actually trade.
+    assert [r.pair for r in d._sorted_rows()] == ["A->B", "C->D"]
+    d.sort_key = "pair"
     assert [r.pair for r in d._sorted_rows()] == ["A->B", "C->D"]   # by name
-    d.sort_key = "now"
-    assert [r.pair for r in d._sorted_rows()] == ["C->D", "A->B"]   # highest first
+    d.sort_key = "size"
+    assert [r.pair for r in d._sorted_rows()] == ["C->D", "A->B"]   # deepest first
 
 
 # -- singleton lock ----------------------------------------------------------

@@ -42,6 +42,7 @@ class MonitorState:
     last_duration: float = 0.0     # seconds the last sweep took
     quoted: int = 0                # successful quotes in the last sweep
     failed: int = 0                # quotes that errored in the last sweep
+    interval: float = 0.0          # configured gap between sweeps
     notional: Decimal = Decimal(0)  # base amount each buy-side quote uses
     errors: list[str] = field(default_factory=list)   # newest first, capped
     status: str = "starting"
@@ -62,6 +63,7 @@ class FeeMonitor:
         cc_units: Decimal = Decimal("110"),
         tokens: list[str] | None = None,
         interval: float = 30.0,
+        both_ways: bool = True,
     ) -> None:
         self.manager = manager
         self.store = store
@@ -70,7 +72,10 @@ class FeeMonitor:
         self.cc_units = cc_units
         self.tokens = tokens
         self.interval = interval
-        self.state = MonitorState(base_symbol=self.base_symbol)
+        # Each pair costs one request per direction. Turning the sell side off
+        # halves the sweep when the buy side is all you watch.
+        self.both_ways = both_ways
+        self.state = MonitorState(base_symbol=self.base_symbol, interval=interval)
         # Recomputed once per sweep, off the event loop. The dashboard paints
         # from here and never touches the DB — render runs on every keypress.
         self.pair_stats: list[PairStats] = []
@@ -150,7 +155,7 @@ class FeeMonitor:
 
             # Sell side at the size the buy would actually leave us holding.
             back = buy.returned_amount
-            if back <= 0:
+            if not self.both_ways or back <= 0:
                 continue
             sell_label = f"{pair.token_symbol}->{self.base_symbol}"
             try:

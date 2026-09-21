@@ -1496,6 +1496,169 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     store.close()
 
 
+# -- distribute (1 wallet -> many) -------------------------------------------
+
+ADDR_A = "Cantex::1220" + "a" * 60
+ADDR_B = "Cantex::1220" + "b" * 60
+ADDR_C = "Cantex::1220" + "c" * 60
+
+
+def test_parse_recipients_accepts_every_documented_form():
+    from cantex_bot.distribute import parse_recipients
+    text = (f"# header\n\n{ADDR_A}\n{ADDR_B},12.5\n  {ADDR_C} 7  \n# note\n")
+    got = parse_recipients(text)
+    assert [r.address for r in got] == [ADDR_A, ADDR_B, ADDR_C]
+    assert [r.amount for r in got] == [None, Decimal("12.5"), Decimal("7")]
+
+
+def test_parse_recipients_rejects_bad_input():
+    from cantex_bot.distribute import parse_recipients
+    from cantex_bot.withdraw import WithdrawError
+    with pytest.raises(WithdrawError, match="line 1"):
+        parse_recipients("not-a-party-id\n")
+    with pytest.raises(WithdrawError, match="not a number"):
+        parse_recipients(f"{ADDR_A} abc\n")
+    with pytest.raises(WithdrawError, match="must be > 0"):
+        parse_recipients(f"{ADDR_A} 0\n")
+    with pytest.raises(WithdrawError, match="3 fields"):
+        parse_recipients(f"{ADDR_A} 1 2\n")
+    with pytest.raises(WithdrawError, match="no recipients"):
+        parse_recipients("# only a comment\n")
+
+
+def test_parse_recipients_rejects_duplicates():
+    """Two lines for one address would silently double that payout."""
+    from cantex_bot.distribute import parse_recipients
+    from cantex_bot.withdraw import WithdrawError
+    with pytest.raises(WithdrawError, match="duplicate"):
+        parse_recipients(f"{ADDR_A}\n{ADDR_B}\n{ADDR_A} 5\n")
+
+
+def test_per_line_amount_overrides_the_shared_one():
+    from cantex_bot.distribute import parse_recipients, plan_total
+    got = parse_recipients(f"{ADDR_A}\n{ADDR_B},12.5\n")
+    assert plan_total(got, Decimal("10")) == Decimal("22.5")   # 10 + 12.5
+
+
+def _dist_wallet(balance="100", batch=None):
+    info = SimpleNamespace(get_balance=lambda inst: Decimal(balance),
+                           address=ADDR_A)
+    sdk = SimpleNamespace(
+        get_account_info=AsyncMock(return_value=info),
+        batch_transfer=batch or AsyncMock(return_value={"id": "x"}),
+        transfer=AsyncMock(),
+    )
+    return SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+
+
+def _dist_manager(wallet, monkeypatch):
+    from cantex_bot import distribute as dmod
+    usdcx = InstrumentId("a", "USDCX")
+
+    class FakeMarket:
+        def instrument(self, sym):
+            return usdcx
+
+    monkeypatch.setattr(dmod.MarketMap, "build", AsyncMock(return_value=FakeMarket()))
+    return SimpleNamespace(names=["w1"], get=lambda n: wallet)
+
+
+@pytest.mark.asyncio
+async def test_distribute_sends_one_batch_not_one_per_recipient(monkeypatch):
+    """batch_transfer is one ledger transaction, so the sender pays one network
+    fee for the whole list instead of one per receiver."""
+    from cantex_bot.distribute import Recipient, distribute
+    batch = AsyncMock(return_value={"id": "x"})
+    wallet = _dist_wallet(balance="100", batch=batch)
+    manager = _dist_manager(wallet, monkeypatch)
+    out = await distribute(
+        manager, sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C, Decimal("12.5"))],
+        amount=Decimal("10"), dry_run=False)
+    assert out.sent and out.total == Decimal("22.5")
+    batch.assert_awaited_once()
+    transfers = batch.await_args.args[0]
+    assert transfers == [{"receiver": ADDR_B, "amount": Decimal("10")},
+                         {"receiver": ADDR_C, "amount": Decimal("12.5")}]
+    wallet.sdk.transfer.assert_not_awaited()          # never the one-by-one path
+
+
+@pytest.mark.asyncio
+async def test_distribute_dry_run_submits_nothing(monkeypatch):
+    from cantex_bot.distribute import Recipient, distribute
+    batch = AsyncMock()
+    wallet = _dist_wallet(batch=batch)
+    manager = _dist_manager(wallet, monkeypatch)
+    out = await distribute(manager, sender="w1", symbol="USDCX",
+                           recipients=[Recipient(ADDR_B)], amount=Decimal("10"),
+                           dry_run=True)
+    assert out.ok and out.dry_run and not out.sent
+    batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_distribute_refuses_when_the_total_exceeds_the_balance(monkeypatch):
+    """All-or-nothing on the ledger, so the whole total is checked up front —
+    a partial send is not a thing batch_transfer can do."""
+    from cantex_bot.distribute import Recipient, distribute
+    batch = AsyncMock()
+    wallet = _dist_wallet(balance="15", batch=batch)
+    manager = _dist_manager(wallet, monkeypatch)
+    out = await distribute(
+        manager, sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
+        amount=Decimal("10"), dry_run=False)
+    assert not out.ok and "only 15" in out.error
+    batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_distribute_honours_the_keep_reserve(monkeypatch):
+    """Every later swap pays its fee in CC, so a sender drained to zero cannot
+    trade — keep is subtracted before the total is checked."""
+    from cantex_bot.distribute import Recipient, distribute
+    batch = AsyncMock()
+    wallet = _dist_wallet(balance="21", batch=batch)
+    manager = _dist_manager(wallet, monkeypatch)
+    out = await distribute(
+        manager, sender="w1", symbol="CC",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
+        amount=Decimal("10"), keep=Decimal("5"), dry_run=False)
+    assert not out.ok and "keep 5" in out.error
+    batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_recipients_resolve_addresses_and_skip_the_sender(monkeypatch):
+    """The party id is not in config.toml — it comes from AccountInfo."""
+    from cantex_bot.distribute import internal_recipients
+
+    def make(name, addr):
+        info = SimpleNamespace(address=addr, get_balance=lambda i: Decimal("0"))
+        return SimpleNamespace(name=name, ensure_auth=AsyncMock(),
+                               sdk=SimpleNamespace(
+                                   get_account_info=AsyncMock(return_value=info)))
+
+    wallets = {"w1": make("w1", ADDR_A), "w2": make("w2", ADDR_B),
+               "w3": make("w3", ADDR_C)}
+    manager = SimpleNamespace(names=list(wallets), get=wallets.get)
+    got = await internal_recipients(manager, ["w1", "w2", "w3"], exclude="w1")
+    assert [(r.label, r.address) for r in got] == [("w2", ADDR_B), ("w3", ADDR_C)]
+
+
+@pytest.mark.asyncio
+async def test_internal_recipients_fail_loudly_on_an_unreadable_wallet(monkeypatch):
+    """Skipping it would silently shrink the distribution."""
+    from cantex_bot.distribute import internal_recipients
+    from cantex_bot.withdraw import WithdrawError
+    bad = SimpleNamespace(name="w2", ensure_auth=AsyncMock(),
+                          sdk=SimpleNamespace(
+                              get_account_info=AsyncMock(side_effect=RuntimeError("timeout"))))
+    manager = SimpleNamespace(names=["w2"], get=lambda n: bad)
+    with pytest.raises(WithdrawError, match="cannot read address for w2"):
+        await internal_recipients(manager, ["w2"])
+
+
 # -- fee monitor (read-only) -------------------------------------------------
 
 def _monitor_market(monkeypatch):

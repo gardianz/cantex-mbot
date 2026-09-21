@@ -1,0 +1,16 @@
+# Recipients for "Distribute (1 wallet -> many)".
+# Copy to recipients.txt (gitignored) and fill in the addresses.
+#
+# One Canton party id per line. Blank lines and # comments are ignored.
+# An optional amount after the address overrides the shared per-recipient
+# amount, so a file can mix equal shares with a few specific payouts.
+#
+#   Cantex::1220abc...            address only  -> uses the amount you type
+#   Cantex::1220def...,12.5       comma-separated amount
+#   Cantex::1220ghi... 7          whitespace-separated amount
+#
+# The whole list goes out as ONE batch_transfer: one network fee for the
+# batch, and one bad address fails all of it. Addresses are checked first.
+
+Cantex::1220000000000000000000000000000000000000000000000000000000000000
+Cantex::1220111111111111111111111111111111111111111111111111111111111111,12.5

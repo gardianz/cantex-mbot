@@ -540,6 +540,158 @@ class App:
             + (f", [red]{bad} failed[/red]" if bad else "")
         )
 
+    async def action_distribute(self) -> None:
+        """Send one token from ONE wallet to MANY receivers, in one batch.
+
+        Order matters here: read the sender's balances BEFORE asking for an
+        amount, and check the total fits BEFORE arming. Being told it does not
+        fit after typing LIVE is three steps too late.
+        """
+        from .distribute import (
+            DEFAULT_RECIPIENT_FILE, distribute, internal_recipients,
+            load_recipients, plan_total,
+        )
+
+        sender = await questionary.select(
+            "Send FROM which wallet?", choices=self.manager.names,
+        ).ask_async()
+        if not sender:
+            return
+
+        where = await questionary.select(
+            "Send TO:",
+            choices=["Internal wallets (from config.toml)",
+                     f"External addresses (file, e.g. {DEFAULT_RECIPIENT_FILE})",
+                     "Back"],
+        ).ask_async()
+        if not where or where == "Back":
+            return
+
+        try:
+            if where.startswith("Internal"):
+                others = [n for n in self.manager.names if n != sender]
+                if not others:
+                    console.print("[yellow]No other wallet configured.[/yellow]")
+                    return
+                picked = await questionary.checkbox(
+                    f"Destination wallets (sender {sender} excluded):",
+                    choices=[questionary.Choice(n) for n in others],
+                ).ask_async()
+                if not picked:
+                    console.print("[yellow]No destination selected.[/yellow]")
+                    return
+                console.print("[dim]Reading destination addresses…[/dim]")
+                recipients = await internal_recipients(
+                    self.manager, picked, exclude=sender)
+            else:
+                path = (await questionary.path(
+                    "Recipient file:", default=DEFAULT_RECIPIENT_FILE,
+                ).ask_async() or "").strip()
+                if not path:
+                    return
+                recipients = load_recipients(path)
+        except WithdrawError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+
+        # Sender balances first, and only tokens it actually holds: offering a
+        # token with a zero balance just wastes the next two prompts.
+        console.print(f"[dim]Reading {sender} balances…[/dim]")
+        try:
+            wallet = self.manager.get(sender)
+            await wallet.ensure_auth()
+            info = await wallet.sdk.get_account_info()
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Cannot read {sender}: {exc}[/red]")
+            return
+        balances: dict[str, Decimal] = {}
+        for tok in getattr(info, "tokens", []) or []:
+            sym = (tok.instrument_symbol or tok.instrument.id).upper()
+            if tok.unlocked_amount > 0:
+                balances[sym] = tok.unlocked_amount
+        if not balances:
+            console.print(f"[yellow]{sender} holds no tokens.[/yellow]")
+            return
+
+        n = len(recipients)
+        symbol = await questionary.select(
+            f"Token to send (balance in {sender}):",
+            choices=[questionary.Choice(f"{sym}  —  {bal}", value=sym)
+                     for sym, bal in sorted(balances.items())],
+        ).ask_async()
+        if not symbol:
+            return
+        balance = balances[symbol]
+
+        fixed = sum(1 for r in recipients if r.amount is not None)
+        console.print(
+            f"[bold]{sender}[/bold] holds [bold]{balance} {symbol}[/bold] · "
+            f"{n} recipient(s) · max [bold]{balance / n}[/bold] each"
+            + (f" · {fixed} recipient(s) carry their own amount" if fixed else "")
+        )
+        amount_raw = await questionary.text(
+            f"Amount per recipient ({symbol}):",
+            default="0" if fixed == n else "",
+        ).ask_async()
+        try:
+            amount = Decimal((amount_raw or "0").strip() or "0")
+        except InvalidOperation:
+            console.print("[red]Bad amount.[/red]")
+            return
+        if amount < 0:
+            console.print("[red]Amount must be >= 0.[/red]")
+            return
+
+        total = plan_total(recipients, amount)
+        if total <= 0:
+            console.print("[red]Nothing to send — total is zero.[/red]")
+            return
+        if total > balance:
+            console.print(
+                f"[red]Not enough {symbol}: need {total} for {n} recipient(s), "
+                f"{sender} has {balance}.[/red]"
+            )
+            return
+        remaining = balance - total
+
+        console.print(
+            f"[bold]DISTRIBUTE[/bold] {total} {symbol} from [cyan]{sender}[/cyan] "
+            f"to [bold]{n}[/bold] recipient(s) — "
+            f"leaving [bold]{remaining} {symbol}[/bold]"
+        )
+        for r in recipients[:10]:
+            who = f"{r.label} " if r.label else ""
+            console.print(f"  [dim]{who}[/dim]{r.address[:28]}…  "
+                          f"{r.resolved(amount)} {symbol}")
+        if n > 10:
+            console.print(f"  [dim](+{n - 10} more)[/dim]")
+        cc = self.config.strategy1.cc_symbol
+        if symbol.upper() == cc.upper() and remaining < 1:
+            console.print(
+                f"[yellow]Warning: {sender} would be left with {remaining} {cc}. "
+                f"Every swap pays its network fee in {cc}, so it could no longer "
+                f"trade.[/yellow]"
+            )
+        # One batch_transfer: one network fee, and all-or-nothing on the ledger.
+        console.print("[dim]Sent as a single batch transfer — one network fee "
+                      "for the whole list, and it succeeds or fails as one.[/dim]")
+
+        await self._choose_execution_mode()
+        if not self.engine.dry_run:
+            console.print("[bold red]Transfers are irreversible. "
+                          f"{total} {symbol} leaves {sender}.[/bold red]")
+
+        out = await distribute(
+            self.manager, sender=sender, symbol=symbol, recipients=recipients,
+            amount=amount, dry_run=self.engine.dry_run, notifier=self.notifier,
+        )
+        if out.error:
+            console.print(f"[red]{out.error}[/red]")
+            return
+        tag = "[cyan]dry-run[/cyan]" if out.dry_run else "[green]sent[/green]"
+        console.print(f"{tag} {out.total} {out.symbol} to {n} recipient(s) "
+                      f"[dim](sender had {out.balance})[/dim]")
+
     async def action_monitor(self) -> None:
         """Watch every pair's fee, slippage, pool fee and depth. Never swaps."""
         market = await self._first_market()
@@ -803,6 +955,7 @@ class App:
             "Swap 1x all pairs": self.action_swap_all,
             "Manual swap": self.action_manual_swap,
             "Withdraw (bulk)": self.action_withdraw,
+            "Distribute (1 wallet -> many)": self.action_distribute,
             "Transfer pre-approvals (activate all)": self.action_preapprovals,
             "Fee monitor (all pairs, read-only)": self.action_monitor,
             "Web check (history + rebates)": self.action_web_check,

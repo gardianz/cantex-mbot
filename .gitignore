@@ -19,3 +19,6 @@ proxies.txt
 
 # Singleton lock beside state.db
 state.db.lock
+
+# Distribution list — external addresses
+recipients.txt

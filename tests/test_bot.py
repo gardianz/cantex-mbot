@@ -1983,6 +1983,34 @@ async def test_monitor_dashboard_renders_every_column(tmp_path, monkeypatch):
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_monitor_table_does_not_stretch_with_the_terminal(tmp_path, monkeypatch):
+    """A stretching PAIR column pushed the numbers to the far edge of a wide
+    terminal, so a row had to be tracked across a screen of blank space."""
+    import io
+    from rich.console import Console as RichConsole
+    from cantex_bot.dashboard import MonitorDashboard
+    _monitor_market(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    mon = _monitor(store, SimpleNamespace(get_swap_quote=AsyncMock(
+        return_value=make_quote(net="0.55", returned="13"))))
+    await mon.sweep_once()
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
+    d = MonitorDashboard(mon, config)
+
+    def table_width(width: int) -> int:
+        buf = io.StringIO()
+        RichConsole(file=buf, width=width).print(d._table(d._sorted_rows()))
+        rows = [ln.rstrip() for ln in buf.getvalue().splitlines() if "->" in ln]
+        return max(len(ln) for ln in rows)
+
+    narrow, wide = table_width(110), table_width(220)
+    assert narrow == wide          # content-sized, not terminal-sized
+    assert wide < 120              # and nowhere near the 220 it was given
+    store.close()
+
+
 def test_monitor_dashboard_sort_cycles_and_quits(tmp_path):
     from cantex_bot.dashboard import MonitorDashboard
     from cantex_bot.monitor import MonitorState

@@ -374,8 +374,10 @@ class Dashboard:
         """Per pair (they differ per pool): latest network fee (CC) with today's
         min/avg, plus the latest slippage and pool fee (percent), and the number
         of fee observations today (n)."""
+        # expand=False: stretching this panel across a wide terminal put the
+        # numbers a screen away from the pair they belong to.
         t = Table(
-            box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
+            box=box.SIMPLE, border_style=_BORDER, expand=False, pad_edge=False,
             title="PAIR FEES  (net fee CC · slippage/pool %)",
             title_style=f"bold {_ACCENT}", title_justify="left",
         )
@@ -652,12 +654,15 @@ class MonitorDashboard:
         )
 
     def _table(self, rows: list) -> Table:
+        # expand=False and no ratio on PAIR: letting that column stretch pushed
+        # the numbers to the far edge of a wide terminal, leaving a gap you had
+        # to track a row across. The table is now only as wide as its content.
         t = Table(
-            box=box.SIMPLE, border_style=_BORDER, expand=True, pad_edge=False,
+            box=box.SIMPLE, border_style=_BORDER, expand=False, pad_edge=False,
             title="PAIRS  (net fee CC · slippage/pool % · pool depth)",
             title_style=f"bold {_ACCENT}", title_justify="left",
         )
-        t.add_column("PAIR", no_wrap=True, overflow="ellipsis", ratio=1)
+        t.add_column("PAIR", no_wrap=True, overflow="ellipsis")
         for name in ("FEE now", "min", "max", "avg"):
             t.add_column(name, justify="right", no_wrap=True)
         t.add_column("slip%", justify="right", no_wrap=True)

@@ -70,6 +70,12 @@ class Strategy1Config:
     # pool fee (it does not), but either way a wallet must never wait silently
     # for ever while the others finish. 0 disables the warning.
     guard_wait_seconds: float = 600.0
+    # A wallet loop that stops making progress for this long is dumped to the log
+    # with the stack of its own coroutine, naming the await it is parked on.
+    # Every network call below has a timeout, so a freeze that outlasts them all
+    # cannot be reasoned about from the outside — only the stack says where.
+    # 0 disables the watchdog.
+    stall_timeout_seconds: float = 300.0
     # -- loss brakes --------------------------------------------------------
     # The per-leg guards (slippage / pool fee / network fee) cannot see a whole
     # round trip, so a sell-back at a bad price still executes. These two cap the
@@ -206,6 +212,8 @@ def load_config(
         poll_far_ratio=float(s1.get("poll_far_ratio", 0.3)),
         notional_ttl_seconds=float(s1.get("notional_ttl_seconds", 60.0)),
         guard_wait_seconds=float(s1.get("guard_wait_seconds", 600.0)),
+        stall_timeout_seconds=float(
+            s1.get("stall_timeout_seconds", 300.0)),
         max_cycle_loss_pct=_dec(s1.get("max_cycle_loss_pct"),
                                 Strategy1Config.max_cycle_loss_pct),
         max_daily_loss_cc=_dec(s1.get("max_daily_loss_cc"),

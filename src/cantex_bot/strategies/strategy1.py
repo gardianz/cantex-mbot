@@ -9,6 +9,8 @@ its daily swap target. Every swap goes through SwapEngine (guards enforced).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -71,6 +73,12 @@ class Strategy1(Strategy):
         # stuck warning has already been raised for it.
         self._guard_since: dict[tuple[str, str], float] = {}
         self._guard_warned: set[tuple[str, str]] = set()
+        # Watchdog bookkeeping: when each wallet last completed a loop pass, the
+        # task running it, and the wallets deliberately parked until tomorrow.
+        self._last_progress: dict[str, float] = {}
+        self._wallet_tasks: dict[str, asyncio.Task] = {}
+        self._idle_until_day: set[str] = set()
+        self._stall_reported: set[str] = set()
 
     def _pairs_for(self, market: MarketMap):
         """base<->token pairs to trade, honouring the chosen token subset."""
@@ -90,12 +98,16 @@ class Strategy1(Strategy):
             selected = await self._selected_tokens()
             self.run_state.begin(self.manager.names, selected,
                                  base_symbol=self.base_symbol)
+        watchdog = asyncio.create_task(self._watchdog(stop))
         try:
             results = await asyncio.gather(
                 *(self._run_wallet(w, stop) for w in self.manager.wallets.values()),
                 return_exceptions=True,
             )
         finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
             if self.run_state is not None:
                 self.run_state.end()
         for name, res in zip(self.manager.names, results):
@@ -130,8 +142,16 @@ class Strategy1(Strategy):
         """Run one wallet's loop with every record below it — this module's, the
         engine's, and the SDK's — attributed to that wallet, so the dashboard can
         show one wallet's log in isolation when it stalls."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._wallet_tasks[wallet.name] = task
+        self._mark_progress(wallet.name)
         with wallet_logs(wallet.name):
-            await self._trade_wallet(wallet, stop)
+            try:
+                await self._trade_wallet(wallet, stop)
+            finally:
+                self._last_progress.pop(wallet.name, None)
+                self._wallet_tasks.pop(wallet.name, None)
 
     async def _trade_wallet(self, wallet: Wallet, stop: asyncio.Event) -> None:
         await wallet.ensure_auth()
@@ -176,6 +196,7 @@ class Strategy1(Strategy):
         usym = self.base_symbol
         run_day = datetime.now(timezone.utc).date()
         while not stop.is_set():
+            self._mark_progress(wallet.name)
             # UTC day rollover: the daily swap target resets at 00:00 UTC (Cantex
             # is UTC). Zero this run's per-day progress — session count AND the
             # web baseline — otherwise `done` carries yesterday's swaps forward.
@@ -218,6 +239,7 @@ class Strategy1(Strategy):
             if done >= target:
                 self._st(wallet.name, status=run_status.DONE,
                          route="", plan="target reached", done=done)
+                self._park_until_day(wallet.name)
                 if not await self._wait_next_day(stop):
                     break
                 continue
@@ -236,6 +258,7 @@ class Strategy1(Strategy):
                     await self.notifier.send(
                         f"🛑 {self.label} [{wallet.name}] daily loss {loss_cc:.2f} CC "
                         f">= budget {budget} CC — paused for today")
+                    self._park_until_day(wallet.name)
                     if not await self._wait_next_day(stop):
                         break
                     continue
@@ -244,6 +267,7 @@ class Strategy1(Strategy):
                                "idle until next UTC day", wallet.name, insufficient_streak)
                 self._st(wallet.name, status=run_status.STOPPED,
                          route="", plan="saldo kurang")
+                self._park_until_day(wallet.name)
                 if not await self._wait_next_day(stop):
                     break
                 continue
@@ -580,6 +604,60 @@ class Strategy1(Strategy):
         far = Decimal(str(c.poll_far_ratio))
         frac = min(gap / far, Decimal(1)) if far > 0 else Decimal(1)
         return float(Decimal(str(lo)) + frac * (Decimal(str(hi)) - Decimal(str(lo))))
+
+    def _mark_progress(self, name: str) -> None:
+        """One loop pass completed. Anything slower than the watchdog window
+        between two of these means the coroutine is parked on an await."""
+        self._last_progress[name] = time.monotonic()
+        self._idle_until_day.discard(name)
+        self._stall_reported.discard(name)
+
+    def _park_until_day(self, name: str) -> None:
+        """Idling to the next UTC day is deliberate, not a stall — the watchdog
+        must not report a wallet that has simply finished for today."""
+        self._idle_until_day.add(name)
+
+    async def _watchdog(self, stop: asyncio.Event) -> None:
+        """Report any wallet whose loop has stopped advancing, with its stack.
+
+        Every network call in the loop carries a timeout, so a freeze that
+        outlasts all of them cannot be diagnosed from the symptoms — the same
+        row reads "proses swap" whether the swap is slow or the coroutine is
+        parked for ever. ``Task.print_stack`` names the exact await instead.
+        """
+        limit = self.config.stall_timeout_seconds
+        if limit <= 0:
+            return
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(60.0, limit))
+                return
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            for name, last in list(self._last_progress.items()):
+                if name in self._idle_until_day or name in self._stall_reported:
+                    continue
+                idle = now - last
+                if idle < limit:
+                    continue
+                self._stall_reported.add(name)
+                task = self._wallet_tasks.get(name)
+                where = "task not found"
+                if task is not None and not task.done():
+                    buf = io.StringIO()
+                    try:
+                        task.print_stack(limit=14, file=buf)
+                        where = buf.getvalue()
+                    except Exception as exc:  # noqa: BLE001 - diagnostics only
+                        where = f"stack unavailable: {exc}"
+                logger.error(
+                    "[%s] STALLED %.0fs with no loop progress — parked here:\n%s",
+                    name, idle, where)
+                await self.notifier.send(
+                    f"🧊 {self.label} [{name}] stalled {idle / 60:.0f}m with no "
+                    f"progress — stack written to cantex_bot.log"
+                )
 
     def _blocking_guard(self, outcome) -> tuple[str, bool]:
         """``(label, static)`` for whatever the guard actually rejected.

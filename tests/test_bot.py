@@ -1401,6 +1401,83 @@ def test_explicit_tag_beats_context(monkeypatch):
     assert ls.recent_logs(10, wallet="w1") == []
 
 
+# -- stall watchdog ----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_watchdog_dumps_the_stack_of_a_parked_wallet(tmp_path, monkeypatch, caplog):
+    """Every network call in the loop has a timeout, so a freeze that outlasts
+    them all cannot be diagnosed from the symptoms — the row reads the same
+    whether a swap is slow or the coroutine is parked for ever. The stack names
+    the actual await."""
+    import asyncio as _a
+    import logging
+    strat, _e, _rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat.config = Strategy1Config(stall_timeout_seconds=0.05)
+    sent = []
+    strat.notifier = SimpleNamespace(send=AsyncMock(side_effect=sent.append))
+
+    async def parked_for_ever():
+        await _a.Event().wait()          # a distinctive await to find in the dump
+
+    task = _a.create_task(parked_for_ever())
+    strat._wallet_tasks["w1"] = task
+    strat._last_progress["w1"] = 0.0     # long past the limit
+
+    stop = _a.Event()
+    with caplog.at_level(logging.ERROR):
+        watch = _a.create_task(strat._watchdog(stop))
+        await _a.sleep(0.2)
+        stop.set()
+        await watch
+    task.cancel()
+
+    dump = "\n".join(r.message for r in caplog.records)
+    assert "STALLED" in dump and "w1" in dump
+    assert "parked_for_ever" in dump      # the real await, not a guess
+    assert len(sent) == 1 and "stalled" in sent[0]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_reports_once_and_not_for_deliberate_idling(tmp_path, monkeypatch):
+    """A wallet that finished for the day idles until the next UTC day on
+    purpose — reporting that as a freeze would bury the real ones."""
+    import asyncio as _a
+    strat, _e, _rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat.config = Strategy1Config(stall_timeout_seconds=0.05)
+    sent = []
+    strat.notifier = SimpleNamespace(send=AsyncMock(side_effect=sent.append))
+    strat._wallet_tasks["w1"] = _a.create_task(_a.sleep(5))
+    strat._last_progress["w1"] = 0.0
+
+    strat._park_until_day("w1")
+    stop = _a.Event()
+    watch = _a.create_task(strat._watchdog(stop))
+    await _a.sleep(0.2)
+    assert sent == []                    # parked on purpose, not stalled
+
+    strat._mark_progress("w1")           # back to work
+    strat._last_progress["w1"] = 0.0     # then stops advancing again
+    await _a.sleep(0.2)
+    stop.set(); await watch
+    strat._wallet_tasks["w1"].cancel()
+    assert len(sent) == 1                # reported once, not every tick
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_off_when_disabled(tmp_path, monkeypatch):
+    import asyncio as _a
+    strat, _e, _rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=3)
+    strat.config = Strategy1Config(stall_timeout_seconds=0)
+    strat.notifier = SimpleNamespace(send=AsyncMock())
+    strat._last_progress["w1"] = 0.0
+    stop = _a.Event()
+    await _a.wait_for(strat._watchdog(stop), timeout=1)   # returns immediately
+    strat.notifier.send.assert_not_awaited()
+    store.close()
+
+
 # -- a wallet must never wait on a guard silently ----------------------------
 
 def _guard_outcome(slip="0.01", pool="0.10", fee="0.50"):

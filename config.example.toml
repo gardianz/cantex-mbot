@@ -58,6 +58,12 @@ notional_ttl_seconds = 60
 # a pool fee never does, so a wallet holding a token whose pool fee is above
 # max_pool_fee_pct can otherwise poll for ever while the others finish. 0 = off.
 guard_wait_seconds = 600
+# A wallet loop that stops advancing for this long is dumped to cantex_bot.log
+# with the stack of its own coroutine, naming the await it is parked on, and a
+# Telegram warning goes out. Every network call already has a timeout, so a
+# freeze that outlasts them all cannot be diagnosed from the symptoms — the row
+# reads the same whether a swap is slow or the loop is wedged. 0 = off.
+stall_timeout_seconds = 300
 
 # Loss brakes. The [guards] limits are per-leg and cannot see a whole round
 # trip, so a sell-back at a bad price still executes. These cap the damage;

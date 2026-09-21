@@ -67,6 +67,10 @@ class Strategy1(Strategy):
         self._held_since: dict[tuple[str, str], float] = {}
         # Per-wallet cache of (monotonic_ts, base value of cc_units CC).
         self._notional_cache: dict[str, tuple[float, Decimal]] = {}
+        # When a (wallet, route) first hit a guard rejection, and whether the
+        # stuck warning has already been raised for it.
+        self._guard_since: dict[tuple[str, str], float] = {}
+        self._guard_warned: set[tuple[str, str]] = set()
 
     def _pairs_for(self, market: MarketMap):
         """base<->token pairs to trade, honouring the chosen token subset."""
@@ -361,6 +365,7 @@ class Strategy1(Strategy):
                 if await self._confirm_via_history(wallet, pre_web):
                     insufficient_streak = 0
                     consecutive_fail = 0
+                    self._clear_guard_wait(wallet.name, route)
                     session_executed += 1
                     if step == "sell":
                         self._clear_hold(wallet.name, tok)
@@ -379,6 +384,7 @@ class Strategy1(Strategy):
 
             insufficient_streak = 0
             if out.counted:
+                self._clear_guard_wait(wallet.name, route)
                 session_executed += 1
                 if step == "sell":
                     # Position closed — only now may the hold timer restart.
@@ -406,10 +412,16 @@ class Strategy1(Strategy):
                     plan = f"fee naik >{limit}"
                     delay = self.config.poll_max_seconds
                 else:
-                    plan = f"wait fee {fee:.3f}" if fee is not None else "wait fee"
+                    # Name the limit that is actually biting, and escalate to
+                    # "stuck" once the wait stops being plausible — a wallet that
+                    # can never pass a guard used to poll for ever while the
+                    # others finished, showing only a row that never moved.
+                    label, static = self._blocking_guard(out)
+                    plan = await self._note_guard_wait(
+                        wallet, route, label, static)
                     delay = self._poll_interval(out)
                 if force_sl:
-                    # Stop armed but the fee guard says no — say so, so the row
+                    # Stop armed but a guard says no — say so, so the row
                     # doesn't look like an ordinary wait.
                     plan = f"SL {plan}"
                 self._st(wallet.name, status=run_status.WAITING,
@@ -568,6 +580,67 @@ class Strategy1(Strategy):
         far = Decimal(str(c.poll_far_ratio))
         frac = min(gap / far, Decimal(1)) if far > 0 else Decimal(1)
         return float(Decimal(str(lo)) + frac * (Decimal(str(hi)) - Decimal(str(lo))))
+
+    def _blocking_guard(self, outcome) -> tuple[str, bool]:
+        """``(label, static)`` for whatever the guard actually rejected.
+
+        The status column used to read "wait fee" for every rejection, so a leg
+        blocked on slippage or a pool fee looked like it was waiting out a
+        network fee that would come down. Read the measured values rather than
+        the reason text, and say which limit is biting.
+
+        ``static`` marks a pool fee: that is a property of the pool, so waiting
+        for it to fall is waiting for nothing.
+        """
+        details = outcome.guard.details if outcome.guard else {}
+        limits = self.engine.guard.config
+        pool = details.get("pool_fee_pct")
+        slip = details.get("slippage_pct")
+        fee = details.get("network_fee")
+        if pool is not None and pool > limits.max_pool_fee_pct:
+            return f"pool {pool:.3f}>{limits.max_pool_fee_pct}", True
+        if slip is not None and slip > limits.max_slippage:
+            return f"slip {slip:.3f}>{limits.max_slippage}", False
+        if fee is not None and fee > limits.max_network_fee:
+            return f"fee {fee:.3f}", False
+        return "guard", False
+
+    async def _note_guard_wait(
+        self, wallet: Wallet, route: str, label: str, static: bool,
+    ) -> str:
+        """Track how long this leg has been rejected; return the status text.
+
+        A wallet that can never satisfy a guard would otherwise poll for ever
+        while the others reach their target — visible only as a row that never
+        moves. Past ``guard_wait_seconds`` it says so, and says why, once.
+        """
+        limit = self.config.guard_wait_seconds
+        if limit <= 0:
+            return f"tunggu {label}"
+        key = (wallet.name, route)
+        first = self._guard_since.setdefault(key, time.monotonic())
+        waited = time.monotonic() - first
+        if waited < limit:
+            return f"tunggu {label}"
+        if key not in self._guard_warned:
+            self._guard_warned.add(key)
+            logger.warning(
+                "[%s] stuck %.0fm on %s: %s%s", wallet.name, waited / 60, route,
+                label,
+                " — a pool fee does not change, so this will not clear itself"
+                if static else "")
+            await self.notifier.send(
+                f"⚠️ {self.label} [{wallet.name}] stuck {waited / 60:.0f}m on "
+                f"{route} — {label}"
+                + (" (pool fee is fixed; raise max_pool_fee_pct or drop this pair)"
+                   if static else "")
+            )
+        return f"stuck: {label}"
+
+    def _clear_guard_wait(self, wallet_name: str, route: str) -> None:
+        key = (wallet_name, route)
+        self._guard_since.pop(key, None)
+        self._guard_warned.discard(key)
 
     async def _buy_notional(
         self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,

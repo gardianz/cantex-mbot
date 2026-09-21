@@ -53,6 +53,11 @@ poll_far_ratio = 0.3       # fee >= 30% above threshold -> use poll_max
 # is sent in the base, so a CC/base move changes what each buy is really worth;
 # priced only once it drifts (a 17% CC move made a 110 CC buy land as 94 CC).
 notional_ttl_seconds = 60
+# How long a leg may sit rejected by the guards before the row says "stuck" and
+# a warning goes to Telegram. Waiting out a network fee is fine — it moves — but
+# a pool fee never does, so a wallet holding a token whose pool fee is above
+# max_pool_fee_pct can otherwise poll for ever while the others finish. 0 = off.
+guard_wait_seconds = 600
 
 # Loss brakes. The [guards] limits are per-leg and cannot see a whole round
 # trip, so a sell-back at a bad price still executes. These cap the damage;

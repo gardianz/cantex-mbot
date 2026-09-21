@@ -1401,6 +1401,93 @@ def test_explicit_tag_beats_context(monkeypatch):
     assert ls.recent_logs(10, wallet="w1") == []
 
 
+# -- a wallet must never wait on a guard silently ----------------------------
+
+def _guard_outcome(slip="0.01", pool="0.10", fee="0.50"):
+    return SimpleNamespace(
+        counted=False, ok=False, error=None, reject_reasons=["blocked"],
+        submitted_attempt=False, fee_rejected=False, buy_amount=Decimal("0"),
+        buy_symbol="CBTC",
+        guard=SimpleNamespace(details={
+            "slippage_pct": Decimal(slip),
+            "pool_fee_pct": Decimal(pool),
+            "network_fee": Decimal(fee)}))
+
+
+def _guard_strat(tmp_path, monkeypatch, **limits):
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=99)
+    engine.guard = SimpleNamespace(config=SimpleNamespace(
+        max_slippage=Decimal(limits.get("slip", "0.07")),
+        max_pool_fee_pct=Decimal(limits.get("pool", "0.16")),
+        max_network_fee=Decimal(limits.get("fee", "0.46"))))
+    return strat, engine, rs, store
+
+
+def test_blocking_guard_names_the_limit_that_is_biting(tmp_path, monkeypatch):
+    """'wait fee' was printed for every rejection, so a leg blocked on slippage
+    or a pool fee looked like it was waiting out a network fee."""
+    strat, _e, _rs, store = _guard_strat(tmp_path, monkeypatch)
+    assert strat._blocking_guard(_guard_outcome(pool="0.20")) == (
+        "pool 0.200>0.16", True)                      # static: will not clear
+    assert strat._blocking_guard(_guard_outcome(slip="0.09")) == (
+        "slip 0.090>0.07", False)
+    label, static = strat._blocking_guard(_guard_outcome(fee="0.55"))
+    assert label == "fee 0.550" and static is False
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_escalates_to_stuck(tmp_path, monkeypatch):
+    """Past guard_wait_seconds the row says stuck, and says it once."""
+    strat, _e, _rs, store = _guard_strat(tmp_path, monkeypatch)
+    strat.config = Strategy1Config(guard_wait_seconds=600)
+    sent = []
+    strat.notifier = SimpleNamespace(send=AsyncMock(side_effect=sent.append))
+    wallet = SimpleNamespace(name="w1")
+
+    plan = await strat._note_guard_wait(wallet, "sell EXAG", "pool 0.20>0.16", True)
+    assert plan == "tunggu pool 0.20>0.16" and sent == []
+
+    strat._guard_since[("w1", "sell EXAG")] = 0.0      # pretend 600s+ has passed
+    plan = await strat._note_guard_wait(wallet, "sell EXAG", "pool 0.20>0.16", True)
+    assert plan.startswith("stuck:")
+    assert len(sent) == 1 and "stuck" in sent[0]
+    assert "pool fee is fixed" in sent[0]             # says why waiting is futile
+
+    await strat._note_guard_wait(wallet, "sell EXAG", "pool 0.20>0.16", True)
+    assert len(sent) == 1                              # warned once, not per poll
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_resets_when_the_leg_gets_through(tmp_path, monkeypatch):
+    """A cleared blockage must not leave the next wait pre-aged into 'stuck'."""
+    strat, _e, _rs, store = _guard_strat(tmp_path, monkeypatch)
+    strat.config = Strategy1Config(guard_wait_seconds=600)
+    strat.notifier = SimpleNamespace(send=AsyncMock())
+    wallet = SimpleNamespace(name="w1")
+    strat._guard_since[("w1", "sell EXAG")] = 0.0
+    assert (await strat._note_guard_wait(
+        wallet, "sell EXAG", "fee 0.55", False)).startswith("stuck:")
+    strat._clear_guard_wait("w1", "sell EXAG")
+    assert await strat._note_guard_wait(
+        wallet, "sell EXAG", "fee 0.55", False) == "tunggu fee 0.55"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_can_be_disabled(tmp_path, monkeypatch):
+    strat, _e, _rs, store = _guard_strat(tmp_path, monkeypatch)
+    strat.config = Strategy1Config(guard_wait_seconds=0)
+    strat.notifier = SimpleNamespace(send=AsyncMock())
+    wallet = SimpleNamespace(name="w1")
+    for _ in range(3):
+        plan = await strat._note_guard_wait(wallet, "sell EXAG", "fee 0.55", False)
+    assert plan == "tunggu fee 0.55"
+    strat.notifier.send.assert_not_awaited()
+    store.close()
+
+
 # -- PAIR FEES shows only what is being traded -------------------------------
 
 def _pair_stat(pair):

@@ -65,6 +65,11 @@ class Strategy1Config:
     # buy is actually worth; priced once at start-up it goes stale within hours,
     # and a wallet idles through the UTC rollover and keeps trading for days.
     notional_ttl_seconds: float = 60.0
+    # How long a leg may sit rejected by the guards before the wallet is called
+    # stuck. Waiting is right for a network fee (it moves) and pointless for a
+    # pool fee (it does not), but either way a wallet must never wait silently
+    # for ever while the others finish. 0 disables the warning.
+    guard_wait_seconds: float = 600.0
     # -- loss brakes --------------------------------------------------------
     # The per-leg guards (slippage / pool fee / network fee) cannot see a whole
     # round trip, so a sell-back at a bad price still executes. These two cap the
@@ -200,6 +205,7 @@ def load_config(
         poll_max_seconds=float(s1.get("poll_max_seconds", 5.0)),
         poll_far_ratio=float(s1.get("poll_far_ratio", 0.3)),
         notional_ttl_seconds=float(s1.get("notional_ttl_seconds", 60.0)),
+        guard_wait_seconds=float(s1.get("guard_wait_seconds", 600.0)),
         max_cycle_loss_pct=_dec(s1.get("max_cycle_loss_pct"),
                                 Strategy1Config.max_cycle_loss_pct),
         max_daily_loss_cc=_dec(s1.get("max_daily_loss_cc"),

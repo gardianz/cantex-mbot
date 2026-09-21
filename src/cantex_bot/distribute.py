@@ -272,12 +272,18 @@ async def distribute(
         if result.sent and i < count:
             await asyncio.sleep(cooldown)   # only pace real submissions
 
+    # Reporting must never lose the result. By here the transfers are final, so
+    # anything that goes wrong building or sending this line is logged and
+    # swallowed — raising would hide from the caller what already happened.
     if notifier is not None:
-        bad = len(out.failed)
-        tag = "🧪 DRY-RUN " if dry_run else "📤 "
-        await notifier.send(
-            f"{tag}distribute {out.sent_total} {out.symbol} from {sender} to "
-            f"{count - bad}/{count} recipient(s)"
-            + (f", {bad} failed" if bad else "")
-        )
+        try:
+            bad = len(out.failed)
+            tag = "🧪 DRY-RUN " if dry_run else "📤 "
+            await notifier.send(
+                f"{tag}distribute {out.ok_total} {out.symbol} from {sender} to "
+                f"{count - bad}/{count} recipient(s)"
+                + (f", {bad} failed" if bad else "")
+            )
+        except Exception as exc:  # noqa: BLE001 - the sends already happened
+            logger.error("[%s] distribute notification failed: %s", sender, exc)
     return out

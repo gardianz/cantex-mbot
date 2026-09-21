@@ -99,6 +99,7 @@ The daily swap target counts from the **web history**, not the local counter —
 - **Dashboard `plan` strings are Indonesian** ("saldo kurang", "proses swap", "tunggu rugi", "swap berhasil"). Match that when adding phases.
 - **Word a loss, don't sign it.** The LOSS column reads negative as a *gain*, so a signed percentage in a status string means the opposite of the same sign in the table.
 - **Per-wallet isolation.** Every sweep/batch catches per wallet (`except Exception  # noqa: BLE001`) so one bad wallet never aborts the rest. Keep that.
+- **Reporting must never lose the result.** Once transfers or ledger transactions have gone out, the closing notifier call is wrapped and its failure only logged — raising there tells the caller the run failed when it in fact succeeded. A renamed attribute in that line once surfaced as `'DistributeOutcome' object has no attribute 'sent_total'` *after* 40 transfers had landed. Tests must exercise the notifier path for anything that moves funds.
 - New response data from the SDK is a frozen dataclass; parse via `_from_raw`, never construct from raw dicts.
 - Never commit `.env`, `config.toml`, `secrets/`, `state.db`, or `*.log`.
 - **README drift**: `README.md` says "`dry_run = true` is the default". That is the `NetworkConfig` code default, but `config.example.toml` ships `dry_run = false` — so a config copied from the example starts in live mode (still gated by the `LIVE` prompt). Trust the code and the example file.

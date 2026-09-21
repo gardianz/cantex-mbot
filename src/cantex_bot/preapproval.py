@@ -191,13 +191,18 @@ async def approve_selected(
         if on_result is not None:
             on_result(out, i, total)
 
+    # Already-submitted ledger transactions must not be hidden by a bad summary.
     if notifier is not None:
-        done = sum(len(o.approved) for o in outcomes)
-        bad = sum(len(o.failed) for o in outcomes) + sum(
-            1 for o in outcomes if o.error)
-        tag = "🧪 DRY-RUN " if dry_run else "✅ "
-        await notifier.send(
-            f"{tag}pre-approvals: {done} token(s) across {len(outcomes)} wallet(s)"
-            + (f", {bad} failed" if bad else "")
-        )
+        try:
+            done = sum(len(o.approved) for o in outcomes)
+            bad = sum(len(o.failed) for o in outcomes) + sum(
+                1 for o in outcomes if o.error)
+            tag = "🧪 DRY-RUN " if dry_run else "✅ "
+            await notifier.send(
+                f"{tag}pre-approvals: {done} token(s) across "
+                f"{len(outcomes)} wallet(s)"
+                + (f", {bad} failed" if bad else "")
+            )
+        except Exception as exc:  # noqa: BLE001 - the approvals already happened
+            logger.error("pre-approval notification failed: %s", exc)
     return outcomes

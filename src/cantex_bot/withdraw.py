@@ -147,11 +147,16 @@ async def withdraw_selected(
         if out.sent:
             await asyncio.sleep(cooldown)  # only pace real submissions
 
+    # The transfers are final by now; a failure while reporting them must not
+    # take the outcomes down with it.
     if notifier is not None:
-        ok = sum(1 for o in outcomes if o.ok)
-        total = sum((o.amount for o in outcomes if o.ok), Decimal(0))
-        tag = "🧪 DRY-RUN " if dry_run else "📤 "
-        await notifier.send(
-            f"{tag}withdraw {sym}: {ok}/{len(outcomes)} wallets, "
-            f"{total} {sym} → {receiver[:20]}…")
+        try:
+            ok = sum(1 for o in outcomes if o.ok)
+            total = sum((o.amount for o in outcomes if o.ok), Decimal(0))
+            tag = "🧪 DRY-RUN " if dry_run else "📤 "
+            await notifier.send(
+                f"{tag}withdraw {sym}: {ok}/{len(outcomes)} wallets, "
+                f"{total} {sym} → {receiver[:20]}…")
+        except Exception as exc:  # noqa: BLE001 - the sends already happened
+            logger.error("withdraw notification failed: %s", exc)
     return outcomes

@@ -1496,6 +1496,75 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     store.close()
 
 
+# -- reporting must not lose the result --------------------------------------
+
+@pytest.mark.asyncio
+async def test_distribute_notifies_with_the_real_total(monkeypatch):
+    """The notifier path was never exercised, so a renamed attribute reached
+    production: 40 transfers landed, then the summary raised and the caller saw
+    only 'object has no attribute'."""
+    from cantex_bot.distribute import Recipient, distribute
+    wallet = _dist_wallet(balance="100")
+    manager = _dist_manager(wallet, monkeypatch)
+    sent = []
+    notifier = SimpleNamespace(send=AsyncMock(side_effect=lambda m: sent.append(m)))
+    out = await distribute(
+        manager, sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
+        amount=Decimal("20"), dry_run=False, cooldown=0, notifier=notifier)
+    assert out.ok and out.ok_total == Decimal("40")
+    assert "40" in sent[0] and "2/2" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_a_broken_notifier_cannot_hide_completed_transfers(monkeypatch):
+    """By the time we report, the money has moved. Raising there would tell the
+    caller the run failed when every transfer actually succeeded."""
+    from cantex_bot.distribute import Recipient, distribute
+    wallet = _dist_wallet(balance="100")
+    manager = _dist_manager(wallet, monkeypatch)
+    notifier = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("telegram down")))
+    out = await distribute(
+        manager, sender="w1", symbol="USDCX", recipients=[Recipient(ADDR_B)],
+        amount=Decimal("20"), dry_run=False, cooldown=0, notifier=notifier)
+    assert out.ok and out.ok_total == Decimal("20")   # result survives
+    assert out.error is None
+    assert wallet.sdk.transfer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_broken_notifier_cannot_hide_completed_withdrawals():
+    from cantex_bot.withdraw import withdraw_selected
+    from cantex_bot.swap_all import AmountSpec
+    from cantex_bot.markets import Pair
+    import cantex_bot.withdraw as wmod
+
+    usdcx = InstrumentId("a", "USDCX")
+
+    class FakeMarket:
+        def instrument(self, sym):
+            return usdcx
+
+    info = SimpleNamespace(get_balance=lambda i: Decimal("100"))
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                             sdk=SimpleNamespace(
+                                 get_account_info=AsyncMock(return_value=info),
+                                 transfer=AsyncMock(return_value={"id": "x"})))
+    manager = SimpleNamespace(names=["w1"], get=lambda n: wallet)
+    original = wmod.MarketMap.build
+    wmod.MarketMap.build = AsyncMock(return_value=FakeMarket())
+    try:
+        notifier = SimpleNamespace(
+            send=AsyncMock(side_effect=RuntimeError("telegram down")))
+        outs = await withdraw_selected(
+            manager, wallet_names=["w1"], symbol="USDCX",
+            receiver=ADDR_B, amount=AmountSpec.parse("10"),
+            dry_run=False, notifier=notifier, cooldown=0)
+    finally:
+        wmod.MarketMap.build = original
+    assert len(outs) == 1 and outs[0].sent        # the transfer still counted
+
+
 # -- address export ----------------------------------------------------------
 
 def _addr_manager(mapping, broken=()):

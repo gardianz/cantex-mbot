@@ -1401,6 +1401,78 @@ def test_explicit_tag_beats_context(monkeypatch):
     assert ls.recent_logs(10, wallet="w1") == []
 
 
+# -- PAIR FEES shows only what is being traded -------------------------------
+
+def _pair_stat(pair):
+    from cantex_bot.store import PairStats
+    return PairStats(pair=pair, fee_now=Decimal("0.5"), fee_min=Decimal("0.4"),
+                     fee_max=Decimal("0.6"), fee_avg=Decimal("0.5"),
+                     slippage=Decimal("0.05"), pool_fee=Decimal("0.1"),
+                     pool_size=Decimal("1000"), samples=60)
+
+
+def _pair_dash(pair_names, run_state):
+    from cantex_bot.dashboard import Dashboard
+    svc = SimpleNamespace(pair_fees=[_pair_stat(p) for p in pair_names],
+                          manager=SimpleNamespace(names=["w1"]))
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="x"),
+        strategy1=SimpleNamespace(usdcx_symbol="USDCX", daily_swap_target=50))
+    return Dashboard(svc, config, run_state)
+
+
+def test_pair_fees_shows_only_the_traded_pairs():
+    """fee_obs accumulates every pair ever quoted — the monitor sweeps the whole
+    market and earlier runs used other bases. Sixty rows buried the two in use."""
+    from cantex_bot.runstate import RunState
+    rs = RunState()
+    rs.begin(["w1"], ["CBTC"], base_symbol="TF-USDT")
+    d = _pair_dash([
+        "TF-USDT->CBTC", "CBTC->TF-USDT",        # traded, both directions
+        "TF-USDT->EDELX", "EDELX->TF-USDT",      # same base, not selected
+        "FRXUSD.B->CBTC", "EXAU->TF-USDT",       # other base entirely
+    ], rs)
+    assert sorted(st.pair for st in d._traded_pairs(d.service.pair_fees)) == [
+        "CBTC->TF-USDT", "TF-USDT->CBTC"]
+
+
+def test_pair_fees_panel_disappears_when_nothing_is_running():
+    """No strategy has run, so there is no 'current' pair — and the fee monitor
+    already covers the market-wide view."""
+    from cantex_bot.runstate import RunState
+    d = _pair_dash(["TF-USDT->CBTC", "FRXUSD.B->CBTC"], RunState())
+    assert d._traded_pairs(d.service.pair_fees) == []
+    assert _pair_dash(["TF-USDT->CBTC"], None)._traded_pairs(
+        [_pair_stat("TF-USDT->CBTC")]) == []
+
+
+def test_pair_fees_follow_a_base_change():
+    """Switching base must not leave the previous base's rows on screen."""
+    from cantex_bot.runstate import RunState
+    rs = RunState()
+    rs.begin(["w1"], ["CBTC"], base_symbol="TF-USDT")
+    stats = [_pair_stat("TF-USDT->CBTC"), _pair_stat("FRXUSD.B->CBTC")]
+    d = _pair_dash([], rs)
+    assert [st.pair for st in d._traded_pairs(stats)] == ["TF-USDT->CBTC"]
+    rs.begin(["w1"], ["CBTC"], base_symbol="FRXUSD.B")
+    assert [st.pair for st in d._traded_pairs(stats)] == ["FRXUSD.B->CBTC"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_render_drops_the_panel_with_no_run():
+    import io
+    from rich.console import Console as RichConsole
+    from cantex_bot.dashboard import Dashboard
+    svc = _fake_portfolio()
+    await svc.refresh_all()
+    svc.pair_fees = [_pair_stat("USDCX->CBTC")]
+    config = SimpleNamespace(
+        network=SimpleNamespace(dry_run=True, base_url="https://api.cantex.io"))
+    buf = io.StringIO()
+    RichConsole(file=buf, width=200).print(Dashboard(svc, config).render())
+    assert "PAIR FEES" not in buf.getvalue()
+
+
 # -- dashboard clock ---------------------------------------------------------
 
 @pytest.mark.asyncio

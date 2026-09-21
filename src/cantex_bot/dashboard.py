@@ -149,10 +149,32 @@ class Dashboard:
         panel = (min(pf, _MAX_PAIR_ROWS) + 3) if pf else 0
         return max(4, self.console.size.height - 20 - panel)
 
+    def _traded_pairs(self, stats: list) -> list:
+        """Only the pairs the run is actually trading.
+
+        ``fee_obs`` accumulates every pair ever quoted: the fee monitor sweeps
+        the whole market, and earlier runs used other bases. Painting all of it
+        buried the handful being traded under sixty rows — and the monitor
+        already exists for the market-wide view.
+
+        Nothing selected (no strategy has run) means nothing to show, and
+        ``render`` drops the panel entirely.
+        """
+        if self.run_state is None or not self.run_state.selected_tokens:
+            return []
+        base = self._base_symbol()
+        wanted = set()
+        for token in self.run_state.selected_tokens:
+            sym = token.upper()
+            wanted.add(f"{base}->{sym}")
+            wanted.add(f"{sym}->{base}")
+        return [st for st in stats if st.pair.upper() in wanted]
+
     def render(self) -> Group:
         # Read the cached per-pair stats (PortfolioService computes them off the
         # event loop). Never query the DB from render — it runs every tick/key.
-        self._pairs = getattr(self.service, "pair_fees", []) or []
+        self._pairs = self._traded_pairs(
+            getattr(self.service, "pair_fees", []) or [])
         page = self._page_size()
         names = self.service.manager.names
         n = len(names)
@@ -378,7 +400,8 @@ class Dashboard:
         # numbers a screen away from the pair they belong to.
         t = Table(
             box=box.SIMPLE, border_style=_BORDER, expand=False, pad_edge=False,
-            title="PAIR FEES  (net fee CC · slippage/pool %)",
+            title=f"PAIR FEES · {self._base_symbol()}  "
+                  "(net fee CC · slippage/pool %)",
             title_style=f"bold {_ACCENT}", title_justify="left",
         )
         t.add_column("PAIR", no_wrap=True, overflow="ellipsis")

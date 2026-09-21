@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .addresses import collect_addresses
 from .markets import MarketMap
 from .wallets import WalletManager
 from .withdraw import WithdrawError, validate_receiver
@@ -166,24 +167,20 @@ async def internal_recipients(
 ) -> list[Recipient]:
     """Resolve configured wallets to their Canton party ids.
 
-    The address is not in ``config.toml`` — it comes from ``AccountInfo`` — so
-    each wallet authenticates once here. A wallet that cannot be read is an
-    error, not a skip: leaving it out would silently shrink the distribution.
+    Shares :func:`addresses.collect_addresses` with the address export, but
+    applies the opposite failure rule: a wallet that cannot be read is an error,
+    not a skip. Quietly leaving one out would shrink the distribution without
+    saying so.
     """
-    out: list[Recipient] = []
-    for name in names:
-        if name == exclude:
-            continue
-        wallet = manager.get(name)
-        try:
-            await wallet.ensure_auth()
-            info = await wallet.sdk.get_account_info()
-        except Exception as exc:  # noqa: BLE001 - report which wallet, then stop
-            raise WithdrawError(f"cannot read address for {name}: {exc}") from None
-        out.append(Recipient(address=validate_receiver(info.address), label=name))
-    if not out:
+    wanted = [n for n in names if n != exclude]
+    if not wanted:
         raise WithdrawError("no destination wallets selected")
-    return out
+    found, failed = await collect_addresses(manager, wanted)
+    if failed:
+        detail = "; ".join(f"{n}: {e}" for n, e in failed.items())
+        raise WithdrawError(f"cannot read address for {detail}")
+    return [Recipient(address=validate_receiver(a.address), label=a.name)
+            for a in found]
 
 
 def plan_total(recipients: list[Recipient], default: Decimal) -> Decimal:

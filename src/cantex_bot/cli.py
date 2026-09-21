@@ -715,6 +715,59 @@ class App:
             console.print("[yellow]Partial: the successful transfers are already "
                           "final. Re-run for the failed ones only.[/yellow]")
 
+    async def action_export_addresses(self) -> None:
+        """Write every wallet's Canton party id to a text file, one per line."""
+        from .addresses import (
+            DEFAULT_ADDRESS_FILE, collect_addresses, write_addresses,
+        )
+
+        n = len(self.manager.names)
+        path = (await questionary.path(
+            f"Write {n} wallet address(es) to:", default=DEFAULT_ADDRESS_FILE,
+        ).ask_async() or "").strip()
+        if not path:
+            return
+        target = Path(path)
+        if target.exists():
+            overwrite = await questionary.confirm(
+                f"{target} exists — overwrite?", default=False,
+            ).ask_async()
+            if not overwrite:
+                console.print("[yellow]Cancelled.[/yellow]")
+                return
+
+        # The party id comes from AccountInfo, so each wallet authenticates once;
+        # with dozens of them that is slow enough to need a progress line.
+        console.print(f"[dim]Reading {n} address(es)…[/dim]")
+
+        def _line(name: str, address, i: int, count: int) -> None:
+            head = f"[dim]{i}/{count}[/dim] {name}"
+            if address:
+                console.print(f"{head} {address[:32]}…")
+            else:
+                console.print(f"{head} [red]failed[/red]")
+
+        found, failed = await collect_addresses(self.manager, on_result=_line)
+        if not found:
+            console.print("[red]No address could be read.[/red]")
+            return
+        try:
+            written = write_addresses(target, found)
+        except OSError as exc:
+            console.print(f"[red]Cannot write {target}: {exc}[/red]")
+            return
+
+        console.print(f"[green]Wrote {written} address(es)[/green] to {target}")
+        if failed:
+            # Say which ones, so the file is not mistaken for the full set.
+            console.print(
+                f"[yellow]{len(failed)} wallet(s) missing from the file:[/yellow] "
+                + ", ".join(sorted(failed))
+            )
+        console.print("[dim]Wallet names are '#' comments, so this file also "
+                      "works as a recipients list for Distribute. For bare ids: "
+                      "grep -v '^#'[/dim]")
+
     async def action_monitor(self) -> None:
         """Watch every pair's fee, slippage, pool fee and depth. Never swaps."""
         market = await self._first_market()
@@ -979,6 +1032,7 @@ class App:
             "Manual swap": self.action_manual_swap,
             "Withdraw (bulk)": self.action_withdraw,
             "Distribute (1 wallet -> many)": self.action_distribute,
+            "Export wallet addresses (party ids)": self.action_export_addresses,
             "Transfer pre-approvals (activate all)": self.action_preapprovals,
             "Fee monitor (all pairs, read-only)": self.action_monitor,
             "Web check (history + rebates)": self.action_web_check,

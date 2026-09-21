@@ -22,3 +22,6 @@ state.db.lock
 
 # Distribution list — external addresses
 recipients.txt
+
+# Exported party ids — maps wallet names to on-chain identities
+wallet_addresses.txt

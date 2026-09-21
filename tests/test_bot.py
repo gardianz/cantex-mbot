@@ -1496,6 +1496,81 @@ async def test_loop_buys_at_the_repriced_size(tmp_path, monkeypatch):
     store.close()
 
 
+# -- address export ----------------------------------------------------------
+
+def _addr_manager(mapping, broken=()):
+    """mapping: name -> address. Names in `broken` raise instead."""
+    def make(name):
+        if name in broken:
+            sdk = SimpleNamespace(
+                get_account_info=AsyncMock(side_effect=RuntimeError("timed out")))
+        else:
+            info = SimpleNamespace(address=mapping[name])
+            sdk = SimpleNamespace(get_account_info=AsyncMock(return_value=info))
+        return SimpleNamespace(name=name, ensure_auth=AsyncMock(), sdk=sdk)
+
+    wallets = {n: make(n) for n in mapping}
+    return SimpleNamespace(names=list(mapping), get=wallets.get)
+
+
+@pytest.mark.asyncio
+async def test_collect_addresses_reports_progress_and_failures():
+    """Export must hand back what it could read and NAME what it could not —
+    a short file that looks complete is the failure mode here."""
+    from cantex_bot.addresses import collect_addresses
+    manager = _addr_manager({"w1": ADDR_A, "w2": ADDR_B, "w3": ADDR_C},
+                            broken=("w2",))
+    seen = []
+    found, failed = await collect_addresses(
+        manager, on_result=lambda n, a, i, t: seen.append((i, t, n, bool(a))))
+    assert [(a.name, a.address) for a in found] == [("w1", ADDR_A), ("w3", ADDR_C)]
+    assert list(failed) == ["w2"] and "timed out" in failed["w2"]
+    assert seen == [(1, 3, "w1", True), (2, 3, "w2", False), (3, 3, "w3", True)]
+
+
+@pytest.mark.asyncio
+async def test_collect_addresses_treats_a_blank_address_as_a_failure():
+    """An empty string would be written to the file as a valid-looking line."""
+    from cantex_bot.addresses import collect_addresses
+    manager = _addr_manager({"w1": "   "})
+    found, failed = await collect_addresses(manager)
+    assert found == [] and "no address" in failed["w1"]
+
+
+def test_export_is_one_address_per_line_with_named_comments(tmp_path):
+    from cantex_bot.addresses import WalletAddress, write_addresses
+    out = tmp_path / "addr.txt"
+    written = write_addresses(out, [WalletAddress("w1", ADDR_A),
+                                    WalletAddress("w2", ADDR_B)])
+    assert written == 2
+    body = out.read_text().splitlines()
+    ids = [ln for ln in body if ln and not ln.startswith("#")]
+    assert ids == [ADDR_A, ADDR_B]                   # one party id per line
+    assert "# w1" in body and "# w2" in body         # traceable to a wallet
+
+
+def test_exported_file_is_a_valid_recipients_list(tmp_path):
+    """The '#' comments are what make the export reusable for Distribute."""
+    from cantex_bot.addresses import WalletAddress, write_addresses
+    from cantex_bot.distribute import parse_recipients
+    out = tmp_path / "addr.txt"
+    write_addresses(out, [WalletAddress("w1", ADDR_A), WalletAddress("w2", ADDR_B)])
+    got = parse_recipients(out.read_text())
+    assert [r.address for r in got] == [ADDR_A, ADDR_B]
+    assert all(r.amount is None for r in got)        # amount comes from the CLI
+
+
+@pytest.mark.asyncio
+async def test_internal_recipients_still_fails_loudly(monkeypatch):
+    """Same collector as the export, opposite rule: a distribution must not
+    quietly shrink because one wallet could not be read."""
+    from cantex_bot.distribute import internal_recipients
+    from cantex_bot.withdraw import WithdrawError
+    manager = _addr_manager({"w1": ADDR_A, "w2": ADDR_B}, broken=("w2",))
+    with pytest.raises(WithdrawError, match="w2: timed out"):
+        await internal_recipients(manager, ["w1", "w2"])
+
+
 # -- distribute (1 wallet -> many) -------------------------------------------
 
 ADDR_A = "Cantex::1220" + "a" * 60

@@ -8,17 +8,32 @@ from either side of the same interface:
 * **external** — a text file of party ids, one per line, optionally with a
   per-line amount. See :func:`parse_recipients` for the accepted forms.
 
-Sent with the SDK's ``batch_transfer``: **one ledger transaction for the whole
-list**, so the sender pays one network fee rather than one per receiver. That is
-also why a single bad address fails the entire batch — the ledger either accepts
-the transaction or it does not. Addresses are therefore validated before
-anything is signed, and the CLI shows the full list and total first.
+Sent as **one ``transfer`` per recipient**, not ``batch_transfer``. The batch
+endpoint looks made for this and would cost a single network fee, but the API
+refuses it — measured 2026-09-21 against a live account::
+
+    [OK]   transfer       -> target : build ok
+    [OK]   transfer       -> self   : build ok
+    [FAIL] batch_transfer -> 1 target : API error 401 {"error":"unauthorized address"}
+    [FAIL] batch_transfer -> 2 targets: API error 401 {"error":"unauthorized address"}
+
+A plain ``transfer`` to the very same address builds fine, and the batch fails
+even with one recipient, so it is the endpoint that is closed, not the address
+or the list size. If that ever changes, switching back is worth it: one fee
+instead of N.
+
+Two consequences follow from sending one at a time, and callers must handle
+both: the sender pays **a network fee per recipient**, and a run can end up
+**partially sent** — so every recipient carries its own result rather than the
+run having a single success flag.
 
 Transfers are irreversible. ``dry_run`` is the default and only reports.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -45,12 +60,11 @@ class Recipient:
 
 
 @dataclass
-class DistributeOutcome:
-    sender: str
-    symbol: str
-    recipients: list[Recipient] = field(default_factory=list)
-    total: Decimal = Decimal(0)
-    balance: Decimal = Decimal(0)
+class SendResult:
+    """One recipient's outcome. Sends are independent, so this is per address."""
+
+    recipient: Recipient
+    amount: Decimal
     sent: bool = False
     dry_run: bool = False
     error: str | None = None
@@ -58,6 +72,34 @@ class DistributeOutcome:
     @property
     def ok(self) -> bool:
         return self.sent or (self.dry_run and self.error is None)
+
+
+@dataclass
+class DistributeOutcome:
+    sender: str
+    symbol: str
+    recipients: list[Recipient] = field(default_factory=list)
+    results: list[SendResult] = field(default_factory=list)
+    total: Decimal = Decimal(0)      # planned
+    balance: Decimal = Decimal(0)
+    dry_run: bool = False
+    error: str | None = None         # whole-run failure, before any send
+
+    @property
+    def ok_total(self) -> Decimal:
+        """Total across recipients that succeeded — not the plan, since a run can
+        be partial. In a dry run that is what *would* have gone out; the caller
+        knows which it is from ``dry_run``."""
+        return sum((r.amount for r in self.results if r.ok), Decimal(0))
+
+    @property
+    def failed(self) -> list[SendResult]:
+        return [r for r in self.results if r.error]
+
+    @property
+    def ok(self) -> bool:
+        return (self.error is None and bool(self.results)
+                and all(r.ok for r in self.results))
 
 
 def parse_recipients(text: str) -> list[Recipient]:
@@ -159,15 +201,22 @@ async def distribute(
     dry_run: bool = True,
     memo: str = "",
     notifier=None,
+    on_result: Callable[[SendResult, int, int], None] | None = None,
+    cooldown: float = 1.0,
 ) -> DistributeOutcome:
     """Send ``amount`` of ``symbol`` from ``sender`` to every recipient.
 
     ``amount`` is the per-recipient default; a recipient carrying its own amount
-    overrides it. ``keep`` is held back in the sender — worth leaving some CC,
-    since every later swap pays its network fee in CC.
+    overrides it. ``keep`` is a floor the sender's balance must not fall below.
 
-    One ``batch_transfer`` for the whole list, so this is all-or-nothing: the
-    balance is checked against the full total before anything is signed.
+    One ``transfer`` per recipient (see the module docstring for why not
+    ``batch_transfer``), so **each costs its own network fee** and a run can be
+    partially sent: one failure does not stop the rest, and every recipient's
+    outcome is reported separately. The full planned total is still checked
+    against the balance up front, so a run that cannot finish does not start.
+
+    ``on_result(result, index, total)`` fires as each send completes, so a caller
+    can report progress live instead of waiting for the whole list.
     """
     out = DistributeOutcome(sender=sender, symbol=symbol.upper(),
                             recipients=list(recipients), dry_run=dry_run)
@@ -201,26 +250,37 @@ async def distribute(
         logger.warning("[%s] distribute refused: %s", sender, out.error)
         return out
 
-    transfers = [
-        {"receiver": r.address, "amount": r.resolved(amount)} for r in recipients
-    ]
-    if dry_run:
-        logger.info("[%s] DRY-RUN distribute %s %s to %d recipient(s)",
-                    sender, total, out.symbol, len(recipients))
-    else:
-        try:
-            await wallet.sdk.batch_transfer(transfers, instrument, memo)
-        except Exception as exc:  # noqa: BLE001 - the whole batch fails together
-            out.error = str(exc)
-            logger.error("[%s] distribute failed: %s", sender, exc)
-            return out
-        out.sent = True
-        logger.info("[%s] distributed %s %s to %d recipient(s)",
-                    sender, total, out.symbol, len(recipients))
+    count = len(recipients)
+    for i, recipient in enumerate(recipients, 1):
+        each = recipient.resolved(amount)
+        result = SendResult(recipient=recipient, amount=each, dry_run=dry_run)
+        who = recipient.label or recipient.address[:20]
+        if dry_run:
+            logger.info("[%s] DRY-RUN send %s %s -> %s",
+                        sender, each, out.symbol, who)
+        else:
+            try:
+                await wallet.sdk.transfer(each, instrument, recipient.address, memo)
+            except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest
+                result.error = str(exc)
+                logger.error("[%s] send %s %s -> %s failed: %s",
+                             sender, each, out.symbol, who, exc)
+            else:
+                result.sent = True
+                logger.info("[%s] sent %s %s -> %s",
+                            sender, each, out.symbol, who)
+        out.results.append(result)
+        if on_result is not None:
+            on_result(result, i, count)
+        if result.sent and i < count:
+            await asyncio.sleep(cooldown)   # only pace real submissions
 
     if notifier is not None:
+        bad = len(out.failed)
         tag = "🧪 DRY-RUN " if dry_run else "📤 "
         await notifier.send(
-            f"{tag}distribute {total} {out.symbol} from {sender} "
-            f"to {len(recipients)} recipient(s)")
+            f"{tag}distribute {out.sent_total} {out.symbol} from {sender} to "
+            f"{count - bad}/{count} recipient(s)"
+            + (f", {bad} failed" if bad else "")
+        )
     return out

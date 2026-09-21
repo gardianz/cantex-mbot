@@ -1540,13 +1540,13 @@ def test_per_line_amount_overrides_the_shared_one():
     assert plan_total(got, Decimal("10")) == Decimal("22.5")   # 10 + 12.5
 
 
-def _dist_wallet(balance="100", batch=None):
+def _dist_wallet(balance="100", transfer=None):
     info = SimpleNamespace(get_balance=lambda inst: Decimal(balance),
                            address=ADDR_A)
     sdk = SimpleNamespace(
         get_account_info=AsyncMock(return_value=info),
-        batch_transfer=batch or AsyncMock(return_value={"id": "x"}),
-        transfer=AsyncMock(),
+        transfer=transfer or AsyncMock(return_value={"id": "x"}),
+        batch_transfer=AsyncMock(),
     )
     return SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
 
@@ -1564,36 +1564,64 @@ def _dist_manager(wallet, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_distribute_sends_one_batch_not_one_per_recipient(monkeypatch):
-    """batch_transfer is one ledger transaction, so the sender pays one network
-    fee for the whole list instead of one per receiver."""
+async def test_distribute_sends_one_transfer_per_recipient(monkeypatch):
+    """batch_transfer returns 401 for this account, so each recipient gets its
+    own transfer — and therefore its own network fee."""
     from cantex_bot.distribute import Recipient, distribute
-    batch = AsyncMock(return_value={"id": "x"})
-    wallet = _dist_wallet(balance="100", batch=batch)
+    transfer = AsyncMock(return_value={"id": "x"})
+    wallet = _dist_wallet(balance="100", transfer=transfer)
     manager = _dist_manager(wallet, monkeypatch)
     out = await distribute(
         manager, sender="w1", symbol="USDCX",
         recipients=[Recipient(ADDR_B), Recipient(ADDR_C, Decimal("12.5"))],
-        amount=Decimal("10"), dry_run=False)
-    assert out.sent and out.total == Decimal("22.5")
-    batch.assert_awaited_once()
-    transfers = batch.await_args.args[0]
-    assert transfers == [{"receiver": ADDR_B, "amount": Decimal("10")},
-                         {"receiver": ADDR_C, "amount": Decimal("12.5")}]
-    wallet.sdk.transfer.assert_not_awaited()          # never the one-by-one path
+        amount=Decimal("10"), dry_run=False, cooldown=0)
+    assert out.ok and out.total == Decimal("22.5")
+    assert out.ok_total == Decimal("22.5")
+    assert transfer.await_count == 2
+    # (amount, instrument, receiver, memo) per the SDK signature.
+    assert [(c.args[0], c.args[2]) for c in transfer.await_args_list] == [
+        (Decimal("10"), ADDR_B), (Decimal("12.5"), ADDR_C)]
+    wallet.sdk.batch_transfer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_distribute_reports_each_recipient_separately(monkeypatch):
+    """Sends are independent, so a run can be partially done — one failure must
+    not stop the rest, and the total sent is what actually left."""
+    from cantex_bot.distribute import Recipient, distribute
+
+    async def _transfer(amount, instrument, receiver, memo=""):
+        if receiver == ADDR_B:
+            raise RuntimeError("unauthorized address")
+        return {"id": "x"}
+
+    wallet = _dist_wallet(balance="100", transfer=AsyncMock(side_effect=_transfer))
+    manager = _dist_manager(wallet, monkeypatch)
+    seen = []
+    out = await distribute(
+        manager, sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
+        amount=Decimal("10"), dry_run=False, cooldown=0,
+        on_result=lambda r, i, n: seen.append((i, n, r.ok)))
+    assert not out.ok                       # not every recipient succeeded
+    assert out.total == Decimal("20")       # planned
+    assert out.ok_total == Decimal("10")  # actually left the wallet
+    assert [r.recipient.address for r in out.failed] == [ADDR_B]
+    assert seen == [(1, 2, False), (2, 2, True)]   # progress reported as it went
 
 
 @pytest.mark.asyncio
 async def test_distribute_dry_run_submits_nothing(monkeypatch):
     from cantex_bot.distribute import Recipient, distribute
-    batch = AsyncMock()
-    wallet = _dist_wallet(batch=batch)
+    transfer = AsyncMock()
+    wallet = _dist_wallet(transfer=transfer)
     manager = _dist_manager(wallet, monkeypatch)
     out = await distribute(manager, sender="w1", symbol="USDCX",
                            recipients=[Recipient(ADDR_B)], amount=Decimal("10"),
-                           dry_run=True)
-    assert out.ok and out.dry_run and not out.sent
-    batch.assert_not_awaited()
+                           dry_run=True, cooldown=0)
+    assert out.ok and out.dry_run
+    assert out.ok_total == Decimal("10")   # what WOULD go out
+    transfer.assert_not_awaited()          # but nothing was submitted
 
 
 @pytest.mark.asyncio
@@ -1601,15 +1629,15 @@ async def test_distribute_refuses_when_the_total_exceeds_the_balance(monkeypatch
     """All-or-nothing on the ledger, so the whole total is checked up front —
     a partial send is not a thing batch_transfer can do."""
     from cantex_bot.distribute import Recipient, distribute
-    batch = AsyncMock()
-    wallet = _dist_wallet(balance="15", batch=batch)
+    transfer = AsyncMock()
+    wallet = _dist_wallet(balance="15", transfer=transfer)
     manager = _dist_manager(wallet, monkeypatch)
     out = await distribute(
         manager, sender="w1", symbol="USDCX",
         recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
         amount=Decimal("10"), dry_run=False)
     assert not out.ok and "only 15" in out.error
-    batch.assert_not_awaited()
+    transfer.assert_not_awaited()          # refused before anything was sent
 
 
 @pytest.mark.asyncio
@@ -1617,15 +1645,15 @@ async def test_distribute_honours_the_keep_reserve(monkeypatch):
     """Every later swap pays its fee in CC, so a sender drained to zero cannot
     trade — keep is subtracted before the total is checked."""
     from cantex_bot.distribute import Recipient, distribute
-    batch = AsyncMock()
-    wallet = _dist_wallet(balance="21", batch=batch)
+    transfer = AsyncMock()
+    wallet = _dist_wallet(balance="21", transfer=transfer)
     manager = _dist_manager(wallet, monkeypatch)
     out = await distribute(
         manager, sender="w1", symbol="CC",
         recipients=[Recipient(ADDR_B), Recipient(ADDR_C)],
         amount=Decimal("10"), keep=Decimal("5"), dry_run=False)
     assert not out.ok and "keep 5" in out.error
-    batch.assert_not_awaited()
+    transfer.assert_not_awaited()
 
 
 @pytest.mark.asyncio

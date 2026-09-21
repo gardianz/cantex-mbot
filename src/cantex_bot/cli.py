@@ -672,25 +672,48 @@ class App:
                 f"Every swap pays its network fee in {cc}, so it could no longer "
                 f"trade.[/yellow]"
             )
-        # One batch_transfer: one network fee, and all-or-nothing on the ledger.
-        console.print("[dim]Sent as a single batch transfer — one network fee "
-                      "for the whole list, and it succeeds or fails as one.[/dim]")
+        # One transfer per recipient: the batch endpoint returns 401 for this
+        # account (see distribute.py), so each send costs its own network fee
+        # and the run can end up partially sent.
+        console.print(
+            f"[yellow]{n} separate transfers — {n} network fees, and a partial "
+            f"result is possible if one fails.[/yellow]"
+        )
 
         await self._choose_execution_mode()
         if not self.engine.dry_run:
             console.print("[bold red]Transfers are irreversible. "
                           f"{total} {symbol} leaves {sender}.[/bold red]")
 
+        # Print as each lands: logging is file-only, so a long list would
+        # otherwise look frozen.
+        def _line(res, i: int, count: int) -> None:
+            who = res.recipient.label or res.recipient.address[:24] + "…"
+            head = f"[dim]{i}/{count}[/dim] {who}"
+            if res.error:
+                console.print(f"{head} [red]{res.error}[/red]")
+            else:
+                tag = "[cyan]dry-run[/cyan]" if res.dry_run else "[green]sent[/green]"
+                console.print(f"{head} {tag} {res.amount} {symbol}")
+
         out = await distribute(
             self.manager, sender=sender, symbol=symbol, recipients=recipients,
             amount=amount, dry_run=self.engine.dry_run, notifier=self.notifier,
+            on_result=_line,
         )
         if out.error:
             console.print(f"[red]{out.error}[/red]")
             return
-        tag = "[cyan]dry-run[/cyan]" if out.dry_run else "[green]sent[/green]"
-        console.print(f"{tag} {out.total} {out.symbol} to {n} recipient(s) "
-                      f"[dim](sender had {out.balance})[/dim]")
+        bad = out.failed
+        tag = "dry-run" if out.dry_run else "sent"
+        console.print(
+            f"[bold]{n - len(bad)}/{n} recipient(s), {out.ok_total} {symbol} "
+            f"{tag}[/bold]"
+            + (f" — [red]{len(bad)} failed[/red]" if bad else "")
+        )
+        if bad:
+            console.print("[yellow]Partial: the successful transfers are already "
+                          "final. Re-run for the failed ones only.[/yellow]")
 
     async def action_monitor(self) -> None:
         """Watch every pair's fee, slippage, pool fee and depth. Never swaps."""

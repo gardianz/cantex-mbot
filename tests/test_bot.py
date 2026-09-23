@@ -541,6 +541,51 @@ def test_parse_dump_label_styles_and_name_norm():
     assert ws[1].operator == "37" * 32 and ws[2].operator == "d7" * 32
 
 
+def _dump_block(n, *, address=True):
+    """One wallet's five lines; drop the address to simulate the real breakage."""
+    rows = [f"wallet{n}", " ".join(["word"] * 24)]
+    if address:
+        rows.append("Cantex::1220" + f"{n:02d}" * 30)
+    rows += [f"{n:02d}" * 32, f"{n:02d}" * 32]
+    return rows
+
+
+def test_misalignment_points_at_the_first_incomplete_wallet():
+    """'got 194 (not a multiple of 5)' left you counting lines by hand across
+    forty wallets. The real file was missing the first wallet's address line."""
+    from cantex_bot.wallet_import import WalletImportError, parse_dump
+    lines = _dump_block(1, address=False) + _dump_block(2) + _dump_block(3)
+    with pytest.raises(WalletImportError) as exc:
+        parse_dump("\n".join(lines))
+    msg = str(exc.value)
+    assert "got 14" in msg
+    assert "non-empty line 7" in msg          # where the first address actually is
+    assert "lines 1-4" in msg                 # the wallet that is short a line
+
+
+def test_misalignment_points_at_a_later_wallet():
+    from cantex_bot.wallet_import import WalletImportError, parse_dump
+    lines = _dump_block(1) + _dump_block(2) + ["stray line"] + _dump_block(3)
+    with pytest.raises(WalletImportError) as exc:
+        parse_dump("\n".join(lines))
+    msg = str(exc.value)
+    assert "wallet 3" in msg and "spare" in msg
+
+
+def test_misalignment_names_a_ragged_tail():
+    from cantex_bot.wallet_import import WalletImportError, parse_dump
+    lines = _dump_block(1) + _dump_block(2) + ["leftover", "lines"]
+    with pytest.raises(WalletImportError) as exc:
+        parse_dump("\n".join(lines))
+    assert "2 leftover line(s)" in str(exc.value)
+
+
+def test_misalignment_spots_the_wrong_file_entirely():
+    from cantex_bot.wallet_import import WalletImportError, parse_dump
+    with pytest.raises(WalletImportError, match="right file"):
+        parse_dump("just\nsome\nrandom\nlines\nhere\nand\nmore\n")
+
+
 def test_parse_dump_rejects_misaligned():
     from cantex_bot.wallet_import import parse_dump, WalletImportError
     with pytest.raises(WalletImportError):

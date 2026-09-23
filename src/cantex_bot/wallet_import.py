@@ -51,6 +51,42 @@ def _hex(line: str, kind: str, block: int) -> str:
     return m.group(1).lower()
 
 
+def _misalignment(lines: list[str]) -> str:
+    """Say WHERE the 5-line grid breaks, not just that it does.
+
+    "got 194 (not a multiple of 5)" leaves you counting lines by hand across
+    forty wallets. The ``Cantex::`` address is the one unmistakable line in a
+    block and belongs at offset 2 of every one, so the first marker off that
+    grid is where a line went missing or spare.
+    """
+    marks = [i for i, ln in enumerate(lines) if ln.startswith("Cantex::")]
+    if not marks:
+        return ("no 'Cantex::' address line anywhere — is this the right file? "
+                "Each wallet needs one as its 3rd line.")
+    for n, idx in enumerate(marks):
+        want = 5 * n + 2
+        if idx == want:
+            continue
+        if n == 0:
+            # Two of the lines above belong to THIS block (name, mnemonic); the
+            # rest are the incomplete wallet.
+            extra = idx - 2
+            return (f"the first 'Cantex::' line is non-empty line {idx + 1}, "
+                    f"expected line 3 — non-empty lines 1-{extra} above it do "
+                    f"not form a whole wallet (a wallet is 5 lines: name / "
+                    f"mnemonic / Cantex:: / operator key / trading key)")
+        drift = idx - want
+        return (f"blocks stop lining up at wallet {n + 1}: its 'Cantex::' line "
+                f"is non-empty line {idx + 1}, expected {want + 1} — "
+                f"{abs(drift)} line(s) {'spare' if drift > 0 else 'missing'} "
+                f"before it")
+    tail = len(lines) - 5 * len(marks)
+    if tail:
+        return (f"{len(marks)} complete wallet(s), then {tail} leftover line(s) "
+                f"at the end (from non-empty line {5 * len(marks) + 1})")
+    return "check the input for a missing or extra line"
+
+
 def parse_dump(text: str) -> list[WalletEntry]:
     """Parse a key dump into WalletEntry rows. Raises WalletImportError on any
     malformed / misaligned block."""
@@ -59,15 +95,17 @@ def parse_dump(text: str) -> list[WalletEntry]:
         raise WalletImportError("empty input")
     if len(lines) % 5 != 0:
         raise WalletImportError(
-            f"expected blocks of 5 non-empty lines, got {len(lines)} "
-            "(not a multiple of 5) — check the input for a missing/extra line"
+            f"expected blocks of 5 non-empty lines, got {len(lines)}. "
+            + _misalignment(lines)
         )
     wallets: list[WalletEntry] = []
     for i in range(0, len(lines), 5):
         b = i // 5 + 1
         name, mnem, addr, op_line, tk_line = lines[i:i + 5]
         if not addr.startswith("Cantex::"):
-            raise WalletImportError(f"block {b}: line 3 is not a Cantex:: address: {addr!r}")
+            raise WalletImportError(
+                f"block {b}: line 3 is not a Cantex:: address. "
+                + _misalignment(lines))
         if len(mnem.split()) < 12:
             raise WalletImportError(f"block {b}: line 2 is not a mnemonic: {mnem!r}")
         wallets.append(WalletEntry(

@@ -4056,6 +4056,15 @@ async def test_transient_error_outside_the_loop_restarts_the_wallet(tmp_path, mo
 
 # -- accept pending incoming transfers ---------------------------------------
 
+@pytest.fixture(autouse=True)
+def _fresh_accept_memory():
+    """incoming remembers accepted contract ids process-wide; tests reuse ids."""
+    from cantex_bot import incoming
+    incoming._recently_accepted.clear()
+    yield
+    incoming._recently_accepted.clear()
+
+
 def _pending_raw(cid, amount="20", symbol="USDC.B", before="2099-01-01 00:00:00+00"):
     return {"instrument_symbol": symbol, "instrument_id": symbol,
             "pending_deposit_transfers": [{
@@ -4147,3 +4156,30 @@ async def test_accept_selected_reports_and_survives_a_broken_notifier():
     assert "2 accepted" in bad_notifier.send.await_args[0][0]
     assert "40 USDC.B" in bad_notifier.send.await_args[0][0]
     assert rs.view("w1").plan == "diterima 1"
+
+
+@pytest.mark.asyncio
+async def test_just_accepted_transfer_is_hidden_while_the_index_lags(monkeypatch):
+    """Live accept 2026-09-24: balance credited at once, but the entry stayed
+    listed for 30-75s. Re-accepting a consumed transfer can only fail."""
+    from cantex_bot import incoming
+    wallet = _incoming_wallet([_pending_raw("a"), _pending_raw("b")])
+    wallet.sdk._build_sign_submit = AsyncMock(
+        side_effect=[{"ok": True}, RuntimeError("boom")])
+
+    await incoming.accept_wallet(wallet, dry_run=False, cooldown=0)
+    # The API still lists both; only the one that failed is offered again.
+    assert [t.contract_id for t in await incoming.fetch_pending(wallet)] == ["b"]
+
+    # Past the TTL it shows again (by then the index has long caught up).
+    clock = {"t": time.monotonic() + incoming.ACCEPTED_TTL + 1}
+    monkeypatch.setattr(incoming.time, "monotonic", lambda: clock["t"])
+    assert len(await incoming.fetch_pending(wallet)) == 2
+
+
+@pytest.mark.asyncio
+async def test_dry_run_accept_does_not_hide_anything():
+    from cantex_bot import incoming
+    wallet = _incoming_wallet([_pending_raw("a")])
+    await incoming.accept_wallet(wallet, dry_run=True)
+    assert len(await incoming.fetch_pending(wallet)) == 1

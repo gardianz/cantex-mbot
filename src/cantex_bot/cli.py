@@ -543,9 +543,9 @@ class App:
     async def action_accept_incoming(self) -> None:
         """Accept transfers waiting on wallets whose token has no pre-approval.
 
-        Survey every wallet first — reading is free, accepting pays a network
-        fee per transfer — and show the deadline: a pending transfer lapses at
-        ``execute_before`` and can then only be withdrawn by its sender.
+        Survey every wallet first and show the deadline: a pending transfer
+        lapses at ``execute_before`` and can then only be withdrawn by its
+        sender. Accepting costs the receiver no fee.
         """
         from datetime import datetime, timezone
 
@@ -627,7 +627,7 @@ class App:
                 if not t.expired(now) and (only is None or t.symbol in only)]
         console.print(
             f"[bold]{len(todo)} accept(s)[/bold] across {len(wallet_names)} wallet(s). "
-            "[yellow]Each is a ledger transaction and pays a network fee in CC.[/yellow]"
+            "[dim]Each is a ledger transaction; accepting costs no fee.[/dim]"
         )
         await self._choose_execution_mode()
 

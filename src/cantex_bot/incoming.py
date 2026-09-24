@@ -21,14 +21,21 @@ Both halves come from the API directly, as with pre-approvals:
     update, withdraw`` for a made-up choice and a built transaction for
     ``accept``.
 
-Accepting is a ledger transaction and pays a network fee **per transfer**, so
-the CLI arms it the way withdraws are armed. Accepting clears what is pending
-now; only a pre-approval stops the next transfer of that token from waiting.
+Accepting is a ledger transaction but costs the receiver **nothing** — measured
+2026-09-24 on a live accept: USDC.B 0 -> 20, CC 100 -> 100. The CLI still arms
+it like withdraws, since it moves funds. Accepting clears what is pending now;
+only a pre-approval stops the next transfer of that token from waiting.
+
+The API's index lags the ledger: on that same accept the balance was credited
+at once but the entry stayed in ``pending_deposit_transfers`` for 30-75s. A
+second accept of a consumed transfer can only fail, so what this process has
+just accepted is hidden for ``ACCEPTED_TTL`` seconds (see ``fetch_pending``).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +50,23 @@ logger = logging.getLogger(__name__)
 
 INFO_PATH = "/v1/account/info"
 ACTION_PATH = "/v1/ledger/transaction/build/transfer_action"
+
+# Contract ids this process accepted, and when. The index keeps listing them
+# for about a minute after the ledger has consumed them.
+ACCEPTED_TTL = 300.0
+_recently_accepted: dict[str, float] = {}
+
+
+def _note_accepted(contract_id: str) -> None:
+    _recently_accepted[contract_id] = time.monotonic()
+
+
+def _just_accepted(contract_id: str) -> bool:
+    now = time.monotonic()
+    for cid, at in list(_recently_accepted.items()):
+        if now - at >= ACCEPTED_TTL:
+            del _recently_accepted[cid]
+    return contract_id in _recently_accepted
 
 
 def _ts(raw: object) -> datetime | None:
@@ -98,13 +122,15 @@ def earliest_deadline(transfers: list[PendingTransfer]) -> datetime | None:
 
 
 async def fetch_pending(wallet) -> list[PendingTransfer]:
-    """Every transfer waiting on this wallet, oldest deadline first."""
+    """Every transfer waiting on this wallet, oldest deadline first — minus
+    the ones this process has just accepted and the index still lists."""
     raw = await wallet.sdk._request("GET", INFO_PATH)
     out: list[PendingTransfer] = []
     for tok in raw.get("tokens", []) or []:
         symbol = tok.get("instrument_symbol") or tok.get("instrument_id") or "?"
         for p in tok.get("pending_deposit_transfers", []) or []:
-            if p.get("contract_id"):
+            cid = p.get("contract_id")
+            if cid and not _just_accepted(cid):
                 out.append(PendingTransfer._from_raw(symbol, p))
     far = datetime.max.replace(tzinfo=timezone.utc)
     out.sort(key=lambda t: t.execute_before or far)
@@ -172,6 +198,7 @@ async def accept_wallet(
             logger.error("[%s] accept %s %s failed: %s",
                          wallet.name, t.amount, t.symbol, exc)
             continue
+        _note_accepted(t.contract_id)
         out.accepted.append(t)
         logger.info("[%s] accepted %s %s from %s", wallet.name, t.amount,
                     t.symbol, t.sender[:24])

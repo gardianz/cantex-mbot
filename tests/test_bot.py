@@ -4270,7 +4270,7 @@ async def test_parked_wallet_resumes_when_funds_arrive(tmp_path, monkeypatch):
         (Decimal("0"), Decimal("100")),          # still empty
         (Decimal("20"), Decimal("100")),         # the transfer was accepted
     ])
-    got = await strat._wait_for_funds(wallet, _a.Event(), base, cc, Decimal("12"))
+    got = await strat._wait_for_funds(wallet, _a.Event(), [], base, cc, Decimal("12"))
     assert got == "funds"
     assert wallet.sdk.get_account_info.await_count == 2   # fresh read each poll
     store.close()
@@ -4284,7 +4284,7 @@ async def test_funds_need_cc_for_the_fee_too(tmp_path, monkeypatch):
         (Decimal("20"), Decimal("5")),
     ])
     assert await strat._wait_for_funds(
-        wallet, _a.Event(), base, cc, Decimal("12")) == "funds"
+        wallet, _a.Event(), [], base, cc, Decimal("12")) == "funds"
     assert wallet.sdk.get_account_info.await_count == 2
     store.close()
 
@@ -4294,7 +4294,7 @@ async def test_funds_wait_ends_on_stop(tmp_path, monkeypatch):
     import asyncio as _a
     strat, wallet, base, cc, store = _funds_strat(tmp_path, monkeypatch, [])
     stop = _a.Event(); stop.set()
-    assert await strat._wait_for_funds(wallet, stop, base, cc, Decimal("12")) is None
+    assert await strat._wait_for_funds(wallet, stop, [], base, cc, Decimal("12")) is None
     store.close()
 
 
@@ -4394,3 +4394,45 @@ def test_log_panel_wraps_instead_of_cutting(monkeypatch):
     console.print(dash._log_panel())
     text = " ".join(console.export_text().split())
     assert "(received 1234 bytes," in text and "expected 5678)" in text
+
+
+@pytest.mark.asyncio
+async def test_parked_wallet_wakes_to_sell_a_held_token(tmp_path, monkeypatch):
+    """mulyanayanu, restarted mid-cycle: 7.97 USDC.B against a 12.04 buy, the
+    rest sitting in TRKXAI. Waiting for base that only the sell can produce
+    parked the open position for the whole day."""
+    import asyncio as _a
+    from cantex_bot.markets import Pair
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch)
+    del strat._wait_for_funds
+    strat.FUNDS_POLL_SECONDS = 0.0
+    engine.guard = SimpleNamespace(config=SimpleNamespace(
+        max_network_fee=Decimal("0.6")))
+    base, cc = InstrumentId("a", "USDC.B"), InstrumentId("a", "CC")
+    tok = InstrumentId("a", "TRKXAI")
+    bal = {base: Decimal("7.97"), cc: Decimal("99"), tok: Decimal("0.39")}
+    info = SimpleNamespace(get_balance=lambda i: bal.get(i, Decimal(0)))
+    wallet = SimpleNamespace(name="w1", sdk=SimpleNamespace(
+        get_account_info=AsyncMock(return_value=info)))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("110"))
+    pairs = [Pair(token=tok, token_symbol="TRKXAI", usdcx=base, pool_contract_id="")]
+
+    got = await strat._wait_for_funds(wallet, _a.Event(), pairs, base, cc,
+                                      Decimal("12.04"))
+    assert got == "funds"
+
+    # Dust is not a reason to wake: it would park again four strikes later.
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0.2"))
+    stop = _a.Event()
+    reads = {"n": 0}
+
+    async def _info():
+        reads["n"] += 1
+        if reads["n"] >= 3:
+            stop.set()
+        return info
+
+    wallet.sdk.get_account_info = _info
+    assert await strat._wait_for_funds(wallet, stop, pairs, base, cc,
+                                       Decimal("12.04")) is None
+    store.close()

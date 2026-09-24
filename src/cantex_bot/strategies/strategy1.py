@@ -330,7 +330,7 @@ class Strategy1(Strategy):
                          route="", plan="saldo kurang")
                 self._park_until_day(wallet.name)
                 woke = await self._wait_for_funds(
-                    wallet, stop, usdcx, cc, state["notional"])
+                    wallet, stop, pairs, usdcx, cc, state["notional"])
                 if woke is None:
                     break
                 if woke == "funds":
@@ -974,16 +974,20 @@ class Strategy1(Strategy):
         return max(self.config.cooldown_seconds, self.config.poll_max_seconds)
 
     async def _wait_for_funds(
-        self, wallet: Wallet, stop: asyncio.Event, base: InstrumentId,
+        self, wallet: Wallet, stop: asyncio.Event, pairs, base: InstrumentId,
         cc: InstrumentId, need: Decimal,
     ) -> str | None:
-        """Idle a wallet that cannot afford a buy until it can, or until the
-        next UTC day. ``"funds"`` = resume now, ``"day"`` = the day rolled
-        over (the loop resets as usual), ``None`` = stopped.
+        """Idle a wallet that cannot trade until it can, or until the next UTC
+        day. ``"funds"`` = resume now, ``"day"`` = the day rolled over (the
+        loop resets as usual), ``None`` = stopped.
 
         Re-reads the balance every FUNDS_POLL_SECONDS — one request a minute,
-        against a whole day of a funded wallet sitting idle. Needs the base
-        for a buy and enough CC to pay the network fee the guard allows.
+        against a whole day of a funded wallet sitting idle. It can trade
+        again when CC covers the network fee the guard allows AND either the
+        base covers a buy or it holds a pair token worth selling. The second
+        case is the one that bit: mulyanayanu was restarted holding TRKXAI,
+        read 7.97 USDC.B against a 12.04 buy, and parked for the day with the
+        position still open — waiting for base that only the sell produces.
         """
         need_cc = self.engine.guard.config.max_network_fee
         day = datetime.now(timezone.utc).date()
@@ -1011,11 +1015,22 @@ class Strategy1(Strategy):
                 logger.debug("[%s] funds check failed: %s", wallet.name, exc)
                 continue
             have, have_cc = info.get_balance(base), info.get_balance(cc)
-            if have >= need and have_cc >= need_cc:
+            if have_cc < need_cc:
+                continue
+            if have >= need:
                 logger.info("[%s] funds arrived: %s %s (need %s), %s CC — "
                             "resuming", wallet.name, have, self.base_symbol,
                             need, have_cc)
                 return "funds"
+            for pair in pairs:
+                held = info.get_balance(pair.token)
+                if held <= 0:
+                    continue
+                value = await self._token_cc_value(wallet, pair.token, held, cc)
+                if self._is_sellable(wallet, pair.token_symbol, held, value):
+                    logger.info("[%s] holding %s %s to sell — resuming",
+                                wallet.name, held, pair.token_symbol)
+                    return "funds"
 
     async def _account_info(self, wallet: Wallet):
         """Account info, reused for BALANCE_TTL seconds.

@@ -4,11 +4,20 @@ quote -> guard -> (dry-run stop | live swap_and_confirm) -> record -> notify.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
-from cantex_sdk import CantexError, InstrumentId, SwapExecutedEvent, SwapQuote
+import aiohttp
+from cantex_sdk import (
+    CantexAPIError,
+    CantexError,
+    CantexTimeoutError,
+    InstrumentId,
+    SwapExecutedEvent,
+    SwapQuote,
+)
 
 from .guards import GuardResult, SwapGuard
 from .store import Store, SwapRecord
@@ -32,6 +41,32 @@ def _is_max_fee_error(exc: object) -> bool:
     return "maxnetworkfee" in text
 
 
+# The statuses the SDK itself retries. Once it gives up on one of these, the
+# request failed for a reason that says nothing about the wallet or the swap.
+_TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """True for the API's HTTP 429 — too many requests, from this egress or key."""
+    return isinstance(exc, CantexAPIError) and exc.status == 429
+
+
+def is_transient(exc: BaseException) -> bool:
+    """True when a request failed for a transport reason: throttled (429), a
+    gateway hiccup (502/503/504), a timeout, or a dropped connection.
+
+    The SDK has already retried these four times by the time one surfaces, so
+    the caller's job is to back off — never to count it as a failed swap or a
+    broken wallet. Counting them is how a burst of 429s ended wallets with
+    "stopped: repeated errors" while nothing was wrong with them.
+    """
+    if isinstance(exc, CantexAPIError):
+        return exc.status in _TRANSIENT_STATUSES
+    if isinstance(exc, (CantexTimeoutError, asyncio.TimeoutError)):
+        return True
+    return isinstance(exc.__cause__, (aiohttp.ClientError, asyncio.TimeoutError))
+
+
 @dataclass
 class SwapOutcome:
     wallet: str
@@ -52,6 +87,11 @@ class SwapOutcome:
     # The API refused the intent because the live network fee was over the cap.
     # A rejection, not an error — see _is_max_fee_error.
     fee_rejected: bool = False
+    # The QUOTE failed for a transport reason (see is_transient). Nothing was
+    # submitted; `error` still says why, but a caller should back off rather
+    # than count it. `rate_limited` narrows it to a 429.
+    transient: bool = False
+    rate_limited: bool = False
 
     @property
     def ok(self) -> bool:
@@ -85,7 +125,16 @@ class SwapEngine:
         quiet_reject: bool = False,
         bypass_guards: bool = False,
         ignore_network_fee: bool = False,
+        quote: SwapQuote | None = None,
     ) -> SwapOutcome:
+        """Quote, guard, and (live) swap ``sell_amount`` of ``sell`` into ``buy``.
+
+        ``quote`` lets a caller that has JUST quoted this exact swap (same
+        amount, same direction) hand it over instead of paying for a second,
+        identical request. It only feeds the guard and the fee record — the
+        live swap builds its own intent — so it must be seconds old, not reused
+        across polls.
+        """
         out = SwapOutcome(
             wallet=wallet.name,
             direction=direction,
@@ -104,14 +153,23 @@ class SwapEngine:
         # 0. Ensure this wallet is authenticated (lazy).
         await wallet.ensure_auth()
 
-        # 1. Quote
-        try:
-            quote = await wallet.sdk.get_swap_quote(sell_amount, sell, buy)
-        except CantexError as exc:
-            out.error = f"quote failed: {exc}"
-            logger.error("%s %s", tag, out.error)
-            await self.notifier.send(f"⚠️ {tag}\nQuote error: {exc}")
-            return out
+        # 1. Quote (unless the caller already holds a fresh one)
+        if quote is None:
+            try:
+                quote = await wallet.sdk.get_swap_quote(sell_amount, sell, buy)
+            except CantexError as exc:
+                out.error = f"quote failed: {exc}"
+                if is_transient(exc):
+                    # Throttled or a network blip: nothing was submitted and
+                    # nothing is wrong. No Telegram — under a 429 storm that
+                    # is one message per wallet per poll.
+                    out.transient = True
+                    out.rate_limited = is_rate_limited(exc)
+                    logger.warning("%s %s", tag, out.error)
+                    return out
+                logger.error("%s %s", tag, out.error)
+                await self.notifier.send(f"⚠️ {tag}\nQuote error: {exc}")
+                return out
         out.quote = quote
         out.buy_amount = quote.returned_amount
         # Record the observed network fee + slippage + pool fee for today's stats.

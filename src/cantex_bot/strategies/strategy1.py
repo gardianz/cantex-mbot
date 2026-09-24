@@ -24,7 +24,7 @@ from ..logging_setup import wallet_logs
 from ..markets import MarketMap
 from .. import runstate as run_status
 from ..runstate import RunState
-from ..swapper import SwapEngine
+from ..swapper import SwapEngine, is_rate_limited, is_transient
 from ..telegram import TelegramNotifier
 from ..store import Store
 from ..wallets import Wallet, WalletManager
@@ -42,6 +42,16 @@ class Strategy1(Strategy):
     # Every later quote is retried by the loop itself.
     PRICE_RETRIES = 5
     PRICE_RETRY_BACKOFF = 2.0
+    # Request budget. A wallet waiting on a guard used to spend FOUR requests
+    # per poll — account info, a dust-check quote, a cycle-loss quote and the
+    # swap quote — when only the last one carries news: nothing it holds
+    # changes until it swaps. Balances are reused for BALANCE_TTL seconds and
+    # dropped the moment a swap is submitted; a holding's CC value (only ever
+    # compared with the 10 CC min ticket) for VALUE_TTL seconds per amount.
+    BALANCE_TTL = 30.0
+    VALUE_TTL = 300.0
+    # Ceiling for the back-off after repeated 429s / network failures.
+    TRANSIENT_MAX_BACKOFF = 60.0
 
     def __init__(
         self,
@@ -84,6 +94,12 @@ class Strategy1(Strategy):
         self._wallet_tasks: dict[str, asyncio.Task] = {}
         self._idle_until_day: set[str] = set()
         self._stall_reported: set[str] = set()
+        # Request-budget caches (see BALANCE_TTL / VALUE_TTL) and the per-wallet
+        # count of back-to-back transient failures that sizes the back-off.
+        self._info_cache: dict[str, tuple[float, object]] = {}
+        self._value_cache: dict[tuple[str, InstrumentId, Decimal],
+                                tuple[float, Decimal]] = {}
+        self._transient_streak: dict[str, int] = {}
 
     def _pairs_for(self, market: MarketMap):
         """base<->token pairs to trade, honouring the chosen token subset."""
@@ -290,8 +306,19 @@ class Strategy1(Strategy):
                     break
                 continue
 
-            pair, sellable, token_bal, usdcx_bal, cc_bal = await self._pick(
-                wallet, pairs, usdcx, cc, state)
+            try:
+                pair, sellable, token_bal, usdcx_bal, cc_bal = await self._pick(
+                    wallet, pairs, usdcx, cc, state)
+            except CantexError as exc:
+                # A 429 on the balance read used to end the wallet outright.
+                if not is_transient(exc):
+                    raise
+                await self._transient_pause(
+                    wallet, "", is_rate_limited(exc), exc, stop)
+                continue
+            # Taken out of `state` now, so a pass that ends early (saldo kurang,
+            # brake hold) cannot leave it behind for a later pass to use stale.
+            buy_hint = state.pop("buy_quote", None)
             tok = pair.token_symbol
 
             # ROUTE (shown in its own dashboard column) vs STATUS (the phase).
@@ -320,8 +347,11 @@ class Strategy1(Strategy):
             take_profit = False
             force_sl = False
             loss_pct = None
+            # The brake and the sell quote the very same swap (all of the token
+            # back to the base), so quote it once and hand it to both.
+            sell_quote = None
             if step == "sell" and (cap > 0 or min_profit > 0):
-                loss_pct = await self._cycle_loss_pct(
+                loss_pct, sell_quote = await self._cycle_loss_and_quote(
                     wallet, pair.token, tok, token_bal, usdcx)
                 # Profitable enough to stop waiting out the network fee? The fee
                 # is a fraction of the gain, so holding risks the gain for nothing.
@@ -371,13 +401,28 @@ class Strategy1(Strategy):
                     # A stop-loss does NOT waive the fee limit — only a clearly
                     # profitable exit does.
                     ignore_network_fee=take_profit,
+                    quote=sell_quote,
                 )
             else:
                 out = await self.engine.execute_swap(
                     wallet, sell=usdcx, buy=pair.token, sell_amount=buy_notional,
                     sell_symbol=usym, buy_symbol=tok,
                     direction="buy", quiet_reject=True,
+                    quote=self._buy_quote_from(buy_hint, tok, buy_notional),
                 )
+            # Anything that reached the exchange may have moved a balance.
+            if (getattr(out, "submitted_attempt", False)
+                    or getattr(out, "executed", False) or out.counted):
+                self._forget_balances(wallet.name)
+            if getattr(out, "transient", False):
+                # The quote was throttled or dropped — nothing was submitted.
+                # Counting it as a failed swap is how a burst of 429s used to
+                # end healthy wallets with "stopped: repeated errors".
+                await self._transient_pause(
+                    wallet, route, getattr(out, "rate_limited", False), out.error,
+                    stop)
+                continue
+            self._transient_streak.pop(wallet.name, None)
 
             # Cannot proceed = a balance problem, NOT a failure to retry forever:
             #  * a "Too small / min ticket" API error (dust that slipped through), or
@@ -484,11 +529,15 @@ class Strategy1(Strategy):
             f"🏁 {self.label} [{wallet.name}] {done}/{target} swaps today (web-synced)"
         )
 
-    async def _web_swaps_today(self, wallet: Wallet, ttl: float = 15.0) -> int:
+    async def _web_swaps_today(self, wallet: Wallet, ttl: float = 60.0) -> int:
         """Successful swaps today (UTC) from web history, 0 if no web.
 
         Cached per wallet for ``ttl`` seconds so the fee-polling loop does not
         hammer the history endpoint; the cache is invalidated after any swap.
+        60s, not less: `_current_done` also counts this run's own swaps and the
+        local counter, so between swaps the history only catches up on
+        indexing lag — and the portfolio sweep mirrors it every refresh anyway.
+        At 15s it was 2 requests a second across 30 waiting wallets.
         """
         if wallet.web is None:
             return 0
@@ -549,14 +598,68 @@ class Strategy1(Strategy):
         percent of the base spent buying it (positive = loss). None when it can't
         be measured (no recorded buy, or the quote failed) — the caller then lets
         the sell through rather than blocking on missing data."""
+        pct, _quote = await self._cycle_loss_and_quote(
+            wallet, token, token_symbol, amount, base)
+        return pct
+
+    async def _cycle_loss_and_quote(
+        self, wallet: Wallet, token: InstrumentId, token_symbol: str,
+        amount: Decimal, base: InstrumentId,
+    ):
+        """``(loss_pct, quote)`` — the brake's reading plus the sell quote it
+        was taken from, which is exactly the quote the sell itself needs. No
+        quote is made when there is no recorded buy to measure against: the
+        sell then quotes for itself, as before."""
         spent = self.store.last_buy_cost(wallet.name, self.base_symbol, token_symbol)
         if spent is None or spent <= 0:
-            return None
+            return None, None
+        quote = await self._quote_or_none(wallet, amount, token, base)
+        if quote is None:
+            return None, None
+        return (spent - quote.returned_amount) / spent * Decimal(100), quote
+
+    @staticmethod
+    async def _quote_or_none(wallet: Wallet, amount: Decimal,
+                             sell: InstrumentId, buy: InstrumentId):
+        """A pricing quote, or None if it failed (execute_swap then re-quotes
+        and classifies the failure itself)."""
         try:
-            q = await wallet.sdk.get_swap_quote(amount, token, base)
+            return await wallet.sdk.get_swap_quote(amount, sell, buy)
         except CantexError:
             return None
-        return (spent - q.returned_amount) / spent * Decimal(100)
+
+    @staticmethod
+    def _buy_quote_from(hint, token_symbol: str, notional: Decimal):
+        """The buy quote a `_pick` override already paid for (left in
+        ``state["buy_quote"]`` this same pass), if it is for this exact buy."""
+        if hint is None:
+            return None
+        sym, amount, quote = hint
+        return quote if sym == token_symbol and amount == notional else None
+
+    async def _transient_pause(
+        self, wallet: Wallet, route: str, rate_limited: bool, why: object,
+        stop: asyncio.Event,
+    ) -> None:
+        """Back off after a throttled or dropped request, longer each time.
+
+        The SDK has already retried four times (1+2+4s), so hitting it again at
+        the normal poll pace just keeps the limit tripped for every wallet on
+        the same egress. Doubles per consecutive failure, capped, and resets on
+        the first request that gets through.
+        """
+        n = self._transient_streak.get(wallet.name, 0) + 1
+        self._transient_streak[wallet.name] = n
+        delay = min(self.TRANSIENT_MAX_BACKOFF,
+                    max(self.config.poll_max_seconds, 1.0) * 2 ** (n - 1))
+        label = "rate limit" if rate_limited else "gangguan jaringan"
+        self._st(wallet.name, status=run_status.WAITING, route=route,
+                 plan=f"{label}, jeda {delay:.0f}s")
+        logger.info("[%s] %s (#%d) — backing off %.0fs: %s",
+                    wallet.name, label, n, delay, why)
+        # Up to a minute: wake on stop rather than hold the run open that long.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=delay)
 
     def _hold_expired(self, wallet_name: str, token_symbol: str) -> bool:
         """True once a sell has been held back by the cycle-loss brake for longer
@@ -820,8 +923,26 @@ class Strategy1(Strategy):
             logger.error("[%s] CC pricing quote failed: %s", wallet.name, exc)
             return Decimal(0)
 
-    async def _token_balance(self, wallet: Wallet, token: InstrumentId) -> Decimal:
+    async def _account_info(self, wallet: Wallet):
+        """Account info, reused for BALANCE_TTL seconds.
+
+        Only a swap moves this wallet's balances (and that drops the cache), so
+        re-reading them on every guard poll bought nothing. The TTL is there
+        for the one thing the bot does not do itself: a deposit arriving.
+        """
+        now = time.monotonic()
+        hit = self._info_cache.get(wallet.name)
+        if hit is not None and now - hit[0] < self.BALANCE_TTL:
+            return hit[1]
         info = await wallet.sdk.get_account_info()
+        self._info_cache[wallet.name] = (now, info)
+        return info
+
+    def _forget_balances(self, wallet_name: str) -> None:
+        self._info_cache.pop(wallet_name, None)
+
+    async def _token_balance(self, wallet: Wallet, token: InstrumentId) -> Decimal:
+        info = await self._account_info(wallet)
         return info.get_balance(token)
 
     async def _balances(
@@ -829,19 +950,53 @@ class Strategy1(Strategy):
         cc: InstrumentId,
     ) -> tuple[Decimal, Decimal, Decimal]:
         """(token, usdcx, cc) balances from a single account-info call."""
-        info = await wallet.sdk.get_account_info()
+        info = await self._account_info(wallet)
         return (info.get_balance(token), info.get_balance(usdcx),
                 info.get_balance(cc))
 
     async def _token_cc_value(
         self, wallet: Wallet, token: InstrumentId, amount: Decimal, cc: InstrumentId,
-    ) -> Decimal:
-        """CC value of `amount` of `token`, via a pricing quote. 0 on error."""
-        try:
-            q = await wallet.sdk.get_swap_quote(amount, token, cc)
-            return q.returned_amount
-        except CantexError:
-            return Decimal(0)
+    ) -> Decimal | None:
+        """CC value of `amount` of `token`, via a pricing quote.
+
+        **None when the quote fails — never 0.** It used to return 0, which
+        reads as "dust": under a 429 a wallet holding ~110 CC of eXAU decided
+        it held nothing, tried to BUY with the base it had already spent, hit
+        "saldo kurang" four times and parked until the next UTC day, still
+        holding the token.
+
+        Cached per exact amount for VALUE_TTL: the result is only compared
+        with the 10 CC min ticket, and a holding of ~110 CC is not going to
+        cross that between two polls.
+        """
+        key = (wallet.name, token, amount)
+        now = time.monotonic()
+        hit = self._value_cache.get(key)
+        if hit is not None and now - hit[0] < self.VALUE_TTL:
+            return hit[1]
+        q = await self._quote_or_none(wallet, amount, token, cc)
+        if q is None:
+            return None
+        if len(self._value_cache) > 512:          # amounts change per trade
+            self._value_cache.clear()
+        self._value_cache[key] = (now, q.returned_amount)
+        return q.returned_amount
+
+    def _is_sellable(self, wallet: Wallet, token_symbol: str, amount: Decimal,
+                     cc_value: Decimal | None) -> bool:
+        """Whether a holding is worth selling. An unknown value (quote failed)
+        counts as sellable: flipping to a buy on a maybe is the same mistake
+        as firing the opposite leg on an unconfirmed swap."""
+        if cc_value is None:
+            logger.info("[%s] %s %s: value unknown (quote failed) — treating "
+                        "as sellable", wallet.name, amount, token_symbol)
+            return True
+        if cc_value < self.config.min_ticket_cc:
+            logger.info("[%s] %s %s is dust (~%s CC < %s) — buying instead",
+                        wallet.name, amount, token_symbol, cc_value,
+                        self.config.min_ticket_cc)
+            return False
+        return True
 
     async def _pick(self, wallet, pairs, usdcx, cc, state):
         """Choose the next (pair, sellable) and read balances for it.
@@ -858,9 +1013,6 @@ class Strategy1(Strategy):
         sellable = False
         if token_bal > 0:
             cc_value = await self._token_cc_value(wallet, pair.token, token_bal, cc)
-            sellable = cc_value >= self.config.min_ticket_cc
-            if not sellable:
-                logger.info("[%s] %s %s is dust (~%s CC < %s) — buying instead",
-                            wallet.name, token_bal, pair.token_symbol, cc_value,
-                            self.config.min_ticket_cc)
+            sellable = self._is_sellable(wallet, pair.token_symbol, token_bal,
+                                         cc_value)
         return pair, sellable, token_bal, usdcx_bal, cc_bal

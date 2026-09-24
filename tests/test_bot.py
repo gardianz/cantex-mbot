@@ -3729,7 +3729,7 @@ async def test_stop_loss_stays_armed_when_fee_guard_rejects(tmp_path, monkeypatc
     strat._price_cc_in_usdcx = AsyncMock(return_value=Decimal("10"))
     strat._token_cc_value = AsyncMock(return_value=Decimal("110"))     # sellable
     strat._balances = AsyncMock(return_value=(Decimal("1"), Decimal("100"), Decimal("50")))
-    strat._cycle_loss_pct = AsyncMock(return_value=Decimal("7"))       # 7% down
+    strat._cycle_loss_and_quote = AsyncMock(return_value=(Decimal("7"), None))  # 7% down
     strat._wait_next_day = AsyncMock(return_value=False)
     # Hold already timed out.
     strat._held_since[("w1", "CBTC")] = _t.monotonic() - 301
@@ -3823,3 +3823,213 @@ async def test_wallet_crash_is_reported_where_it_happens(tmp_path, monkeypatch):
     # and the watchdog must not keep hunting a wallet that has already ended
     assert "w1" not in strat._last_progress
     store.close()
+
+
+# -- rate limits: fewer requests, and a 429 never ends a wallet ---------------
+
+def test_transient_classification():
+    """What the SDK already retried is a transport problem, not a verdict."""
+    import aiohttp
+    from cantex_sdk import CantexAPIError, CantexError, CantexTimeoutError
+    from cantex_bot.swapper import is_rate_limited, is_transient
+
+    assert is_transient(CantexAPIError(429, "slow down"))
+    assert is_rate_limited(CantexAPIError(429, "slow down"))
+    assert is_transient(CantexAPIError(503, "")) and not is_rate_limited(
+        CantexAPIError(503, ""))
+    assert is_transient(CantexTimeoutError("POST /v2/pools/quote timed out"))
+    dropped = CantexError("failed after 4 attempts")
+    dropped.__cause__ = aiohttp.ClientConnectionError("reset")
+    assert is_transient(dropped)
+    # A real answer from the API is not something to wait out.
+    assert not is_transient(CantexAPIError(400, "Too small"))
+    assert not is_transient(CantexError("Missing required key"))
+
+
+def _engine_wallet(quote_side_effect=None, quote=None):
+    sdk = SimpleNamespace(get_swap_quote=AsyncMock(
+        side_effect=quote_side_effect, return_value=quote))
+    return SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_quote_is_flagged_not_telegrammed(tmp_path):
+    from cantex_sdk import CantexAPIError
+    store = Store(tmp_path / "s.db")
+    sent = AsyncMock()
+    engine = SwapEngine(SwapGuard(GuardConfig()), store,
+                        SimpleNamespace(send=sent), dry_run=True)
+    wallet = _engine_wallet(quote_side_effect=CantexAPIError(429, "slow down"))
+    usdcx, tok = InstrumentId("a", "USDCX"), InstrumentId("a", "CBTC")
+
+    out = await engine.execute_swap(
+        wallet, sell=usdcx, buy=tok, sell_amount=Decimal("10"),
+        sell_symbol="USDCX", buy_symbol="CBTC", direction="buy", quiet_reject=True)
+
+    assert out.transient and out.rate_limited
+    assert out.error and not out.submitted_attempt
+    sent.assert_not_awaited()          # one message per wallet per poll otherwise
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_real_quote_error_still_reports(tmp_path):
+    from cantex_sdk import CantexAPIError
+    store = Store(tmp_path / "s.db")
+    sent = AsyncMock()
+    engine = SwapEngine(SwapGuard(GuardConfig()), store,
+                        SimpleNamespace(send=sent), dry_run=True)
+    wallet = _engine_wallet(quote_side_effect=CantexAPIError(400, "no route"))
+    usdcx, tok = InstrumentId("a", "USDCX"), InstrumentId("a", "CBTC")
+
+    out = await engine.execute_swap(
+        wallet, sell=usdcx, buy=tok, sell_amount=Decimal("10"),
+        sell_symbol="USDCX", buy_symbol="CBTC", direction="buy", quiet_reject=True)
+
+    assert not out.transient and out.error
+    sent.assert_awaited_once()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_swap_reuses_a_quote_it_is_handed(tmp_path):
+    """The cycle-loss brake already quoted this exact sell; quoting it again
+    was one of the four requests per poll."""
+    store = Store(tmp_path / "s.db")
+    engine = SwapEngine(SwapGuard(GuardConfig()), store, notifier(), dry_run=True)
+    wallet = _engine_wallet()
+    usdcx, tok = InstrumentId("a", "USDCX"), InstrumentId("a", "CBTC")
+
+    out = await engine.execute_swap(
+        wallet, sell=tok, buy=usdcx, sell_amount=Decimal("1"),
+        sell_symbol="CBTC", buy_symbol="USDCX", direction="sell",
+        quote=make_quote())
+
+    wallet.sdk.get_swap_quote.assert_not_awaited()
+    assert out.quote is not None and out.counted       # dry run went through
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_value_quote_is_unknown_not_dust(tmp_path, monkeypatch):
+    """erpan_7: a 429 on the dust check read ~110 CC of eXAU as 0 CC, so the
+    wallet tried to BUY with base it had already spent, hit 'saldo kurang'
+    four times and parked for the day still holding the token."""
+    from cantex_sdk import CantexAPIError
+    strat, _e, _rs, store = _strategy_fixture(tmp_path, monkeypatch)
+    wallet = _engine_wallet(quote_side_effect=CantexAPIError(429, "slow down"))
+    tok, cc = InstrumentId("a", "EXAU"), InstrumentId("a", "CC")
+
+    value = await strat._token_cc_value(wallet, tok, Decimal("0.0027"), cc)
+
+    assert value is None
+    assert strat._is_sellable(wallet, "EXAU", Decimal("0.0027"), value)
+    assert not strat._is_sellable(wallet, "EXAU", Decimal("0.0027"), Decimal("3"))
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_value_and_balances_are_not_refetched_every_poll(tmp_path, monkeypatch):
+    strat, _e, _rs, store = _strategy_fixture(tmp_path, monkeypatch)
+    info = SimpleNamespace(get_balance=lambda _i: Decimal("1"))
+    wallet = _engine_wallet(quote=SimpleNamespace(returned_amount=Decimal("110")))
+    wallet.sdk.get_account_info = AsyncMock(return_value=info)
+    tok, cc = InstrumentId("a", "EXAU"), InstrumentId("a", "CC")
+
+    for _ in range(5):
+        await strat._account_info(wallet)
+        await strat._token_cc_value(wallet, tok, Decimal("0.0027"), cc)
+    assert wallet.sdk.get_account_info.await_count == 1
+    assert wallet.sdk.get_swap_quote.await_count == 1
+
+    # A swap moves balances: the next read must go back to the exchange.
+    strat._forget_balances("w1")
+    await strat._account_info(wallet)
+    assert wallet.sdk.get_account_info.await_count == 2
+    # A different amount is a different holding.
+    await strat._token_cc_value(wallet, tok, Decimal("0.0031"), cc)
+    assert wallet.sdk.get_swap_quote.await_count == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_quotes_never_stop_the_wallet(tmp_path, monkeypatch):
+    """A 429 storm used to count each throttled quote as a failed swap and end
+    the wallet with 'stopped: repeated errors' after six."""
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=99)
+    strat.TRANSIENT_MAX_BACKOFF = 0.0
+    strat.config = Strategy1Config(daily_swap_target=99, insufficient_retries=99,
+                                   cooldown_seconds=0, poll_max_seconds=0)
+    stop = _a.Event()
+    calls = {"n": 0}
+
+    async def _throttled(*_a_, **_kw):
+        calls["n"] += 1
+        if calls["n"] >= 20:      # well past the abort cap of 6
+            stop.set()
+        return SimpleNamespace(
+            counted=False, ok=False, error="quote failed: API error 429",
+            submitted_attempt=False, transient=True, rate_limited=True,
+            reject_reasons=None, guard=None, buy_amount=Decimal("0"),
+            buy_symbol="CBTC")
+
+    engine.execute_swap = AsyncMock(side_effect=_throttled)
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))          # flat -> buy
+    strat._balances = AsyncMock(return_value=(Decimal("0"), Decimal("100"), Decimal("50")))
+    await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                                            sdk=SimpleNamespace()), stop)
+
+    assert calls["n"] == 20
+    assert rs.view("w1").plan.startswith("rate limit")
+    assert strat._transient_streak["w1"] == 20
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_balance_read_does_not_crash_the_wallet(tmp_path, monkeypatch):
+    """The balance read has no fallback, so a 429 on it propagated out of the
+    loop and ended the wallet."""
+    import asyncio as _a
+    from cantex_sdk import CantexAPIError
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=99)
+    strat.TRANSIENT_MAX_BACKOFF = 0.0
+    strat.config = Strategy1Config(daily_swap_target=99, insufficient_retries=99,
+                                   cooldown_seconds=0, poll_max_seconds=0)
+    stop = _a.Event()
+    reads = {"n": 0}
+
+    async def _balances(*_a_, **_kw):
+        reads["n"] += 1
+        if reads["n"] <= 3:
+            raise CantexAPIError(429, "slow down")
+        stop.set()
+        return Decimal("0"), Decimal("100"), Decimal("50")
+
+    engine.execute_swap = AsyncMock(return_value=SimpleNamespace(
+        counted=False, ok=False, error=None, submitted_attempt=False,
+        reject_reasons=["network fee 0.9 > 0.7"],
+        guard=SimpleNamespace(details={"network_fee": Decimal("0.9")}),
+        buy_amount=Decimal("0"), buy_symbol="CBTC"))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
+    strat._balances = _balances
+    await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                                            sdk=SimpleNamespace()), stop)
+
+    assert reads["n"] == 4                      # retried past three 429s
+    assert engine.execute_swap.await_count == 1  # and went on to trade
+    assert rs.view("w1").status != "error"
+    store.close()
+
+
+def test_buy_quote_hint_only_matches_the_same_buy():
+    from cantex_bot.strategies.strategy1 import Strategy1
+    q = object()
+    assert Strategy1._buy_quote_from(("EXAU", Decimal("11.8"), q), "EXAU",
+                                     Decimal("11.8")) is q
+    # A re-priced buy or another token is a different swap: quote it afresh.
+    assert Strategy1._buy_quote_from(("EXAU", Decimal("11.8"), q), "EXAU",
+                                     Decimal("11.9")) is None
+    assert Strategy1._buy_quote_from(("CBTC", Decimal("11.8"), q), "EXAU",
+                                     Decimal("11.8")) is None
+    assert Strategy1._buy_quote_from(None, "EXAU", Decimal("11.8")) is None

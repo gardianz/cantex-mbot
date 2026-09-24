@@ -29,7 +29,7 @@ class Strategy2(Strategy1):
         """Sell a held (stuck) token back to base first; otherwise buy the
         lowest network-fee destination. Returns
         ``(pair, sellable, token_bal, usdcx_bal, cc_bal)``."""
-        info = await wallet.sdk.get_account_info()
+        info = await self._account_info(wallet)
         usdcx_bal = info.get_balance(usdcx)
         cc_bal = info.get_balance(cc)
 
@@ -39,20 +39,25 @@ class Strategy2(Strategy1):
             bal = info.get_balance(pair.token)
             if bal > 0:
                 cc_value = await self._token_cc_value(wallet, pair.token, bal, cc)
-                if cc_value >= self.config.min_ticket_cc:
+                if self._is_sellable(wallet, pair.token_symbol, bal, cc_value):
                     return pair, True, bal, usdcx_bal, cc_bal
 
         # 2. Holding base: pick the lowest-network-fee destination to buy.
-        best = await self._lowest_fee_pair(wallet, pairs, usdcx, state["notional"])
+        best = await self._lowest_fee_pair(wallet, pairs, usdcx, state["notional"],
+                                           state=state)
         return best, False, info.get_balance(best.token), usdcx_bal, cc_bal
 
-    async def _lowest_fee_pair(self, wallet, pairs, usdcx, notional):
+    async def _lowest_fee_pair(self, wallet, pairs, usdcx, notional, *, state=None):
         """Quote base->token for every candidate and return the pool with the
         smallest network fee. Each observed fee is recorded so the dashboard's
         PAIR FEES panel stays current for all pairs. Falls back to the first
-        pair if none could be quoted."""
+        pair if none could be quoted.
+
+        The winner's quote is left in ``state["buy_quote"]`` so the buy that
+        follows reuses it instead of quoting the same swap a second time."""
         best = None
         best_fee = None
+        best_quote = None
         for pair in pairs:
             try:
                 q = await wallet.sdk.get_swap_quote(notional, usdcx, pair.token)
@@ -64,7 +69,9 @@ class Strategy2(Strategy1):
             self.store.record_fee(
                 wallet.name, f"{self.base_symbol}->{pair.token_symbol}", fee, slip, pool)
             if best_fee is None or fee < best_fee:
-                best_fee, best = fee, pair
+                best_fee, best, best_quote = fee, pair, q
+        if best is not None and state is not None:
+            state["buy_quote"] = (best.token_symbol, notional, best_quote)
         if best is not None:
             logger.info("[%s] lowest-fee target: %s (network fee %s)",
                         wallet.name, best.token_symbol, best_fee)

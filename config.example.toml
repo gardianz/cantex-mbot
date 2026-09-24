@@ -46,6 +46,9 @@ confirm_retries = 5
 confirm_interval = 2.0
 # Adaptive fee polling: while waiting for the network fee to fall to
 # max_network_fee, re-quote fast when close, slow when far above.
+# Each poll is one quote request PER WAITING WALLET: 30 wallets at 0.5s is 60
+# requests a second, which is what trips the API's rate limit (HTTP 429). Raise
+# poll_min_seconds before anything else if the log shows "returned 429".
 poll_min_seconds = 0.5     # interval when fee is at/near the threshold
 poll_max_seconds = 5.0     # interval when fee is far above the threshold
 poll_far_ratio = 0.3       # fee >= 30% above threshold -> use poll_max

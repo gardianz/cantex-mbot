@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1570,7 +1571,9 @@ async def test_guard_wait_escalates_to_stuck(tmp_path, monkeypatch):
     plan = await strat._note_guard_wait(wallet, "sell EXAG", "pool 0.20>0.16", True)
     assert plan == "tunggu pool 0.20>0.16" and sent == []
 
-    strat._guard_since[("w1", "sell EXAG")] = 0.0      # pretend 600s+ has passed
+    # Pretend 600s+ has passed. Not 0.0: time.monotonic() counts from boot on
+    # Linux, so on a freshly booted host 0.0 is only seconds ago.
+    strat._guard_since[("w1", "sell EXAG")] = time.monotonic() - 10_000
     plan = await strat._note_guard_wait(wallet, "sell EXAG", "pool 0.20>0.16", True)
     assert plan.startswith("stuck:")
     assert len(sent) == 1 and "stuck" in sent[0]
@@ -1588,7 +1591,7 @@ async def test_guard_wait_resets_when_the_leg_gets_through(tmp_path, monkeypatch
     strat.config = Strategy1Config(guard_wait_seconds=600)
     strat.notifier = SimpleNamespace(send=AsyncMock())
     wallet = SimpleNamespace(name="w1")
-    strat._guard_since[("w1", "sell EXAG")] = 0.0
+    strat._guard_since[("w1", "sell EXAG")] = time.monotonic() - 10_000
     assert (await strat._note_guard_wait(
         wallet, "sell EXAG", "fee 0.55", False)).startswith("stuck:")
     strat._clear_guard_wait("w1", "sell EXAG")
@@ -3747,4 +3750,76 @@ async def test_stop_loss_stays_armed_when_fee_guard_rejects(tmp_path, monkeypatc
                for c in engine.execute_swap.await_args_list)
     # Timer still expired -> the stop is still armed for the next attempt.
     assert strat._hold_expired("w1", "CBTC")
+    store.close()
+
+
+# -- a wallet must never die quietly -----------------------------------------
+
+def _startup_strat(tmp_path, monkeypatch):
+    """Strategy fixture whose startup retries are instant."""
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch)
+    strat.PRICE_RETRY_BACKOFF = 0.0
+    strat.notifier = SimpleNamespace(send=AsyncMock())
+    return strat, engine, rs, store
+
+
+@pytest.mark.asyncio
+async def test_startup_price_failure_stops_the_wallet_loudly(tmp_path, monkeypatch):
+    """danu_seven: one failed CC quote ended the wallet before the loop, and
+    nothing said so — the row read "running" with 0 swaps all day, because
+    `run()` only reports a returned wallet once EVERY wallet has returned."""
+    import asyncio as _a
+    from cantex_bot.runstate import STOPPED
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat._price_cc_in_usdcx = AsyncMock(return_value=Decimal("0"))
+
+    await strat._run_wallet(
+        SimpleNamespace(name="w1", sdk=None, ensure_auth=AsyncMock(), web=None),
+        _a.Event())
+
+    view = rs.view("w1")
+    assert view.status == STOPPED and view.finished
+    assert view.plan == "harga CC gagal"
+    assert strat._price_cc_in_usdcx.await_count == strat.PRICE_RETRIES
+    assert strat.notifier.send.await_count == 1
+    assert "could not price" in strat.notifier.send.await_args[0][0]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_price_recovers_on_a_later_try(tmp_path, monkeypatch):
+    """A transient quote error must cost a retry, not the wallet's whole day."""
+    import asyncio as _a
+    strat, _e, _rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat._price_cc_in_usdcx = AsyncMock(
+        side_effect=[Decimal("0"), Decimal("0"), Decimal("12")])
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(), web=None)
+
+    got = await strat._initial_notional(
+        wallet, InstrumentId("a", "CC"), InstrumentId("a", "USDCX"), _a.Event())
+
+    assert got == Decimal("12")
+    assert strat._price_cc_in_usdcx.await_count == 3
+    strat.notifier.send.assert_not_awaited()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_wallet_crash_is_reported_where_it_happens(tmp_path, monkeypatch):
+    """A crash used to surface only after the gather in `run()`, which waits for
+    every wallet — and a wallet polling a guard may poll until the run stops."""
+    import asyncio as _a
+    from cantex_bot.runstate import ERROR
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat._trade_wallet = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await strat._run_wallet(SimpleNamespace(name="w1"), _a.Event())
+
+    view = rs.view("w1")
+    assert view.status == ERROR and view.finished
+    assert "boom" in view.plan
+    assert strat.notifier.send.await_count == 1
+    assert "boom" in strat.notifier.send.await_args[0][0]
+    # and the watchdog must not keep hunting a wallet that has already ended
+    assert "w1" not in strat._last_progress
     store.close()

@@ -28,7 +28,7 @@ from ..swapper import SwapEngine
 from ..telegram import TelegramNotifier
 from ..store import Store
 from ..wallets import Wallet, WalletManager
-from ..webclient import WebClient, WebClientError
+from ..webclient import WebClient
 from .base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 class Strategy1(Strategy):
     name = "strategy1"
     label = "Strategy1"          # display name in logs / Telegram (subclasses override)
+    # Tries for the one quote a wallet cannot start without (see
+    # `_initial_notional`), and the seconds between them (grows per attempt).
+    # Every later quote is retried by the loop itself.
+    PRICE_RETRIES = 5
+    PRICE_RETRY_BACKOFF = 2.0
 
     def __init__(
         self,
@@ -149,6 +154,20 @@ class Strategy1(Strategy):
         with wallet_logs(wallet.name):
             try:
                 await self._trade_wallet(wallet, stop)
+            except Exception as exc:  # noqa: BLE001 - per-wallet isolation
+                # Report it here, not after the gather in `run()`. That gather
+                # only returns once EVERY wallet has, and a wallet polling a
+                # guard may poll until the run is stopped — so a crash reported
+                # there stays invisible for the rest of the day while the
+                # dashboard still shows the wallet's last status.
+                logger.exception("[%s] %s wallet crashed: %s",
+                                 wallet.name, self.label, exc)
+                self._st(wallet.name, status=run_status.ERROR, route="",
+                         plan=f"crash: {exc}"[:60])
+                if self.run_state is not None:
+                    self.run_state.finish(wallet.name, status=run_status.ERROR)
+                await self.notifier.send(
+                    f"❌ {self.label} [{wallet.name}] crashed: {exc}")
             finally:
                 self._last_progress.pop(wallet.name, None)
                 self._wallet_tasks.pop(wallet.name, None)
@@ -170,9 +189,8 @@ class Strategy1(Strategy):
         self._st(wallet.name, target=self.config.daily_swap_target,
                  status=run_status.RUNNING)
 
-        buy_notional = await self._price_cc_in_usdcx(wallet, cc, usdcx)
+        buy_notional = await self._initial_notional(wallet, cc, usdcx, stop)
         if buy_notional <= 0:
-            logger.error("[%s] could not price CC, aborting wallet", wallet.name)
             return
         self._notional_cache[wallet.name] = (time.monotonic(), buy_notional)
         logger.info(
@@ -486,7 +504,7 @@ class Strategy1(Strategy):
             self.store.record_trades(wallet.name, trades)
             today = datetime.now(timezone.utc).date()
             val = self.store.count_trades(wallet.name, today, today)
-        except WebClientError as exc:
+        except Exception as exc:  # noqa: BLE001 - one bad poll, not a dead wallet
             logger.warning("[%s] web history fetch failed: %s", wallet.name, exc)
             val = cached[1] if cached else 0
         self._web_cache[wallet.name] = (now, val)
@@ -508,7 +526,7 @@ class Strategy1(Strategy):
             val = WebClient.loss_between(
                 self.store.trades_between(wallet.name, today, today),
                 usdcx_symbol=self.base_symbol, start=today, end=today)
-        except WebClientError as exc:
+        except Exception as exc:  # noqa: BLE001 - one bad poll, not a dead wallet
             logger.debug("[%s] loss fetch failed: %s", wallet.name, exc)
             val = cached[1] if cached else Decimal(0)
         self._loss_cache[wallet.name] = (now, val)
@@ -746,6 +764,46 @@ class Strategy1(Strategy):
                             float((priced - current) / current * 100))
         self._notional_cache[wallet.name] = (now, priced)
         return priced
+
+    async def _initial_notional(
+        self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,
+        stop: asyncio.Event,
+    ) -> Decimal:
+        """Price the first buy, retrying a failed quote. 0 = give up (reported).
+
+        A single transient quote error used to end the wallet right here: the
+        loop was never entered, so no route, plan or terminal status was ever
+        written, and the row read "running" with 0 swaps for the rest of the day
+        while every other wallet traded. The buy size is re-quoted every
+        `notional_ttl_seconds` once the loop runs, so this one quote is the only
+        place where a failure is fatal — retry it, and if it really cannot be
+        priced, stop the wallet loudly instead of silently.
+        """
+        for attempt in range(1, self.PRICE_RETRIES + 1):
+            if stop.is_set():
+                return Decimal(0)
+            priced = await self._price_cc_in_usdcx(wallet, cc, usdcx)
+            if priced > 0:
+                return priced
+            if attempt == self.PRICE_RETRIES:
+                break
+            self._st(wallet.name, status=run_status.WAITING, route="",
+                     plan=f"harga CC gagal {attempt}/{self.PRICE_RETRIES}")
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(), timeout=self.PRICE_RETRY_BACKOFF * attempt)
+        logger.error("[%s] could not price %s CC in %s after %d tries — "
+                     "wallet stopped", wallet.name, self.config.cc_units,
+                     self.base_symbol, self.PRICE_RETRIES)
+        self._st(wallet.name, status=run_status.STOPPED, route="",
+                 plan="harga CC gagal")
+        if self.run_state is not None:
+            self.run_state.finish(wallet.name, status=run_status.STOPPED)
+        await self.notifier.send(
+            f"⚠️ {self.label} [{wallet.name}] could not price "
+            f"{self.config.cc_units} CC in {self.base_symbol} — wallet stopped"
+        )
+        return Decimal(0)
 
     async def _price_cc_in_usdcx(
         self, wallet: Wallet, cc: InstrumentId, usdcx: InstrumentId,

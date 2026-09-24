@@ -53,6 +53,11 @@ class Strategy1(Strategy):
     VALUE_TTL = 300.0
     # Ceiling for the back-off after repeated 429s / network failures.
     TRANSIENT_MAX_BACKOFF = 60.0
+    # A wallet parked for "saldo kurang" re-reads its balance this often and
+    # resumes the same day once it can afford a buy again — funds arrive
+    # mid-day (an accepted incoming transfer, a distribute, a deposit), and
+    # idling to midnight with the money already there wastes the day.
+    FUNDS_POLL_SECONDS = 60.0
 
     def __init__(
         self,
@@ -319,12 +324,22 @@ class Strategy1(Strategy):
                     continue
             if insufficient_streak >= self.config.insufficient_retries:
                 logger.warning("[%s] insufficient balance after %d retries — "
-                               "idle until next UTC day", wallet.name, insufficient_streak)
+                               "waiting for funds or the next UTC day",
+                               wallet.name, insufficient_streak)
                 self._st(wallet.name, status=run_status.STOPPED,
                          route="", plan="saldo kurang")
                 self._park_until_day(wallet.name)
-                if not await self._wait_next_day(stop):
+                woke = await self._wait_for_funds(
+                    wallet, stop, usdcx, cc, state["notional"])
+                if woke is None:
                     break
+                if woke == "funds":
+                    insufficient_streak = 0
+                    self._st(wallet.name, status=run_status.RUNNING,
+                             route="", plan="saldo masuk")
+                    await self.notifier.send(
+                        f"💰 {self.label} [{wallet.name}] funds arrived — "
+                        f"trading again")
                 continue
 
             try:
@@ -355,7 +370,11 @@ class Strategy1(Strategy):
                 logger.info("[%s] insufficient %s (%s < %s), skip %s",
                             wallet.name, self.base_symbol, usdcx_bal,
                             buy_notional, tok)
-                await asyncio.sleep(self.config.cooldown_seconds)
+                # Each strike must be a FRESH read: a balance cached from just
+                # before a sell settled would otherwise be counted four times
+                # in a row and park a wallet that has the money.
+                self._forget_balances(wallet.name)
+                await asyncio.sleep(self._insufficient_pause())
                 continue
 
             # Cycle-loss brake: the per-leg guards cannot see a round trip, so a
@@ -457,7 +476,8 @@ class Strategy1(Strategy):
                          route=route, plan="saldo kurang")
                 logger.info("[%s] %s cannot proceed (cc=%s, fee=%s): saldo kurang",
                             wallet.name, step, cc_bal, fee)
-                await asyncio.sleep(self.config.cooldown_seconds)
+                self._forget_balances(wallet.name)
+                await asyncio.sleep(self._insufficient_pause())
                 continue
 
             # Ambiguous: a live swap was SUBMITTED but confirmation errored — it
@@ -946,6 +966,56 @@ class Strategy1(Strategy):
         except CantexError as exc:
             logger.error("[%s] CC pricing quote failed: %s", wallet.name, exc)
             return Decimal(0)
+
+    def _insufficient_pause(self) -> float:
+        """Gap between "saldo kurang" strikes. Four strikes at the 1s cooldown
+        span ~4s, shorter than the exchange can take to show a swap that just
+        settled; spacing them at the slow poll gives it ~15s."""
+        return max(self.config.cooldown_seconds, self.config.poll_max_seconds)
+
+    async def _wait_for_funds(
+        self, wallet: Wallet, stop: asyncio.Event, base: InstrumentId,
+        cc: InstrumentId, need: Decimal,
+    ) -> str | None:
+        """Idle a wallet that cannot afford a buy until it can, or until the
+        next UTC day. ``"funds"`` = resume now, ``"day"`` = the day rolled
+        over (the loop resets as usual), ``None`` = stopped.
+
+        Re-reads the balance every FUNDS_POLL_SECONDS — one request a minute,
+        against a whole day of a funded wallet sitting idle. Needs the base
+        for a buy and enough CC to pay the network fee the guard allows.
+        """
+        need_cc = self.engine.guard.config.max_network_fee
+        day = datetime.now(timezone.utc).date()
+        while True:
+            # Checked explicitly: wait_for with a zero timeout (right at
+            # midnight) times out without looking at an already-set event.
+            if stop.is_set():
+                return None
+            now = datetime.now(timezone.utc)
+            midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            wait = min(self.FUNDS_POLL_SECONDS,
+                       max((midnight - now).total_seconds(), 0.0))
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=wait)
+                return None
+            except asyncio.TimeoutError:
+                pass
+            if datetime.now(timezone.utc).date() != day:
+                return "day"
+            self._forget_balances(wallet.name)
+            try:
+                info = await self._account_info(wallet)
+            except Exception as exc:  # noqa: BLE001 - keep waiting, try again
+                logger.debug("[%s] funds check failed: %s", wallet.name, exc)
+                continue
+            have, have_cc = info.get_balance(base), info.get_balance(cc)
+            if have >= need and have_cc >= need_cc:
+                logger.info("[%s] funds arrived: %s %s (need %s), %s CC — "
+                            "resuming", wallet.name, have, self.base_symbol,
+                            need, have_cc)
+                return "funds"
 
     async def _account_info(self, wallet: Wallet):
         """Account info, reused for BALANCE_TTL seconds.

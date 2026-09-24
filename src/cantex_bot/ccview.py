@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -31,6 +32,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CCVIEW_BASE = "https://ccview.io"
 FEE_ANS_NAME = "cantex.unverified.cns"
+
+
+def _error_summary(body: str) -> str:
+    """What an error response says, in one short line.
+
+    A 502 from ccview's proxy is a whole HTML page; its first 200 characters
+    are a doctype and IE conditional comments, which is what the dashboard's
+    LOG panel used to show. Use the page's <title> when there is one.
+    """
+    text = body.strip()
+    if text[:200].lower().lstrip().startswith(("<!doctype", "<html", "<!--")):
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        title = " ".join(m.group(1).split()) if m else ""
+        return f"HTML error page{': ' + title[:120] if title else ''}"
+    return " ".join(text.split())[:200]
 
 
 class CCViewError(Exception):
@@ -134,7 +150,7 @@ class CCViewClient:
                     continue
                 break
         if status >= 400:
-            raise CCViewError(f"ccview HTTP {status}: {body[:200]}")
+            raise CCViewError(f"ccview HTTP {status}: {_error_summary(body)}")
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:

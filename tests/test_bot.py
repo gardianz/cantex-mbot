@@ -212,6 +212,8 @@ async def test_strategy_sells_held_token_first(tmp_path, monkeypatch):
     strat._token_cc_value = AsyncMock(return_value=Decimal("110"))   # >= min ticket
     strat._balances = AsyncMock(return_value=(Decimal("0.0002"), Decimal("100"), Decimal("50")))
     strat._wait_next_day = AsyncMock(return_value=False)  # end on target instead of idling
+    strat._wait_for_funds = AsyncMock(return_value=None)   # as if stopped
+    strat._insufficient_pause = lambda: 0.0
 
     wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
                              sdk=SimpleNamespace())
@@ -254,6 +256,8 @@ async def test_strategy_buys_when_flat(tmp_path, monkeypatch):
     strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
     strat._balances = AsyncMock(return_value=(Decimal("0"), Decimal("100"), Decimal("50")))  # flat
     strat._wait_next_day = AsyncMock(return_value=False)
+    strat._wait_for_funds = AsyncMock(return_value=None)   # as if stopped
+    strat._insufficient_pause = lambda: 0.0
     await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
                                             sdk=SimpleNamespace()), _a.Event())
     first = engine.execute_swap.await_args_list[0].kwargs
@@ -296,6 +300,8 @@ async def test_strategy_stops_on_too_small(tmp_path, monkeypatch):
     strat._token_cc_value = AsyncMock(return_value=Decimal("110"))   # sellable -> sell attempted
     strat._balances = AsyncMock(return_value=(Decimal("0.02"), Decimal("0"), Decimal("50")))
     strat._wait_next_day = AsyncMock(return_value=False)
+    strat._wait_for_funds = AsyncMock(return_value=None)   # as if stopped
+    strat._insufficient_pause = lambda: 0.0
     await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
                                             sdk=SimpleNamespace()), _a.Event())
     # stopped as saldo-kurang, and it did NOT spin up to the 6-failure abort.
@@ -334,6 +340,8 @@ def _strategy_fixture(tmp_path, monkeypatch, *, retries=3):
     # Terminal states now idle until the next UTC day; in tests return False
     # (as if stopped) so _run_wallet ends instead of sleeping for hours.
     strat._wait_next_day = AsyncMock(return_value=False)
+    strat._wait_for_funds = AsyncMock(return_value=None)   # as if stopped
+    strat._insufficient_pause = lambda: 0.0
     return strat, engine, rs, store
 
 
@@ -3731,6 +3739,8 @@ async def test_stop_loss_stays_armed_when_fee_guard_rejects(tmp_path, monkeypatc
     strat._balances = AsyncMock(return_value=(Decimal("1"), Decimal("100"), Decimal("50")))
     strat._cycle_loss_and_quote = AsyncMock(return_value=(Decimal("7"), None))  # 7% down
     strat._wait_next_day = AsyncMock(return_value=False)
+    strat._wait_for_funds = AsyncMock(return_value=None)   # as if stopped
+    strat._insufficient_pause = lambda: 0.0
     # Hold already timed out.
     strat._held_since[("w1", "CBTC")] = _t.monotonic() - 301
 
@@ -4232,3 +4242,155 @@ async def test_distribute_stops_firing_when_the_sender_cannot_spend(monkeypatch)
     assert out.failed[1].error.startswith("not sent:")   # never fired
     assert seen == [(1, True), (2, False), (3, False)]  # every recipient reported
     notifier_.send.assert_awaited_once()                # the summary still goes out
+
+
+# -- "saldo kurang" wakes up when the money arrives ---------------------------
+
+def _funds_strat(tmp_path, monkeypatch, reads):
+    """Strategy whose account info returns `reads` in order (base, cc)."""
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch)
+    del strat._wait_for_funds                       # use the real one
+    strat.FUNDS_POLL_SECONDS = 0.0
+    engine.guard = SimpleNamespace(config=SimpleNamespace(
+        max_network_fee=Decimal("0.6")))
+    base, cc = InstrumentId("a", "USDC.B"), InstrumentId("a", "CC")
+    infos = [SimpleNamespace(get_balance=lambda i, b=b, c=c: b if i == base else c)
+             for b, c in reads]
+    wallet = SimpleNamespace(name="w1", sdk=SimpleNamespace(
+        get_account_info=AsyncMock(side_effect=infos)))
+    return strat, wallet, base, cc, store
+
+
+@pytest.mark.asyncio
+async def test_parked_wallet_resumes_when_funds_arrive(tmp_path, monkeypatch):
+    """mulyanayanu read 'saldo kurang' with 20 USDC.B in it: parked until the
+    next UTC day, it never looked at its balance again."""
+    import asyncio as _a
+    strat, wallet, base, cc, store = _funds_strat(tmp_path, monkeypatch, [
+        (Decimal("0"), Decimal("100")),          # still empty
+        (Decimal("20"), Decimal("100")),         # the transfer was accepted
+    ])
+    got = await strat._wait_for_funds(wallet, _a.Event(), base, cc, Decimal("12"))
+    assert got == "funds"
+    assert wallet.sdk.get_account_info.await_count == 2   # fresh read each poll
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_funds_need_cc_for_the_fee_too(tmp_path, monkeypatch):
+    import asyncio as _a
+    strat, wallet, base, cc, store = _funds_strat(tmp_path, monkeypatch, [
+        (Decimal("20"), Decimal("0.1")),         # base ok, cannot pay a fee
+        (Decimal("20"), Decimal("5")),
+    ])
+    assert await strat._wait_for_funds(
+        wallet, _a.Event(), base, cc, Decimal("12")) == "funds"
+    assert wallet.sdk.get_account_info.await_count == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_funds_wait_ends_on_stop(tmp_path, monkeypatch):
+    import asyncio as _a
+    strat, wallet, base, cc, store = _funds_strat(tmp_path, monkeypatch, [])
+    stop = _a.Event(); stop.set()
+    assert await strat._wait_for_funds(wallet, stop, base, cc, Decimal("12")) is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_saldo_kurang_strike_rereads_the_balance(tmp_path, monkeypatch):
+    """A strike counted on a cached balance could be the same stale read four
+    times over — each one must go back to the exchange."""
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=2)
+    reads = {"n": 0}
+    info = SimpleNamespace(get_balance=lambda _i: Decimal("0"))
+
+    async def _info():
+        reads["n"] += 1
+        return info
+
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                             sdk=SimpleNamespace(get_account_info=_info))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
+    await strat._run_wallet(wallet, _a.Event())
+    assert reads["n"] == 2                    # one fresh read per strike, no cache hit
+    assert rs.view("w1").plan == "saldo kurang"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_wallet_trades_again_the_same_day(tmp_path, monkeypatch):
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=2)
+    stop = _a.Event()
+    balances = iter([(Decimal("0"), Decimal("1"), Decimal("50"))] * 2
+                    + [(Decimal("0"), Decimal("100"), Decimal("50"))] * 5)
+    strat._balances = AsyncMock(side_effect=lambda *a, **k: next(balances))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
+    strat._wait_for_funds = AsyncMock(return_value="funds")
+
+    async def _swap(*_a_, **_kw):
+        stop.set()
+        return SimpleNamespace(counted=True, ok=True, error=None,
+                               reject_reasons=None, guard=None,
+                               buy_amount=Decimal("1"), buy_symbol="CBTC")
+
+    engine.execute_swap = AsyncMock(side_effect=_swap)
+    await strat._run_wallet(SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                                            sdk=SimpleNamespace()), stop)
+    strat._wait_for_funds.assert_awaited_once()
+    engine.execute_swap.assert_awaited_once()     # bought once the money was there
+    store.close()
+
+
+# -- the LOG panel shows a whole record, on one line --------------------------
+
+def test_panel_line_folds_a_multiline_message():
+    """A ccview 502 page spilled across the panel as <!--[if lt IE 7]> rows."""
+    from cantex_bot.logging_setup import _panel_line
+    got = _panel_line("22:20:11 WARNING portfolio refresh failed: ccview HTTP 502:"
+                      " <!DOCTYPE html>\n<!--[if lt IE 7]> <html>\n  <head>", False)
+    assert "\n" not in got
+    assert got.endswith("<!--[if lt IE 7]> <html> <head>")
+
+
+def test_panel_line_keeps_only_the_first_line_of_a_traceback():
+    from cantex_bot.logging_setup import _panel_line
+    got = _panel_line("ERROR [w1] wallet crashed: boom\nTraceback (most recent "
+                      "call last):\n  File ...", True)
+    assert got == "ERROR [w1] wallet crashed: boom"
+
+
+def test_panel_line_is_capped():
+    from cantex_bot.logging_setup import _PANEL_MAX, _panel_line
+    got = _panel_line("x" * 5000, False)
+    assert len(got) == _PANEL_MAX and got.endswith("…")
+
+
+def test_ccview_html_error_is_summarised():
+    from cantex_bot.ccview import _error_summary
+    page = ('<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie"> '
+            '<![endif]-->\n<html><head><title>ccview.io | 502: Bad gateway'
+            '</title></head><body>...</body></html>')
+    assert _error_summary(page) == "HTML error page: ccview.io | 502: Bad gateway"
+    assert _error_summary('{"error":\n "busy"}') == '{"error": "busy"}'
+
+
+def test_log_panel_wraps_instead_of_cutting(monkeypatch):
+    """'…Not enough data to satisfy content length header (receive…' — the
+    end of the line was the part that said what happened."""
+    from rich.console import Console
+    from cantex_bot import dashboard as dmod
+    from cantex_bot.runstate import RunState
+    tail = "(received 1234 bytes, expected 5678)"
+    monkeypatch.setattr(dmod, "recent_logs", lambda n, wallet=None: [
+        "22:25:00 WARNING cantex_bot.portfolio portfolio refresh w1 failed: "
+        "Response payload is not completed: <ContentLengthError: 400, message="
+        "'Not enough data to satisfy content length header " + tail + "'>"])
+    dash = _pair_dash([], RunState())
+    console = Console(width=80, record=True)
+    console.print(dash._log_panel())
+    text = " ".join(console.export_text().split())
+    assert "(received 1234 bytes," in text and "expected 5678)" in text

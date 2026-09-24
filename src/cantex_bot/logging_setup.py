@@ -70,12 +70,35 @@ def _wallet_of(record: logging.LogRecord) -> str | None:
     return _current_wallet.get()
 
 
+# Longest line the dashboard panel keeps for one record. The panel wraps, so
+# this is about not letting one record fill the screen, not about width.
+_PANEL_MAX = 400
+
+
+def _panel_line(text: str, has_traceback: bool) -> str:
+    """One record as ONE panel line.
+
+    The panel paints each newline as its own row, so a multi-line message — an
+    HTML error page, most often — used to spill across the whole panel as
+    ``<!--[if lt IE 7]>`` rows. A traceback is dropped here (its first line
+    already says what failed; the full one is in cantex_bot.log); any other
+    line breaks are folded into spaces.
+    """
+    if has_traceback:
+        text = text.split("\n", 1)[0]
+    text = " ".join(text.split())
+    if len(text) > _PANEL_MAX:
+        text = text[:_PANEL_MAX - 1] + "…"
+    return text
+
+
 class _RingHandler(logging.Handler):
     """Keep the last N formatted records in memory for the dashboard panel."""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            _RING.append((_wallet_of(record), self.format(record)))
+            line = _panel_line(self.format(record), bool(record.exc_info))
+            _RING.append((_wallet_of(record), line))
         except Exception:  # noqa: BLE001 - logging must never raise
             pass
 

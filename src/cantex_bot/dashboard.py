@@ -444,7 +444,9 @@ class Dashboard:
             show_header=False, title=title, title_style=f"bold {_ACCENT}",
             title_justify="left",
         )
-        t.add_column(no_wrap=True, overflow="ellipsis")
+        # Wrap, never cut: the end of a line is usually the part that says
+        # what went wrong ("…Not enough data to satisfy content length…").
+        t.add_column(no_wrap=False, overflow="fold")
         lines = recent_logs(8, wallet=wallet)
         if not lines:
             empty = f"(no log for {wallet} yet — 'l' for all)" if wallet else "(no log yet)"

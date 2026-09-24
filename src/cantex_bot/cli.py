@@ -648,13 +648,32 @@ class App:
             for t, err in o.failed:
                 console.print(f"    [red]{t.amount} {t.symbol}: {err}[/red]")
 
-        results = await accept_selected(
-            self.manager, wallet_names=wallet_names, dry_run=self.engine.dry_run,
-            only_symbols=only, run_state=self.run_state, notifier=self.notifier,
-            on_result=_line,
-        )
+        # Retry only the wallets with something still unaccepted. A re-read
+        # happens inside accept_wallet, and what this run accepted is hidden
+        # from it, so a retry can never accept the same transfer twice.
+        results: list[AcceptOutcome] = []
+        todo_wallets = list(wallet_names)
+        while todo_wallets:
+            round_ = await accept_selected(
+                self.manager, wallet_names=todo_wallets,
+                dry_run=self.engine.dry_run, only_symbols=only,
+                run_state=self.run_state, notifier=self.notifier, on_result=_line,
+            )
+            results.extend(round_)
+            failed = [o.wallet for o in round_ if o.error or o.failed]
+            if not failed:
+                break
+            console.print(f"[red]{len(failed)} wallet(s) with failures:[/red] "
+                          + ", ".join(failed))
+            again = await questionary.confirm(
+                f"Retry the {len(failed)} wallet(s) that failed?", default=True,
+            ).ask_async()
+            if not again:
+                break
+            todo_wallets = failed
         accepted = [t for o in results for t in o.accepted]
-        bad = sum(len(o.failed) for o in results) + sum(1 for o in results if o.error)
+        last: dict[str, AcceptOutcome] = {o.wallet: o for o in results}
+        bad = sum(len(o.failed) + (1 if o.error else 0) for o in last.values())
         got = ", ".join(f"{v.normalize():f} {k}" for k, v in totals(accepted).items())
         console.print(
             f"[bold]{len(accepted)} transfer(s) accepted"
@@ -824,24 +843,48 @@ class App:
                 tag = "[cyan]dry-run[/cyan]" if res.dry_run else "[green]sent[/green]"
                 console.print(f"{head} {tag} {res.amount} {symbol}")
 
-        out = await distribute(
-            self.manager, sender=sender, symbol=symbol, recipients=recipients,
-            amount=amount, dry_run=self.engine.dry_run, notifier=self.notifier,
-            on_result=_line,
-        )
-        if out.error:
-            console.print(f"[red]{out.error}[/red]")
+        # Run, then offer to retry only the recipients that failed — the ones
+        # that went through are final, so a retry must never include them.
+        # Each round re-checks the sender's balance against what is left.
+        todo = list(recipients)
+        final: dict[str, object] = {}
+        while todo:
+            out = await distribute(
+                self.manager, sender=sender, symbol=symbol, recipients=todo,
+                amount=amount, dry_run=self.engine.dry_run,
+                notifier=self.notifier, on_result=_line,
+            )
+            if out.error:
+                console.print(f"[red]{out.error}[/red]")
+                break
+            for res in out.results:
+                final[res.recipient.address] = res
+            bad = out.failed
+            if not bad:
+                break
+            console.print(f"[red]{len(bad)} failed:[/red] " + ", ".join(
+                r.recipient.label or r.recipient.address[:20] for r in bad))
+            again = await questionary.confirm(
+                f"Retry the {len(bad)} failed recipient(s)? "
+                "(the ones already sent are not sent again)",
+                default=True,
+            ).ask_async()
+            if not again:
+                break
+            todo = [r.recipient for r in bad]
+
+        results = list(final.values())
+        if not results:
             return
-        bad = out.failed
-        tag = "dry-run" if out.dry_run else "sent"
+        ok = [r for r in results if r.ok]
+        sent = sum((r.amount for r in ok), Decimal(0))
+        tag = "dry-run" if self.engine.dry_run else "sent"
+        failed = len(results) - len(ok)
         console.print(
-            f"[bold]{n - len(bad)}/{n} recipient(s), {out.ok_total} {symbol} "
+            f"[bold]{len(ok)}/{len(results)} recipient(s), {sent} {symbol} "
             f"{tag}[/bold]"
-            + (f" — [red]{len(bad)} failed[/red]" if bad else "")
+            + (f" — [red]{failed} still failed[/red]" if failed else "")
         )
-        if bad:
-            console.print("[yellow]Partial: the successful transfers are already "
-                          "final. Re-run for the failed ones only.[/yellow]")
 
     async def action_export_addresses(self) -> None:
         """Write every wallet's Canton party id to a text file, one per line."""

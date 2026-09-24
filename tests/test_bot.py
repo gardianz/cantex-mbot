@@ -4183,3 +4183,52 @@ async def test_dry_run_accept_does_not_hide_anything():
     wallet = _incoming_wallet([_pending_raw("a")])
     await incoming.accept_wallet(wallet, dry_run=True)
     assert len(await incoming.fetch_pending(wallet)) == 1
+
+
+# -- distribute: the sender's holdings drop out of the API's index ------------
+
+def _holdings_404():
+    from cantex_sdk import CantexAPIError
+    return CantexAPIError(404, '{"error":"input holding cids not found"}')
+
+
+@pytest.mark.asyncio
+async def test_distribute_waits_out_missing_sender_holdings(monkeypatch):
+    """aninur: 21 sends went through, then the API's index had no spendable
+    holding left for the sender. A short wait lets it catch up."""
+    from cantex_bot import distribute as dmod
+    from cantex_bot.distribute import Recipient, distribute
+    monkeypatch.setattr(dmod, "HOLDINGS_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    transfer = AsyncMock(side_effect=[{"id": "1"}, _holdings_404(), {"id": "2"},
+                                      {"id": "3"}])
+    wallet = _dist_wallet(balance="100", transfer=transfer)
+    out = await distribute(
+        _dist_manager(wallet, monkeypatch), sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_B), Recipient(ADDR_C), Recipient(ADDR_A)],
+        amount=Decimal("10"), dry_run=False, cooldown=0)
+    assert out.ok and out.ok_total == Decimal("30")
+    assert transfer.await_count == 4          # the one 404 was retried, once
+
+
+@pytest.mark.asyncio
+async def test_distribute_stops_firing_when_the_sender_cannot_spend(monkeypatch):
+    """The 404 is about the SENDER, so every later recipient would fail the
+    same way — 13 requests in 3 seconds. Stop, and leave them for a retry."""
+    from cantex_bot import distribute as dmod
+    from cantex_bot.distribute import Recipient, distribute
+    monkeypatch.setattr(dmod, "HOLDINGS_RETRY_DELAYS", (0.0, 0.0))
+    transfer = AsyncMock(side_effect=[{"id": "1"}] + [_holdings_404()] * 3)
+    wallet = _dist_wallet(balance="100", transfer=transfer)
+    seen = []
+    notifier_ = SimpleNamespace(send=AsyncMock())
+    out = await distribute(
+        _dist_manager(wallet, monkeypatch), sender="w1", symbol="USDCX",
+        recipients=[Recipient(ADDR_A), Recipient(ADDR_B), Recipient(ADDR_C)],
+        amount=Decimal("10"), dry_run=False, cooldown=0, notifier=notifier_,
+        on_result=lambda r, i, n: seen.append((i, r.ok)))
+    assert transfer.await_count == 4          # 1 ok + first 404 + 2 retries
+    assert out.ok_total == Decimal("10")
+    assert [r.recipient.address for r in out.failed] == [ADDR_B, ADDR_C]
+    assert out.failed[1].error.startswith("not sent:")   # never fired
+    assert seen == [(1, True), (2, False), (3, False)]  # every recipient reported
+    notifier_.send.assert_awaited_once()                # the summary still goes out

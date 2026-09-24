@@ -47,6 +47,27 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RECIPIENT_FILE = "recipients.txt"
 
+# How long to wait, per retry, when the API finds no spendable holding for the
+# SENDER (see _holdings_unavailable). Sum is the most one recipient can stall.
+HOLDINGS_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0, 30.0)
+
+
+def _holdings_unavailable(exc: object) -> bool:
+    """True for ``404 {"error":"input holding cids not found"}``.
+
+    The API picks the sender's input holdings itself; this says it found none
+    it could use. Measured 2026-09-24: 21 of 34 sends went through, then every
+    build failed — any recipient, any amount, even 1 unit to the sender
+    itself — while the balance read 740 USDC.B, and it stayed that way for
+    13+ minutes. Only that sender's USDC.B was affected: its CC built fine,
+    and so did another wallet's USDC.B. So it is a SENDER-and-token condition
+    on the API's side, and every later recipient would fail the same way. It
+    fails at build, before anything is signed, so nothing moved and a retry
+    cannot double-send.
+    """
+    text = str(exc).lower()
+    return "input holding" in text and "not found" in text
+
 
 @dataclass(frozen=True)
 class Recipient:
@@ -248,24 +269,44 @@ async def distribute(
         return out
 
     count = len(recipients)
+    blocked: str | None = None     # sender cannot spend right now: stop sending
     for i, recipient in enumerate(recipients, 1):
         each = recipient.resolved(amount)
         result = SendResult(recipient=recipient, amount=each, dry_run=dry_run)
         who = recipient.label or recipient.address[:20]
-        if dry_run:
+        if blocked is not None:
+            # Every send after a sender-side failure fails the same way; do
+            # not fire them. They are reported as failed so a retry picks them up.
+            result.error = f"not sent: {blocked}"
+        elif dry_run:
             logger.info("[%s] DRY-RUN send %s %s -> %s",
                         sender, each, out.symbol, who)
         else:
-            try:
-                await wallet.sdk.transfer(each, instrument, recipient.address, memo)
-            except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest
-                result.error = str(exc)
-                logger.error("[%s] send %s %s -> %s failed: %s",
-                             sender, each, out.symbol, who, exc)
-            else:
-                result.sent = True
-                logger.info("[%s] sent %s %s -> %s",
-                            sender, each, out.symbol, who)
+            waits = iter(HOLDINGS_RETRY_DELAYS)
+            while True:
+                try:
+                    await wallet.sdk.transfer(
+                        each, instrument, recipient.address, memo)
+                except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest
+                    if _holdings_unavailable(exc):
+                        delay = next(waits, None)
+                        if delay is not None:
+                            logger.warning(
+                                "[%s] no spendable %s holding indexed yet — "
+                                "waiting %.0fs, then retrying %s",
+                                sender, out.symbol, delay, who)
+                            await asyncio.sleep(delay)
+                            continue
+                        blocked = (f"{sender} has no spendable {out.symbol} "
+                                   "holding in the API's index yet — retry later")
+                    result.error = str(exc)
+                    logger.error("[%s] send %s %s -> %s failed: %s",
+                                 sender, each, out.symbol, who, exc)
+                else:
+                    result.sent = True
+                    logger.info("[%s] sent %s %s -> %s",
+                                sender, each, out.symbol, who)
+                break
         out.results.append(result)
         if on_result is not None:
             on_result(result, i, count)

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -169,7 +170,27 @@ class Strategy1(Strategy):
         self._mark_progress(wallet.name)
         with wallet_logs(wallet.name):
             try:
-                await self._trade_wallet(wallet, stop)
+                while True:
+                    try:
+                        await self._trade_wallet(wallet, stop)
+                        return
+                    except Exception as exc:  # noqa: BLE001 - classified below
+                        # A throttled or dropped request that escaped the loop's
+                        # own handling — authenticating or loading the market at
+                        # start-up, say — says nothing about the wallet. Ending
+                        # it would leave it dead until the whole run restarts,
+                        # so back off and start its loop again. Restarting is
+                        # safe: the day's count comes back from the local
+                        # counter and the history, and a held token is sold.
+                        if not is_transient(exc) or stop.is_set():
+                            raise
+                        logger.warning("[%s] %s — restarting wallet loop",
+                                       wallet.name, exc)
+                        await self._transient_pause(
+                            wallet, "", is_rate_limited(exc), exc, stop)
+                        if stop.is_set():
+                            return
+                        self._mark_progress(wallet.name)
             except Exception as exc:  # noqa: BLE001 - per-wallet isolation
                 # Report it here, not after the gather in `run()`. That gather
                 # only returns once EVERY wallet has, and a wallet polling a
@@ -652,6 +673,9 @@ class Strategy1(Strategy):
         self._transient_streak[wallet.name] = n
         delay = min(self.TRANSIENT_MAX_BACKOFF,
                     max(self.config.poll_max_seconds, 1.0) * 2 ** (n - 1))
+        # Jitter: wallets throttled by the same burst would otherwise all come
+        # back in the same second and trip the limit together again.
+        delay *= random.uniform(0.5, 1.0)
         label = "rate limit" if rate_limited else "gangguan jaringan"
         self._st(wallet.name, status=run_status.WAITING, route=route,
                  plan=f"{label}, jeda {delay:.0f}s")

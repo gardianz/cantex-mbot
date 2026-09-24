@@ -4033,3 +4033,22 @@ def test_buy_quote_hint_only_matches_the_same_buy():
     assert Strategy1._buy_quote_from(("CBTC", Decimal("11.8"), q), "EXAU",
                                      Decimal("11.8")) is None
     assert Strategy1._buy_quote_from(None, "EXAU", Decimal("11.8")) is None
+
+
+@pytest.mark.asyncio
+async def test_transient_error_outside_the_loop_restarts_the_wallet(tmp_path, monkeypatch):
+    """Seven wallets read 'crash: API error 429' mid-run and never came back.
+    A throttled request anywhere must cost a pause, not the wallet."""
+    import asyncio as _a
+    from cantex_sdk import CantexAPIError
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat.TRANSIENT_MAX_BACKOFF = 0.0
+    strat._trade_wallet = AsyncMock(
+        side_effect=[CantexAPIError(429, "rate limited"), None])
+
+    await strat._run_wallet(SimpleNamespace(name="w1"), _a.Event())
+
+    assert strat._trade_wallet.await_count == 2          # restarted, not ended
+    assert rs.view("w1").status != "error"
+    strat.notifier.send.assert_not_awaited()             # no crash message
+    store.close()

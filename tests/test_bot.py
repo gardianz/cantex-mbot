@@ -4436,3 +4436,46 @@ async def test_parked_wallet_wakes_to_sell_a_held_token(tmp_path, monkeypatch):
     assert await strat._wait_for_funds(wallet, stop, pairs, base, cc,
                                        Decimal("12.04")) is None
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_locked_base_is_a_pending_swap_not_saldo_kurang(tmp_path, monkeypatch):
+    """mulyanayanu, restarted with its buy still pending: 7.97 USDC.B free and
+    ~12.03 locked in the swap. Four 'saldo kurang' strikes parked it for the
+    day; the lock was released minutes later and it had 20.00 again."""
+    import asyncio as _a
+    strat, engine, rs, store = _strategy_fixture(tmp_path, monkeypatch, retries=2)
+    usdcx = InstrumentId("a", "USDCX")
+    stop = _a.Event()
+    locked = [Decimal("12.03")] * 3 + [Decimal("0")] * 10     # then released
+
+    def _tb(unlocked, lock):
+        return SimpleNamespace(instrument=usdcx, instrument_symbol="USDCX",
+                               unlocked_amount=unlocked, locked_amount=lock)
+
+    state = {"i": 0}
+
+    async def _info():
+        i = min(state["i"], len(locked) - 1); state["i"] += 1
+        free = Decimal("7.97") if locked[i] else Decimal("20")
+        tok = _tb(free, locked[i])
+        return SimpleNamespace(tokens=[tok],
+                               get_balance=lambda inst, f=free: f if inst == usdcx
+                               else (Decimal("50") if inst.id == "CC" else Decimal(0)))
+
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(),
+                             sdk=SimpleNamespace(get_account_info=_info))
+    strat._token_cc_value = AsyncMock(return_value=Decimal("0"))
+
+    async def _swap(*_a_, **_kw):
+        stop.set()
+        return SimpleNamespace(counted=True, ok=True, error=None,
+                               reject_reasons=None, guard=None,
+                               buy_amount=Decimal("1"), buy_symbol="CBTC")
+
+    engine.execute_swap = AsyncMock(side_effect=_swap)
+    await strat._run_wallet(wallet, stop)
+
+    strat._wait_for_funds.assert_not_awaited()     # never parked
+    engine.execute_swap.assert_awaited_once()      # bought once the lock cleared
+    store.close()

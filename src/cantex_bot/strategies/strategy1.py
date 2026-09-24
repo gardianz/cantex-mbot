@@ -364,6 +364,21 @@ class Strategy1(Strategy):
                 step, route = "buy", f"buy {usym}→{tok}"
 
             if step == "buy" and usdcx_bal < buy_notional:
+                # Short because a swap is still in flight? Then it is not
+                # "saldo kurang" — the base (or the token) is locked in it and
+                # comes back one way or the other. mulyanayanu, restarted with
+                # its buy still pending: 7.97 free + ~12.03 locked = 20.00.
+                locked = await self._locked_in_flight(
+                    wallet, usdcx, pair.token)
+                if locked:
+                    self._st(wallet.name, status=run_status.WAITING,
+                             route=route, plan=f"swap tertunda ({locked})")
+                    logger.info("[%s] %s locked in a pending swap — waiting "
+                                "for it, not counting saldo kurang",
+                                wallet.name, locked)
+                    self._forget_balances(wallet.name)
+                    await asyncio.sleep(self._insufficient_pause())
+                    continue
                 insufficient_streak += 1
                 self._st(wallet.name, status=run_status.WAITING,
                          route=route, plan="saldo kurang")
@@ -966,6 +981,24 @@ class Strategy1(Strategy):
         except CantexError as exc:
             logger.error("[%s] CC pricing quote failed: %s", wallet.name, exc)
             return Decimal(0)
+
+    async def _locked_in_flight(self, wallet: Wallet, *instruments) -> str | None:
+        """``"12.03 USDC.B"`` when any of ``instruments`` has a LOCKED balance —
+        funds held by a swap that has not settled (or been released) yet.
+
+        ``get_balance`` returns only the unlocked amount, so a wallet restarted
+        mid-swap reads as short of base and holding no token. None when
+        nothing is locked or the read fails (then the caller carries on as
+        before — a failed read must not keep a wallet waiting).
+        """
+        try:
+            info = await self._account_info(wallet)
+            for tok in info.tokens:
+                if tok.instrument in instruments and tok.locked_amount > 0:
+                    return f"{tok.locked_amount.normalize():f} {tok.instrument_symbol}"
+        except Exception:  # noqa: BLE001 - diagnostics only, see docstring
+            return None
+        return None
 
     def _insufficient_pause(self) -> float:
         """Gap between "saldo kurang" strikes. Four strikes at the 1s cooldown

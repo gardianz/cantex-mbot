@@ -540,6 +540,134 @@ class App:
             + (f", [red]{bad} failed[/red]" if bad else "")
         )
 
+    async def action_accept_incoming(self) -> None:
+        """Accept transfers waiting on wallets whose token has no pre-approval.
+
+        Survey every wallet first — reading is free, accepting pays a network
+        fee per transfer — and show the deadline: a pending transfer lapses at
+        ``execute_before`` and can then only be withdrawn by its sender.
+        """
+        from datetime import datetime, timezone
+
+        from .incoming import (
+            AcceptOutcome, accept_selected, earliest_deadline, fetch_pending,
+            totals,
+        )
+
+        console.print("[dim]Reading pending incoming transfers…[/dim]")
+
+        async def _read(name: str):
+            wallet = self.manager.get(name)
+            async with self.manager.sem:
+                try:
+                    await wallet.ensure_auth()
+                    return name, await fetch_pending(wallet)
+                except Exception as exc:  # noqa: BLE001 - per-wallet isolation
+                    return name, exc
+
+        found: dict[str, list] = {}
+        unread: dict[str, Exception] = {}
+        for name, res in await asyncio.gather(
+                *(_read(n) for n in self.manager.names)):
+            if isinstance(res, Exception):
+                unread[name] = res
+            elif res:
+                found[name] = res
+
+        now = datetime.now(timezone.utc)
+        for name, items in found.items():
+            live = [t for t in items if not t.expired(now)]
+            lapsed = len(items) - len(live)
+            amounts = ", ".join(f"{v.normalize():f} {k}"
+                                for k, v in totals(live).items())
+            console.print(f"[{name}] {len(live)} pending: {amounts or '-'}"
+                          + (f"  [red]{lapsed} lapsed[/red]" if lapsed else ""))
+        for name, exc in unread.items():
+            console.print(f"[{name}] [red]unreadable: {exc}[/red]")
+
+        pending = [t for items in found.values() for t in items
+                   if not t.expired(now)]
+        if not pending:
+            console.print("[green]No pending incoming transfer to accept.[/green]"
+                          if not unread else
+                          "[yellow]Nothing to accept among the wallets read.[/yellow]")
+            return
+
+        grand = ", ".join(f"{v.normalize():f} {k}" for k, v in totals(pending).items())
+        deadline = earliest_deadline(pending)
+        console.print(f"[bold]{len(pending)} transfer(s) on {len(found)} "
+                      f"wallet(s): {grand}[/bold]")
+        if deadline is not None:
+            left = deadline - now
+            hours = left.total_seconds() / 3600
+            console.print(
+                f"Earliest deadline: [bold]{deadline:%Y-%m-%d %H:%M} UTC[/bold] "
+                f"({hours:.1f}h left) — after it only the sender can take it back.")
+
+        wallet_names = await questionary.checkbox(
+            "Wallets to accept on (space to toggle, enter to confirm):",
+            choices=[questionary.Choice(n, checked=True) for n in found],
+        ).ask_async()
+        if not wallet_names:
+            console.print("[yellow]No wallet selected.[/yellow]")
+            return
+
+        symbols = sorted({t.symbol for n in wallet_names for t in found[n]})
+        only = None
+        if len(symbols) > 1:
+            only = await questionary.checkbox(
+                "Tokens to accept:",
+                choices=[questionary.Choice(s, checked=True) for s in symbols],
+            ).ask_async()
+            if not only:
+                console.print("[yellow]No token selected.[/yellow]")
+                return
+
+        todo = [t for n in wallet_names for t in found[n]
+                if not t.expired(now) and (only is None or t.symbol in only)]
+        console.print(
+            f"[bold]{len(todo)} accept(s)[/bold] across {len(wallet_names)} wallet(s). "
+            "[yellow]Each is a ledger transaction and pays a network fee in CC.[/yellow]"
+        )
+        await self._choose_execution_mode()
+
+        def _line(o: AcceptOutcome, i: int, n: int) -> None:
+            head = f"[dim]{i}/{n}[/dim] [{o.wallet}]"
+            if o.error:
+                console.print(f"{head} [red]{o.error}[/red]")
+                return
+            tag = "[cyan]dry-run[/cyan]" if o.dry_run else "[green]done[/green]"
+            got = ", ".join(f"{v.normalize():f} {k}"
+                            for k, v in totals(o.accepted).items())
+            parts = [f"{tag} {len(o.accepted)} accepted" + (f" ({got})" if got else "")]
+            if o.expired:
+                parts.append(f"[red]{len(o.expired)} lapsed[/red]")
+            if o.failed:
+                parts.append(f"[red]{len(o.failed)} failed[/red]")
+            console.print(f"{head} " + ", ".join(parts))
+            for t, err in o.failed:
+                console.print(f"    [red]{t.amount} {t.symbol}: {err}[/red]")
+
+        results = await accept_selected(
+            self.manager, wallet_names=wallet_names, dry_run=self.engine.dry_run,
+            only_symbols=only, run_state=self.run_state, notifier=self.notifier,
+            on_result=_line,
+        )
+        accepted = [t for o in results for t in o.accepted]
+        bad = sum(len(o.failed) for o in results) + sum(1 for o in results if o.error)
+        got = ", ".join(f"{v.normalize():f} {k}" for k, v in totals(accepted).items())
+        console.print(
+            f"[bold]{len(accepted)} transfer(s) accepted"
+            f"{' (dry-run)' if self.engine.dry_run else ''}"
+            + (f": {got}" if got else "") + "[/bold]"
+            + (f", [red]{bad} failed[/red]" if bad else "")
+        )
+        if accepted and not self.engine.dry_run:
+            console.print(
+                "[dim]Next transfers of these tokens will wait again until "
+                "their pre-approval is active — see "
+                "'Transfer pre-approvals (activate all)'.[/dim]")
+
     async def action_distribute(self) -> None:
         """Send one token from ONE wallet to MANY receivers, in one batch.
 
@@ -1034,6 +1162,7 @@ class App:
             "Distribute (1 wallet -> many)": self.action_distribute,
             "Export wallet addresses (party ids)": self.action_export_addresses,
             "Transfer pre-approvals (activate all)": self.action_preapprovals,
+            "Accept incoming transfers (pending)": self.action_accept_incoming,
             "Fee monitor (all pairs, read-only)": self.action_monitor,
             "Web check (history + rebates)": self.action_web_check,
             "Wallet status": self.action_wallet_status,

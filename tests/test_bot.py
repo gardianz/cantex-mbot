@@ -4052,3 +4052,98 @@ async def test_transient_error_outside_the_loop_restarts_the_wallet(tmp_path, mo
     assert rs.view("w1").status != "error"
     strat.notifier.send.assert_not_awaited()             # no crash message
     store.close()
+
+
+# -- accept pending incoming transfers ---------------------------------------
+
+def _pending_raw(cid, amount="20", symbol="USDC.B", before="2099-01-01 00:00:00+00"):
+    return {"instrument_symbol": symbol, "instrument_id": symbol,
+            "pending_deposit_transfers": [{
+                "contract_id": cid, "amount": amount,
+                "sender": "Cantex::1220sender",
+                "execute_before": before,
+                "requested_at": "2026-09-24 12:40:27.23649+00"}]}
+
+
+def _incoming_wallet(tokens, *, submit=None):
+    sdk = SimpleNamespace(
+        _request=AsyncMock(return_value={"tokens": tokens}),
+        _build_sign_submit=submit or AsyncMock(return_value={"ok": True}))
+    return SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+
+
+@pytest.mark.asyncio
+async def test_fetch_pending_reads_the_raw_account_info():
+    """TokenBalance keeps only contract ids; amount, sender and the deadline
+    live in the raw response."""
+    from cantex_bot.incoming import fetch_pending
+    wallet = _incoming_wallet([
+        _pending_raw("late", before="2026-09-26 00:00:00+00"),
+        _pending_raw("soon", amount="5", symbol="CBTC",
+                     before="2026-09-25 12:40:27.23649+00"),
+        {"instrument_symbol": "CC", "pending_deposit_transfers": []},
+    ])
+    got = await fetch_pending(wallet)
+    wallet.sdk._request.assert_awaited_once_with("GET", "/v1/account/info")
+    assert [t.contract_id for t in got] == ["soon", "late"]      # deadline first
+    assert got[0].amount == Decimal("5") and got[0].symbol == "CBTC"
+    assert got[0].execute_before == datetime(2026, 9, 25, 12, 40, 27, 236490,
+                                             tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_accept_wallet_accepts_each_and_skips_lapsed():
+    from cantex_bot.incoming import ACTION_PATH, accept_wallet
+    submit = AsyncMock(side_effect=[{"ok": True}, RuntimeError("boom"), {"ok": True}])
+    wallet = _incoming_wallet([
+        _pending_raw("a"), _pending_raw("b"), _pending_raw("c"),
+        _pending_raw("old", before="2020-01-01 00:00:00+00"),
+    ], submit=submit)
+
+    out = await accept_wallet(wallet, dry_run=False, cooldown=0)
+
+    assert submit.await_count == 3                 # the lapsed one is not tried
+    first = submit.await_args_list[0]
+    assert first.args == (ACTION_PATH,
+                          {"transferInstructionCid": "a", "choice": "accept"})
+    assert [t.contract_id for t in out.accepted] == ["a", "c"]   # b failed, c still ran
+    assert [t.contract_id for t, _ in out.failed] == ["b"]
+    assert [t.contract_id for t in out.expired] == ["old"]
+    assert not out.ok
+
+
+@pytest.mark.asyncio
+async def test_accept_wallet_dry_run_submits_nothing():
+    from cantex_bot.incoming import accept_wallet
+    wallet = _incoming_wallet([_pending_raw("a"),
+                               _pending_raw("x", symbol="CBTC")])
+    out = await accept_wallet(wallet, dry_run=True, only_symbols=["usdc.b"])
+    wallet.sdk._build_sign_submit.assert_not_awaited()
+    assert [t.contract_id for t in out.accepted] == ["a"]   # CBTC filtered out
+    assert out.ok and out.dry_run
+
+
+@pytest.mark.asyncio
+async def test_accept_selected_reports_and_survives_a_broken_notifier():
+    """Reporting must never lose the result: the accepts are already on-ledger."""
+    from cantex_bot.incoming import accept_selected
+    from cantex_bot.runstate import RunState
+    wallets = {"w1": _incoming_wallet([_pending_raw("a", amount="20")]),
+               "w2": _incoming_wallet([_pending_raw("b", amount="20")])}
+    wallets["w2"].name = "w2"
+    manager = SimpleNamespace(get=lambda n: wallets[n])
+    rs = RunState(); rs.begin(["w1", "w2"], [])
+    seen = []
+    bad_notifier = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("tg down")))
+
+    outs = await accept_selected(
+        manager, wallet_names=["w1", "w2"], dry_run=False, run_state=rs,
+        notifier=bad_notifier, cooldown=0,
+        on_result=lambda o, i, n: seen.append((o.wallet, i, n)))
+
+    assert [len(o.accepted) for o in outs] == [1, 1]
+    assert seen == [("w1", 1, 2), ("w2", 2, 2)]
+    bad_notifier.send.assert_awaited_once()
+    assert "2 accepted" in bad_notifier.send.await_args[0][0]
+    assert "40 USDC.B" in bad_notifier.send.await_args[0][0]
+    assert rs.view("w1").plan == "diterima 1"

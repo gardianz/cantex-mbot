@@ -60,11 +60,22 @@ def is_transient(exc: BaseException) -> bool:
     broken wallet. Counting them is how a burst of 429s ended wallets with
     "stopped: repeated errors" while nothing was wrong with them.
     """
-    if isinstance(exc, CantexAPIError):
-        return exc.status in _TRANSIENT_STATUSES
-    if isinstance(exc, (CantexTimeoutError, asyncio.TimeoutError)):
-        return True
-    return isinstance(exc.__cause__, (aiohttp.ClientError, asyncio.TimeoutError))
+    # Walk the chain: the SDK wraps most transport errors in a CantexError
+    # (cause = the aiohttp error), but its WebSocket path — `swap_and_confirm`
+    # opening and reading /v1/ws/private — lets them through bare. Seen live:
+    # "Cannot connect to host api.cantex.io" (ClientConnectorError) and
+    # "[Errno 104] Connection reset by peer" (ConnectionResetError) each ended
+    # a wallet as a crash.
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, CantexAPIError):
+            return exc.status in _TRANSIENT_STATUSES
+        if isinstance(exc, (CantexTimeoutError, asyncio.TimeoutError,
+                            aiohttp.ClientError, ConnectionError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 @dataclass
@@ -157,7 +168,7 @@ class SwapEngine:
         if quote is None:
             try:
                 quote = await wallet.sdk.get_swap_quote(sell_amount, sell, buy)
-            except CantexError as exc:
+            except Exception as exc:  # noqa: BLE001 - classified below
                 out.error = f"quote failed: {exc}"
                 if is_transient(exc):
                     # Throttled or a network blip: nothing was submitted and
@@ -226,7 +237,13 @@ class SwapEngine:
             event = await wallet.sdk.swap_and_confirm(
                 sell_amount, sell, buy, max_network_fee=max_fee,
             )
-        except CantexError as exc:
+        # Everything, not just CantexError: the SDK's WebSocket path raises bare
+        # aiohttp / OS errors, and one of those escaping here skipped the
+        # caller's "may have settled" reconciliation and crashed the wallet.
+        # submitted_attempt stays True, so the caller checks the history
+        # before doing anything else — a drop before the submit shows up there
+        # as "not executed", a drop after it as settled.
+        except Exception as exc:  # noqa: BLE001 - see above
             if _is_max_fee_error(exc):
                 # The fee rose between the quote and the submit. The API refused
                 # the intent before executing it, so NOTHING settled: clear

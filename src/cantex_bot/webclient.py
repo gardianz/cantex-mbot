@@ -196,7 +196,12 @@ class WebClient:
                     return json.loads(body)
                 except json.JSONDecodeError as exc:
                     raise WebClientError(f"{path} not JSON: {exc}") from exc
-            except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+            # ClientError, not only ClientConnectionError: a connection reset
+            # mid-body surfaces as ClientPayloadError ("Not enough data to
+            # satisfy content length header (received 7709 of 38699 bytes)")
+            # and deserves the same retry as a reset before the headers.
+            except (asyncio.TimeoutError, aiohttp.ClientError,
+                    ConnectionError) as exc:
                 last_exc = exc
                 if attempt < retries:
                     await asyncio.sleep(0.5 * (attempt + 1))

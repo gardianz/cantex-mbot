@@ -58,6 +58,13 @@ class Strategy1(Strategy):
     # mid-day (an accepted incoming transfer, a distribute, a deposit), and
     # idling to midnight with the money already there wastes the day.
     FUNDS_POLL_SECONDS = 60.0
+    # A crash that is NOT a known transport failure restarts the wallet too,
+    # after CRASH_RESTART_PAUSE, up to CRASH_RESTARTS times in a row — a row
+    # being crashes less than CRASH_WINDOW apart. Past that it is a real bug
+    # and the wallet stops loudly rather than looping on it.
+    CRASH_RESTARTS = 3
+    CRASH_RESTART_PAUSE = 60.0
+    CRASH_WINDOW = 600.0
 
     def __init__(
         self,
@@ -175,24 +182,49 @@ class Strategy1(Strategy):
         self._mark_progress(wallet.name)
         with wallet_logs(wallet.name):
             try:
+                crashes, last_crash = 0, 0.0
                 while True:
                     try:
                         await self._trade_wallet(wallet, stop)
                         return
                     except Exception as exc:  # noqa: BLE001 - classified below
-                        # A throttled or dropped request that escaped the loop's
-                        # own handling — authenticating or loading the market at
-                        # start-up, say — says nothing about the wallet. Ending
-                        # it would leave it dead until the whole run restarts,
-                        # so back off and start its loop again. Restarting is
-                        # safe: the day's count comes back from the local
-                        # counter and the history, and a held token is sold.
-                        if not is_transient(exc) or stop.is_set():
+                        if stop.is_set():
                             raise
-                        logger.warning("[%s] %s — restarting wallet loop",
-                                       wallet.name, exc)
-                        await self._transient_pause(
-                            wallet, "", is_rate_limited(exc), exc, stop)
+                        # Anything restarted must start from the exchange's
+                        # view, not a balance cached before the failure.
+                        self._forget_balances(wallet.name)
+                        if is_transient(exc):
+                            # A throttled or dropped request that escaped the
+                            # loop's own handling says nothing about the wallet.
+                            # Ending it left it dead until the whole run was
+                            # restarted, so back off and start its loop again.
+                            # Safe: the day's count comes back from the local
+                            # counter and the history, a held token is sold,
+                            # and locked funds wait as "swap tertunda".
+                            logger.warning("[%s] %s — restarting wallet loop",
+                                           wallet.name, exc)
+                            await self._transient_pause(
+                                wallet, "", is_rate_limited(exc), exc, stop)
+                        else:
+                            now = time.monotonic()
+                            if now - last_crash > self.CRASH_WINDOW:
+                                crashes = 0
+                            crashes, last_crash = crashes + 1, now
+                            if crashes > self.CRASH_RESTARTS:
+                                raise
+                            logger.exception(
+                                "[%s] %s wallet crashed (%d/%d), restarting in "
+                                "%.0fs: %s", wallet.name, self.label, crashes,
+                                self.CRASH_RESTARTS, self.CRASH_RESTART_PAUSE, exc)
+                            self._st(wallet.name, status=run_status.WAITING,
+                                     route="", plan=f"restart {crashes}/"
+                                     f"{self.CRASH_RESTARTS}: {exc}"[:60])
+                            await self.notifier.send(
+                                f"♻️ {self.label} [{wallet.name}] crashed: {exc} "
+                                f"— restarting ({crashes}/{self.CRASH_RESTARTS})")
+                            with contextlib.suppress(asyncio.TimeoutError):
+                                await asyncio.wait_for(
+                                    stop.wait(), timeout=self.CRASH_RESTART_PAUSE)
                         if stop.is_set():
                             return
                         self._mark_progress(wallet.name)

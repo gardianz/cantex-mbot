@@ -337,6 +337,10 @@ def _strategy_fixture(tmp_path, monkeypatch, *, retries=3):
                             notifier(), store, run_state=rs, tokens=["CBTC"])
     strat._web_swaps_today = AsyncMock(return_value=0)
     strat._price_cc_in_usdcx = AsyncMock(return_value=Decimal("10"))
+    # An unexpected crash restarts a wallet after a minute in production; in
+    # tests report it at once, so a broken test fails instead of hanging.
+    strat.CRASH_RESTARTS = 0
+    strat.CRASH_RESTART_PAUSE = 0.0
     # Terminal states now idle until the next UTC day; in tests return False
     # (as if stopped) so _run_wallet ends instead of sleeping for hours.
     strat._wait_next_day = AsyncMock(return_value=False)
@@ -4479,3 +4483,129 @@ async def test_locked_base_is_a_pending_swap_not_saldo_kurang(tmp_path, monkeypa
     strat._wait_for_funds.assert_not_awaited()     # never parked
     engine.execute_swap.assert_awaited_once()      # bought once the lock cleared
     store.close()
+
+
+
+# -- bare transport errors from the SDK's WebSocket path ----------------------
+
+def test_bare_transport_errors_are_transient():
+    """swap_and_confirm opens and reads /v1/ws/private without wrapping errors:
+    matt_shadow crashed on 'Cannot connect to host api.cantex.io', gardians_5
+    on '[Errno 104] Connection reset by peer'."""
+    import aiohttp
+    from cantex_sdk import CantexError
+    from cantex_bot.swapper import is_transient
+    assert is_transient(aiohttp.ClientConnectionError("Cannot connect to host"))
+    assert is_transient(ConnectionResetError(104, "Connection reset by peer"))
+    assert is_transient(aiohttp.ClientPayloadError("Not enough data"))
+    wrapped = CantexError("swap failed")
+    wrapped.__context__ = ConnectionResetError(104, "reset")
+    assert is_transient(wrapped)                  # found down the chain
+    assert not is_transient(RuntimeError("a real bug"))
+    assert not is_transient(ValueError("bad amount"))
+
+
+@pytest.mark.asyncio
+async def test_a_bare_error_after_submit_is_reconciled_not_raised(tmp_path):
+    """A connection drop while waiting for the confirmation may come after the
+    swap settled — it must reach the history check, not crash the wallet."""
+    store = Store(tmp_path / "s.db")
+    engine = SwapEngine(SwapGuard(GuardConfig()), store, notifier(), dry_run=False)
+    sdk = SimpleNamespace(
+        get_swap_quote=AsyncMock(return_value=make_quote()),
+        swap_and_confirm=AsyncMock(
+            side_effect=ConnectionResetError(104, "Connection reset by peer")))
+    wallet = SimpleNamespace(name="w1", ensure_auth=AsyncMock(), sdk=sdk)
+    usdcx, tok = InstrumentId("a", "USDCX"), InstrumentId("a", "CBTC")
+
+    out = await engine.execute_swap(
+        wallet, sell=usdcx, buy=tok, sell_amount=Decimal("10"),
+        sell_symbol="USDCX", buy_symbol="CBTC", direction="buy", quiet_reject=True)
+
+    assert out.submitted_attempt and out.error          # -> _confirm_via_history
+    assert not out.executed
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_bare_connection_error_restarts_the_wallet(tmp_path, monkeypatch):
+    import asyncio as _a
+    import aiohttp
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat.TRANSIENT_MAX_BACKOFF = 0.0
+    strat._trade_wallet = AsyncMock(side_effect=[
+        aiohttp.ClientConnectionError("Cannot connect to host api.cantex.io"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        None])
+    await strat._run_wallet(SimpleNamespace(name="w1"), _a.Event())
+    assert strat._trade_wallet.await_count == 3
+    assert rs.view("w1").status != "error"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_crash_restarts_a_few_times_then_stops_loudly(tmp_path, monkeypatch):
+    """'crash terus berhenti total': an unforeseen error gets CRASH_RESTARTS
+    more chances, then the wallet stops and says so — never an endless loop."""
+    import asyncio as _a
+    from cantex_bot.runstate import ERROR
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat.CRASH_RESTARTS = 3
+    strat._trade_wallet = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await strat._run_wallet(SimpleNamespace(name="w1"), _a.Event())
+
+    assert strat._trade_wallet.await_count == 4          # 1 + 3 restarts
+    assert rs.view("w1").status == ERROR
+    msgs = [c.args[0] for c in strat.notifier.send.await_args_list]
+    assert sum("restarting" in m for m in msgs) == 3
+    assert "crashed: boom" in msgs[-1]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_crash_recovers_when_the_restart_works(tmp_path, monkeypatch):
+    import asyncio as _a
+    strat, _e, rs, store = _startup_strat(tmp_path, monkeypatch)
+    strat.CRASH_RESTARTS = 3
+    strat._trade_wallet = AsyncMock(side_effect=[RuntimeError("once"), None])
+    await strat._run_wallet(SimpleNamespace(name="w1"), _a.Event())
+    assert strat._trade_wallet.await_count == 2
+    assert rs.view("w1").status != "error"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_webclient_retries_a_response_cut_mid_body(monkeypatch):
+    """ervan_8: 'Not enough data to satisfy content length header (received
+    7709 of 38699 bytes)' — a reset mid-body is a ClientPayloadError, which the
+    retry used to let straight through."""
+    import aiohttp
+    from cantex_bot import webclient as wmod
+    from cantex_bot.webclient import WebClient
+
+    class _Resp:
+        status = 200
+        async def text(self):
+            return '{"ok": true}'
+
+    calls = {"n": 0}
+
+    class _CM:
+        async def __aenter__(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise aiohttp.ClientPayloadError(
+                    "Not enough data to satisfy content length header")
+            return _Resp()
+        async def __aexit__(self, *exc):
+            return False
+
+    session = SimpleNamespace(get=lambda url, headers=None: _CM())
+    wc = WebClient(token_provider=AsyncMock(return_value="t"),
+                   api_base="https://api.example")
+    wc._get_session = AsyncMock(return_value=session)
+    monkeypatch.setattr(wmod.asyncio, "sleep", AsyncMock())
+
+    assert await wc._get_json("/v1/history/trading") == {"ok": True}
+    assert calls["n"] == 2
